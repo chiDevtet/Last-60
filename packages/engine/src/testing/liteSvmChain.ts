@@ -9,7 +9,7 @@ import { FailedTransactionMetadata, LiteSVM } from "litesvm";
 import { address, getTransactionDecoder, lamports } from "@solana/kit";
 import { RpcError, type ChainRpc, type SignatureStatus } from "../chain/rpc";
 
-export class LiteSvmChain implements Pick<ChainRpc, "getSlot" | "getBlockHeight" | "getBalance" | "getLatestBlockhash" | "sendRawTransaction" | "getSignatureStatuses"> {
+export class LiteSvmChain implements Pick<ChainRpc, "getSlot" | "getBlockHeight" | "getBalance" | "getLatestBlockhash" | "sendRawTransaction" | "getSignatureStatuses" | "getSignatureStatusesWithContext" | "getEpochInfo"> {
   readonly svm = new LiteSVM().withSysvars().withBuiltins().withDefaultPrograms();
   slot = 1_000;
   finalityLag = 32;
@@ -77,6 +77,15 @@ export class LiteSvmChain implements Pick<ChainRpc, "getSlot" | "getBlockHeight"
       const finalized = st.slot <= this.slot - this.finalityLag;
       return { slot: st.slot, confirmations: null, err: st.err, confirmationStatus: finalized ? "finalized" : "confirmed" };
     });
+  }
+
+  async getSignatureStatusesWithContext(signatures: string[]) {
+    return { contextSlot: this.slot, value: await this.getSignatureStatuses(signatures) };
+  }
+
+  async getEpochInfo(commitment: "processed" | "confirmed" | "finalized" = "finalized") {
+    const s = commitment === "finalized" ? this.slot - this.finalityLag : this.slot;
+    return { absoluteSlot: s, blockHeight: s };
   }
 
   /** Any SPL/raw transaction (setup helpers in tests). */

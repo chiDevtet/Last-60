@@ -14,7 +14,10 @@ mutation is audited.
 | Rounds `missed` | WARN "window missed" | The engine was down for a whole final window; its buys and fees flow into the next executed round. Investigate the outage. |
 | Pool graduating | WARN "Pool status is migrating/migrated", UI banner | Switch to the post-migration adapter (see `PROVIDERS.md`). Until then new fees are not attributed. |
 | Unrecognised pool activity | WARN "flagged for review" | A program upgrade may have changed events. Check `anomalies` in logs; update the IDL/adapter. Unknown activity is never counted. |
-| Emergency stop | — | `cli pause payouts` (stops signing; in-flight transactions still confirm), `cli pause scheduler` (no new snapshots), `cli pause indexer`. Resume with `resume`. |
+| Emergency stop | — | `cli pause payouts` (stops signing; in-flight transactions still confirm), `cli pause scheduler` (no new snapshots), `cli pause indexer`. Resume with `resume`. Switching `payoutMode` to `dry_run` also stops signing of queued live payouts (they stay `pending` until live mode returns). |
+| "Live payouts are queued and not being signed" | WARN line, payouts `pending` with `lastError` | Live mode is set but the rewards worker's own environment forbids signing (mainnet without `ALLOW_MAINNET_PAYOUTS=true`). Fix `.env.rewards` and restart, or switch back to dry-run. |
+| Round stuck `snapshotting` with "refusing to snapshot" | `lastError` names a lagging slot or a catch-up backlog | The RPC answered from behind the previous snapshot, or the indexer is too far behind. It retries automatically; check RPC health / indexer lag. |
+| Ledger check: "period fees are now X but Y were distributed" | ERROR line | Transactions arrived after a snapshot (or counted ones were dropped). Investigate the RPC/indexer around that round; the difference was not paid. |
 | Change reward parameters | — | Admin config. Applies from the next snapshot; each round stores the config it used. |
 | Switch provider / pool | — | Admin config (critical: needs confirmation + reason). The indexer re-attaches and ingests the current reward period. |
 | Rotate payout key | — | Pause payouts → wait until no payout is `submitted` → swap key file and `PAYOUT_WALLET_PUBLIC_KEY` + admin `expectedPayoutPublicKey` → restart `last60-rewards` → resume. |

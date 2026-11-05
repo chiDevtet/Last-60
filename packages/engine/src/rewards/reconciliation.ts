@@ -17,6 +17,7 @@ import { big, dec } from "../db/decimal";
 import type { LaunchProvider } from "../providers/LaunchProvider";
 import type { TerminalWriter } from "../terminal/terminal";
 import { cursorId, readCursor, syncAddress } from "../indexer/signatureSync";
+import { periodFees } from "./selection";
 import { rootLogger, type Logger } from "../util/logger";
 
 export interface ReconcileDeps {
@@ -67,7 +68,12 @@ export class Reconciler {
         await this.d.db.Reconciliation.create({ kind: "fee_source", status: "skipped", details: { reason: "indexer cursor not established" } });
         return null;
       }
-      await syncAddress({ db: this.d.db, provider, minBuyQuote: settings.minBuyQuote, rpc: this.d.rpc, terminal: this.d.terminal }, address, { untilSignature: cursor?.lastSignature ?? null, source: "catchup", cap: 20_000, concurrency: 4 });
+      const r = await syncAddress({ db: this.d.db, provider, minBuyQuote: settings.minBuyQuote, rpc: this.d.rpc, terminal: this.d.terminal }, address, { untilSignature: cursor?.lastSignature ?? null, source: "catchup", cap: 20_000, concurrency: 4, minContextSlot: state.slot });
+      if (r.truncated) {
+        // Not everything up to the balance slot was ingested; a comparison now would be wrong.
+        await this.d.db.Reconciliation.create({ kind: "fee_source", status: "skipped", details: { reason: "indexer backlog exceeds the reconciliation catch-up cap" } });
+        return null;
+      }
     }
     const poolDoc: any = await this.d.db.Pool.findOne({ key: `${info.provider}:${info.poolAddress}` }).lean();
     const baseline = poolDoc?.baseline ?? { slot: -1, quote: "0" };
@@ -106,6 +112,16 @@ export class Reconciler {
     }
     const confirmedNoSig = await this.d.db.Payout.countDocuments({ state: "confirmed", confirmedSignature: null });
     if (confirmedNoSig) problems.push(`${confirmedNoSig} confirmed payouts without a signature`);
+    // Period re-check (most recent rounds): recompute each executed round's eligible fees from the
+    // swaps now stored for its period. More than recorded = transactions ingested after the
+    // snapshot (their buyers and fees were counted in no round); less = counted transactions later
+    // dropped as forked out. Either must be investigated, never silently ignored.
+    for (const r of rounds.slice(0, 50)) {
+      if (r.snapshotSlot == null || !r.config?.pool || !r.config?.payoutMint) continue;
+      const pool = r.config.previousPool ? [r.config.previousPool, r.config.pool] : r.config.pool;
+      const now = await periodFees(this.d.db, { pool, afterSlot: r.prevSnapshotSlot ?? null, periodStartAt: r.periodStartAt ?? null, snapshotSlot: r.snapshotSlot }, r.config.payoutMint);
+      if (now.payout !== big(r.fees)) problems.push(`round #${r.roundNumber}: period fees are now ${now.payout} but ${big(r.fees)} were distributed (${now.payout > big(r.fees) ? "transactions ingested after the snapshot" : "counted transactions later dropped"})`);
+    }
     const status = problems.length ? "mismatch" : "ok";
     await this.d.db.Reconciliation.create({ kind: "ledger", status, details: { checked: rounds.length, problems: problems.slice(0, 50) } });
     if (problems.length) await this.d.terminal.error("Ledger invariant check failed; operators notified.", `ledger:${Math.floor(Date.now() / 3_600_000)}`);

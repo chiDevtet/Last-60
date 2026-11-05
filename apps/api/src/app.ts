@@ -5,6 +5,7 @@
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
+import { getConnInfo } from "hono/bun";
 import { z } from "zod";
 import {
   jsonSafe,
@@ -52,13 +53,42 @@ function rateLimiter(rps: number, burst: number) {
   };
 }
 
-const clientIp = (c: Context) => c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || c.req.header("x-real-ip") || "local";
+/**
+ * Client address for rate limiting and audit records.
+ *
+ * X-Forwarded-For is client-controlled except for the entries appended by proxies WE run: with
+ * `trustProxyHops = N` the client is the Nth entry from the right (nginx `$proxy_add_x_forwarded_for`
+ * appends exactly one). With 0 trusted hops forwarding headers are ignored and the socket peer is
+ * used. (Trusting the left-most entry let any client pick a fresh rate-limit bucket per request.)
+ */
+export function clientIp(c: Context, trustProxyHops: number): string {
+  if (trustProxyHops > 0) {
+    const chain = (c.req.header("x-forwarded-for") ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+    if (chain.length >= trustProxyHops) return chain[chain.length - trustProxyHops]!;
+    const real = c.req.header("x-real-ip")?.trim();
+    if (real) return real;
+  }
+  try {
+    return getConnInfo(c).remote.address ?? "unknown";
+  } catch {
+    return "unknown"; // no socket information (e.g. in-process requests in tests)
+  }
+}
+
+/** Parse a positive integer query parameter, clamped to [1, max]; anything else → `def`. */
+export function intParam(v: string | undefined, def: number, max: number): number {
+  if (v === undefined || !/^\d{1,9}$/.test(v)) return def;
+  const n = Number(v);
+  return n >= 1 ? Math.min(n, max) : def;
+}
 
 export function createApp(d: ApiDeps) {
   const app = new Hono<Env>();
   const now = d.now ?? (() => Date.now());
   const publicLimit = rateLimiter(20, 60);
   const adminLimit = rateLimiter(3, 20);
+  const hops = d.cfg.api.trustProxyHops ?? 0;
+  const ipOf = (c: Context) => clientIp(c, hops);
 
   app.use("*", async (c, next) => {
     await next();
@@ -76,7 +106,7 @@ export function createApp(d: ApiDeps) {
     }),
   );
   app.use("/api/v1/*", async (c, next) => {
-    if (!publicLimit(clientIp(c))) return c.json({ error: "rate limited" }, 429);
+    if (!publicLimit(ipOf(c))) return c.json({ error: "rate limited" }, 429);
     await next();
   });
   app.onError((err, c) => {
@@ -94,18 +124,30 @@ export function createApp(d: ApiDeps) {
     return c.json({ roundNumber: r.roundNumber, endsAt: r.endsAt, finalWindowStartsAt: r.finalWindowStartsAt, serverTime: r.serverTime, phase: r.phase });
   });
   app.get("/api/v1/pool", async (c) => c.json(await d.data.rewardPool()));
-  app.get("/api/v1/buys/recent", async (c) => c.json(await d.data.recentBuys(Number(c.req.query("limit") ?? 30))));
-  app.get("/api/v1/rounds", async (c) => c.json(await d.data.rounds({ before: c.req.query("cursor") ? Number(c.req.query("cursor")) : undefined, limit: Number(c.req.query("limit") ?? 20) })));
+  app.get("/api/v1/buys/recent", async (c) => c.json(await d.data.recentBuys(intParam(c.req.query("limit"), 30, 100))));
+  app.get("/api/v1/rounds", async (c) => {
+    const cursor = c.req.query("cursor");
+    if (cursor !== undefined && !/^\d{1,9}$/.test(cursor)) return c.json({ error: "invalid cursor" }, 400);
+    return c.json(await d.data.rounds({ before: cursor ? Number(cursor) : undefined, limit: intParam(c.req.query("limit"), 20, 100) }));
+  });
   app.get("/api/v1/rounds/:n", async (c) => {
     const n = Number(c.req.param("n"));
     if (!Number.isInteger(n) || n < 1) return c.json({ error: "invalid round" }, 400);
     const r = await d.data.round(n);
     return r ? c.json(r) : c.json({ error: "round not found or not yet settled" }, 404);
   });
-  app.get("/api/v1/payouts", async (c) => c.json(await d.data.payouts({ before: c.req.query("cursor") ?? undefined, limit: Number(c.req.query("limit") ?? 50) })));
+  app.get("/api/v1/payouts", async (c) => {
+    const cursor = c.req.query("cursor");
+    if (cursor !== undefined && Number.isNaN(new Date(cursor).getTime())) return c.json({ error: "invalid cursor" }, 400);
+    return c.json(await d.data.payouts({ before: cursor || undefined, limit: intParam(c.req.query("limit"), 50, 200) }));
+  });
   app.get("/api/v1/stats", async (c) => c.json(await d.data.stats()));
-  app.get("/api/v1/chart", async (c) => c.json(await d.data.chart(Number(c.req.query("limit") ?? 24))));
-  app.get("/api/v1/terminal", async (c) => c.json(await d.data.terminal({ before: c.req.query("before") ? Number(c.req.query("before")) : undefined, limit: Number(c.req.query("limit") ?? 50) })));
+  app.get("/api/v1/chart", async (c) => c.json(await d.data.chart(intParam(c.req.query("limit"), 24, 200))));
+  app.get("/api/v1/terminal", async (c) => {
+    const before = c.req.query("before");
+    if (before !== undefined && !/^\d{1,15}$/.test(before)) return c.json({ error: "invalid cursor" }, 400);
+    return c.json(await d.data.terminal({ before: before ? Number(before) : undefined, limit: intParam(c.req.query("limit"), 50, 200) }));
+  });
   app.get("/api/v1/dashboard", async (c) => c.json(await d.data.dashboard()));
   app.get("/api/v1/stream", (c) =>
     streamSSE(c, async (stream) => {
@@ -141,7 +183,7 @@ export function createApp(d: ApiDeps) {
   // ── admin ───────────────────────────────────────────────────────────────────
   const admin = new Hono<Env>();
   admin.use("*", async (c, next) => {
-    if (!adminLimit(clientIp(c))) return c.json({ error: "rate limited" }, 429);
+    if (!adminLimit(ipOf(c))) return c.json({ error: "rate limited" }, 429);
     await next();
   });
   admin.post("/auth/nonce", async (c) => {
@@ -173,7 +215,7 @@ export function createApp(d: ApiDeps) {
       return c.json({ error: `changing ${critical.join(", ")} requires confirmCritical=true and a reason` }, 400);
     }
     try {
-      const res = await d.settings.update(body.patch, { actor: c.get("admin"), reason: body.reason, ip: clientIp(c), expectedVersion: body.expectedVersion });
+      const res = await d.settings.update(body.patch, { actor: c.get("admin"), reason: body.reason, ip: ipOf(c), expectedVersion: body.expectedVersion });
       return c.json(jsonSafe({ ...res, effective: maskSettings(await d.settings.get(true)) }));
     } catch (err) {
       if (err instanceof SettingsValidationError) return c.json({ error: "validation failed", issues: err.problems }, 400);
@@ -205,19 +247,19 @@ export function createApp(d: ApiDeps) {
     const action = c.req.param("action");
     if (!key || !["pause", "resume"].includes(action)) return c.json({ error: "unknown component/action" }, 400);
     const raw = await d.settings.raw();
-    const res = await d.settings.update({ [key]: action === "pause" ? true : null }, { actor: c.get("admin"), reason: `${action} ${c.req.param("component")}`, ip: clientIp(c), expectedVersion: raw.version });
+    const res = await d.settings.update({ [key]: action === "pause" ? true : null }, { actor: c.get("admin"), reason: `${action} ${c.req.param("component")}`, ip: ipOf(c), expectedVersion: raw.version });
     return c.json(jsonSafe(res));
   });
   admin.post("/payouts/:id/requeue", async (c) => {
     const ok = await requeueFailedPayout(d.db, c.req.param("id"), c.get("admin"));
-    await d.db.ConfigAudit.create({ version: (await d.settings.raw()).version, actor: c.get("admin"), action: "requeue_payout", changes: [{ key: "payout", from: "failed", to: ok ? "pending" : "unchanged" }], reason: c.req.param("id"), ip: clientIp(c) });
+    await d.db.ConfigAudit.create({ version: (await d.settings.raw()).version, actor: c.get("admin"), action: "requeue_payout", changes: [{ key: "payout", from: "failed", to: ok ? "pending" : "unchanged" }], reason: c.req.param("id"), ip: ipOf(c) });
     return ok ? c.json({ ok }) : c.json({ error: "payout is not in failed state" }, 409);
   });
   admin.post("/halt/clear", async (c) => {
     const body = z.object({ reason: z.string().min(3) }).parse(await c.req.json());
     const prev: any = await d.db.SystemState.findById("payout_halt").lean();
     await d.db.SystemState.deleteOne({ _id: "payout_halt" });
-    await d.db.ConfigAudit.create({ version: (await d.settings.raw()).version, actor: c.get("admin"), action: "clear_payout_halt", changes: [{ key: "payout_halt", from: prev?.value ?? null, to: null }], reason: body.reason, ip: clientIp(c) });
+    await d.db.ConfigAudit.create({ version: (await d.settings.raw()).version, actor: c.get("admin"), action: "clear_payout_halt", changes: [{ key: "payout_halt", from: prev?.value ?? null, to: null }], reason: body.reason, ip: ipOf(c) });
     return c.json({ ok: true });
   });
   admin.get("/reconciliation", async (c) => c.json(jsonSafe(await d.db.Reconciliation.find({}).sort({ at: -1 }).limit(100).lean())));

@@ -13,7 +13,8 @@ import type { Models } from "../db/models";
 import { big, dec } from "../db/decimal";
 
 export interface SelectionParams {
-  pool: string;
+  /** The period's pool, or pools when the provider/pool was switched during the period. */
+  pool: string | string[];
   afterSlot: number | null; // exclusive lower bound (previous snapshot slot)
   periodStartAt: Date | null; // used only when there is no previous snapshot
   snapshotSlot: number; // inclusive upper bound
@@ -39,7 +40,7 @@ export interface SelectionResult {
 export function periodMatch(p: Pick<SelectionParams, "pool" | "afterSlot" | "periodStartAt" | "snapshotSlot">): Record<string, unknown> {
   const slot: Record<string, number> = { $lte: p.snapshotSlot };
   if (p.afterSlot !== null) slot.$gt = p.afterSlot;
-  const m: Record<string, unknown> = { pool: p.pool, status: "active", slot };
+  const m: Record<string, unknown> = { pool: Array.isArray(p.pool) ? { $in: p.pool } : p.pool, status: "active", slot };
   if (p.afterSlot === null && p.periodStartAt) m.blockTime = { $gte: p.periodStartAt };
   return m;
 }

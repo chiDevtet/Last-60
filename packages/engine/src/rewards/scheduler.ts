@@ -39,6 +39,8 @@ export interface SchedulerDeps {
   random?: (min: number, max: number) => number;
   log?: Logger;
   onRoundPlanned?: (roundNumber: number) => void;
+  /** Max signatures a pre-snapshot catch-up may ingest beyond the indexer cursor (default 20 000). */
+  catchUpCap?: number;
 }
 
 const LOCK_MS = 90_000;
@@ -224,10 +226,20 @@ export class RoundScheduler {
       // 1. Fix the snapshot slot (persist before anything else; reused on recovery).
       let snapshotSlot: number | null = locked.snapshotSlot;
       let executedAt: Date = locked.executedAt ?? new Date(now);
+      // Periods tile the chain only if snapshot slots strictly increase. A lagging RPC node (load
+      // balancer, failover) can report a slot at or below the previous snapshot; accepting it would
+      // re-open an already-paid period and re-use its rollover — i.e. pay the same fees twice.
+      const floor: any = await this.d.db.Round.findOne({ roundNumber: { $lt: locked.roundNumber }, snapshotSlot: { $ne: null } }, { snapshotSlot: 1, roundNumber: 1 }).sort({ snapshotSlot: -1 }).lean();
       if (snapshotSlot === null) {
-        snapshotSlot = await this.d.rpc.getSlot("confirmed");
+        const observed = await this.d.rpc.getSlot("confirmed");
+        if (floor && observed <= floor.snapshotSlot) {
+          throw new Error(`RPC reported slot ${observed}, not after round #${floor.roundNumber}'s snapshot slot ${floor.snapshotSlot} (lagging node); refusing to snapshot`);
+        }
+        snapshotSlot = observed;
         const r = await this.d.db.Round.updateOne({ ...fence, snapshotSlot: null }, { $set: { snapshotSlot, executedAt } });
         if (!r.modifiedCount) throw new LostLockError();
+      } else if (floor && snapshotSlot <= floor.snapshotSlot) {
+        throw new Error(`persisted snapshot slot ${snapshotSlot} is not after round #${floor.roundNumber}'s snapshot slot ${floor.snapshotSlot}; operator review required`);
       }
       await this.d.terminal.processingStarted(roundNumber);
 
@@ -238,13 +250,22 @@ export class RoundScheduler {
       const pool = provider.info();
       const prev: any = await this.d.db.Round.findOne({ snapshotSlot: { $ne: null, $lt: snapshotSlot }, roundNumber: { $lt: roundNumber }, state: { $nin: ["snapshotting"] } }).sort({ snapshotSlot: -1 }).lean();
       const genesisStart = boundsOf(await this.ensureGenesis(now), this.params).startsAt;
-      const period = { pool: pool.poolAddress, afterSlot: prev?.snapshotSlot ?? null, periodStartAt: prev ? null : new Date(genesisStart), snapshotSlot };
+      // Provider/pool switch: the first period after a switch also covers the previous pool's
+      // already-indexed activity between the previous snapshot and the switch (e.g. the last
+      // bonding-curve trades before graduation). Without this those fees and buyers would belong to
+      // no round at all — silently.
+      const previousPool: string | null = prev?.config?.pool && prev.config.pool !== pool.poolAddress ? prev.config.pool : null;
+      const pools = previousPool ? [previousPool, pool.poolAddress] : [pool.poolAddress];
+      const period = { pool: pools.length === 1 ? pools[0]! : pools, afterSlot: prev?.snapshotSlot ?? null, periodStartAt: prev ? null : new Date(genesisStart), snapshotSlot };
 
       // 3. Make sure every transaction of the period up to the snapshot slot is ingested.
       const settleUntil = executedAt.getTime() + this.d.cfg.schedule.snapshotSettleMs;
       const wait = settleUntil - this.d.clock.now();
       if (wait > 0) await this.d.clock.sleep(wait);
       await this.catchUp(snapshotSlot, { afterSlot: period.afterSlot, sinceTime: period.periodStartAt ? Math.floor(period.periodStartAt.getTime() / 1000) : null });
+      if (previousPool) {
+        await this.d.terminal.warn(`Pool changed since round #${prev.roundNumber}: this period also includes the previous pool's indexed activity up to the switch.`, `pool-switch:${roundNumber}`, roundNumber);
+      }
       const excluded = new Set([...settings.excludedWallets, pool.beneficiary, pool.creator, ...(this.d.payer ? [this.d.payer.publicKey.toBase58()] : []), ...(settings.expectedPayoutPublicKey ? [settings.expectedPayoutPublicKey] : [])]);
       const selection = await selectRecipients(this.d.db, this.d.rpc, { ...period, minBuyQuote: settings.minBuyQuote, buyerCount: settings.buyerCount, excluded });
       const fees = await periodFees(this.d.db, period, settings.payoutAssetMint);
@@ -272,6 +293,7 @@ export class RoundScheduler {
                 payoutMode: settings.payoutMode,
                 provider: pool.provider,
                 pool: pool.poolAddress,
+                previousPool,
                 tokenMint: pool.tokenMint,
                 skippedRoundPolicy: settings.skippedRoundPolicy,
                 minPayoutLamports: dec(settings.minPayoutLamports),
@@ -321,7 +343,7 @@ export class RoundScheduler {
       });
 
       // 5. Non-critical bookkeeping (after commit).
-      await this.d.db.Swap.updateMany({ ...{ pool: period.pool, slot: { $lte: snapshotSlot, ...(period.afterSlot !== null ? { $gt: period.afterSlot } : {}) } }, roundNumber: null }, { $set: { roundNumber } });
+      await this.d.db.Swap.updateMany({ pool: { $in: pools }, slot: { $lte: snapshotSlot, ...(period.afterSlot !== null ? { $gt: period.afterSlot } : {}) }, roundNumber: null }, { $set: { roundNumber } });
       if (a.payouts.length) {
         await this.d.terminal.accounting(roundNumber, { fees: a.fees, reward: a.pool, retained: a.retained, recipients: a.payouts.length, perRecipient: a.perRecipient, rolloverIn: a.rolloverIn });
       } else {
@@ -354,15 +376,16 @@ export class RoundScheduler {
       const key = cursorId(pool.provider, pool.poolAddress, address);
       const cursor = await readCursor(this.d.db, key);
       // Bounded: from the indexer's cursor if it has one, never further back than the period.
-      await syncAddress(
+      // `minContextSlot`: the node must have processed the snapshot slot before answering, so a
+      // lagging backend cannot silently omit transactions at or below it.
+      const r = await syncAddress(
         { db: this.d.db, provider, terminal: this.d.terminal, minBuyQuote: settings.minBuyQuote, rpc: this.d.rpc, log: this.log },
         address,
-        { untilSignature: cursor?.lastSignature ?? null, source: "catchup", cap: 20_000, concurrency: 4, bounds },
+        { untilSignature: cursor?.lastSignature ?? null, source: "catchup", cap: this.d.catchUpCap ?? 20_000, concurrency: 4, bounds, minContextSlot: snapshotSlot },
       );
+      if (r.truncated) throw new Error(`catch-up for ${address} exceeds ${this.d.catchUpCap ?? 20_000} signatures beyond the indexer cursor; refusing to snapshot incomplete data (round retried)`);
     }
-    // Every signature returned by the RPC at `confirmed` up to now is ingested; the snapshot slot
-    // was read before this call, so all transactions at or below it are included.
-    void snapshotSlot;
+    // Every signature returned by a node at or past the snapshot slot is ingested.
   }
 }
 

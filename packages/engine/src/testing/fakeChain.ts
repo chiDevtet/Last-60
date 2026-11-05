@@ -114,8 +114,9 @@ export class FakeChain implements ChainRpc {
     this.maybeFail("getBlockHeight");
     return commitment === "finalized" ? this.finalizedSlot : this.slot;
   }
-  async getSignaturesForAddress(address: string, o: { before?: string; until?: string; limit?: number } = {}): Promise<SignatureInfo[]> {
+  async getSignaturesForAddress(address: string, o: { before?: string; until?: string; limit?: number; minContextSlot?: number } = {}): Promise<SignatureInfo[]> {
     this.maybeFail("getSignaturesForAddress");
+    if (o.minContextSlot !== undefined && o.minContextSlot > this.slot) throw new RpcError("Minimum context slot has not been reached", -32016, 200, undefined, true);
     const list = [...(this.byAddress.get(address) ?? [])].reverse(); // newest first
     let start = 0;
     if (o.before) {
@@ -214,6 +215,16 @@ export class FakeChain implements ChainRpc {
       const finalized = t.slot <= this.finalizedSlot;
       return { slot: t.slot, confirmations: finalized ? null : this.slot - t.slot, err: t.err, confirmationStatus: finalized ? "finalized" : "confirmed" };
     });
+  }
+
+  async getSignatureStatusesWithContext(signatures: string[]): Promise<{ contextSlot: number; value: (SignatureStatus | null)[] }> {
+    return { contextSlot: this.slot, value: await this.getSignatureStatuses(signatures) };
+  }
+
+  async getEpochInfo(commitment: "processed" | "confirmed" | "finalized" = "finalized") {
+    this.maybeFail("getEpochInfo");
+    const s = commitment === "finalized" ? this.finalizedSlot : this.slot;
+    return { absoluteSlot: s, blockHeight: s }; // FakeChain: one block per slot
   }
 
   transfersTo(address: string) {

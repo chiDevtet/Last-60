@@ -46,6 +46,13 @@ export class RewardsWorker {
   readonly reconciler: Reconciler;
   private plannedSinceClaim = false;
   private stopped = false;
+  /**
+   * Fee claims (which wait for confirmation) and reconciliation (which can ingest thousands of
+   * transactions and scan hundreds of rounds) run in the background, one of each at a time. Awaited
+   * inline they blocked the scheduler loop: a round whose private execution instant fell inside a
+   * slow claim/reconciliation was executed late or, past the grace period, recorded as missed.
+   */
+  private background: { claim: Promise<unknown> | null; recon: Promise<unknown> | null } = { claim: null, recon: null };
 
   constructor(private readonly d: RewardsWorkerDeps) {
     this.log = (d.log ?? rootLogger()).child({ component: "rewards" });
@@ -133,14 +140,20 @@ export class RewardsWorker {
           await this.payouts.processDue();
           t.payouts = now;
         }
-        if (this.plannedSinceClaim || now - t.claim > 300_000) {
+        if (!this.background.claim && (this.plannedSinceClaim || now - t.claim > 300_000)) {
           this.plannedSinceClaim = false;
           t.claim = now;
-          await this.fees.maybeClaim().catch((err) => this.log.warn({ err: String(err) }, "fee claim failed"));
+          this.background.claim = Promise.resolve()
+            .then(() => this.fees.maybeClaim())
+            .catch((err) => this.log.warn({ err: String(err) }, "fee claim failed"))
+            .finally(() => (this.background.claim = null));
         }
-        if (now - t.recon >= this.d.cfg.reconciliation.intervalMs) {
+        if (!this.background.recon && now - t.recon >= this.d.cfg.reconciliation.intervalMs) {
           t.recon = now;
-          await this.reconciler.run().catch((err) => this.log.warn({ err: String(err) }, "reconciliation failed"));
+          this.background.recon = Promise.resolve()
+            .then(() => this.reconciler.run())
+            .catch((err) => this.log.warn({ err: String(err) }, "reconciliation failed"))
+            .finally(() => (this.background.recon = null));
         }
         this.status = { status: "running", detail: null };
         failures = 0;
@@ -154,6 +167,9 @@ export class RewardsWorker {
         await this.clock.sleep(delay, signal);
       }
     }
+    // Let in-flight background work settle (bounded) before giving up the lease.
+    const pending = [this.background.claim, this.background.recon].filter((x): x is Promise<unknown> => !!x);
+    if (pending.length) await Promise.race([Promise.allSettled(pending), new Promise((r) => setTimeout(r, 10_000))]);
     clearInterval(hb);
     if (this.leader) await heartbeat(this.d.db, "rewards", { status: "stopped" }).catch(() => undefined);
     await this.lease.release().catch(() => undefined);

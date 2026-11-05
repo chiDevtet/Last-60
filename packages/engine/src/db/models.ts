@@ -175,6 +175,7 @@ const roundSchema = new Schema(
       payoutMode: String,
       provider: String,
       pool: String,
+      previousPool: { type: String, default: null }, // set when the pool/provider changed during the period
       tokenMint: String,
       skippedRoundPolicy: String,
       minPayoutLamports: D,

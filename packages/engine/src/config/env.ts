@@ -175,6 +175,8 @@ const RawEnv = z.object({
   ADMIN_SESSION_SECRET: z.string().optional(),
   ADMIN_SESSION_TTL_SECONDS: int(3600, 60, 86_400),
   STREAM_SNAPSHOT_INTERVAL_MS: int(2000, 500, 60_000),
+  /** Number of trusted reverse proxies in front of the API (0 = use the socket peer address). */
+  API_TRUST_PROXY_HOPS: int(0, 0, 10),
 
   RECONCILIATION_INTERVAL_SECONDS: int(300, 30),
   RECONCILIATION_HALT_ON_OVER_ATTRIBUTION: bool(true),
@@ -257,6 +259,8 @@ export interface AppConfig {
     adminSessionSecret: string | null;
     adminSessionTtlSeconds: number;
     streamSnapshotIntervalMs: number;
+    /** X-Forwarded-For entries appended by trusted proxies; the client is the Nth from the right. */
+    trustProxyHops: number;
   };
   reconciliation: { intervalMs: number; haltOnOverAttribution: boolean; toleranceLamports: bigint };
   terminal: { retentionDays: number };
@@ -499,6 +503,7 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
       adminSessionSecret: raw.ADMIN_SESSION_SECRET ?? null,
       adminSessionTtlSeconds: raw.ADMIN_SESSION_TTL_SECONDS,
       streamSnapshotIntervalMs: raw.STREAM_SNAPSHOT_INTERVAL_MS,
+      trustProxyHops: raw.API_TRUST_PROXY_HOPS,
     },
     reconciliation: {
       intervalMs: raw.RECONCILIATION_INTERVAL_SECONDS * 1000,
