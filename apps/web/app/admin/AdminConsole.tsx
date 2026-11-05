@@ -83,7 +83,7 @@ export function AdminConsole() {
 
   useEffect(() => {
     const api = getWallets();
-    const usable = () => api.get().filter((w) => "standard:connect" in w.features && "solana:signMessage" in w.features);
+    const usable = () => api.get().filter((w) => "standard:connect" in w.features && ("solana:signIn" in w.features || "solana:signMessage" in w.features));
     setWallets(usable());
     const off = api.on("register", () => setWallets(usable()));
     try {
@@ -119,8 +119,17 @@ export function AdminConsole() {
       if (!acc) throw new Error("wallet returned no account");
       setAccount({ wallet: w, account: acc });
       const n = await call("/auth/nonce", { method: "POST", body: JSON.stringify({ wallet: acc.address }) });
-      const [out] = await (w.features["solana:signMessage"] as any).signMessage({ account: acc, message: new TextEncoder().encode(n.message) });
-      const v = await call("/auth/verify", { method: "POST", body: JSON.stringify({ wallet: acc.address, nonce: n.nonce, signature: bs58.encode(out.signature) }) });
+      let body: Record<string, string>;
+      if ("solana:signIn" in w.features) {
+        // Sign-In With Solana: the wallet itself checks that the domain matches this page.
+        const [out] = await (w.features["solana:signIn"] as any).signIn(n.signInInput);
+        body = { wallet: acc.address, nonce: n.nonce, signature: bs58.encode(out.signature), signedMessage: new TextDecoder().decode(out.signedMessage) };
+      } else {
+        // The message is SIWS-formatted, so wallets that parse signMessage payloads still verify the domain.
+        const [out] = await (w.features["solana:signMessage"] as any).signMessage({ account: acc, message: new TextEncoder().encode(n.message) });
+        body = { wallet: acc.address, nonce: n.nonce, signature: bs58.encode(out.signature) };
+      }
+      const v = await call("/auth/verify", { method: "POST", body: JSON.stringify(body) });
       setToken(v.token);
       try {
         sessionStorage.setItem("last60.admin", v.token);
