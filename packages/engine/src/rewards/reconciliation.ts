@@ -1,0 +1,121 @@
+/**
+ * Reconciliation — every balance must agree with the chain and with the ledger.
+ *
+ * 1. fee_source:   Σ attributed eligible fees − Σ claims (+ baseline)  vs  on-chain unclaimed
+ *                  (DBC: exact equality; LaunchLab: vault ≥ expected because vaults are shared).
+ *                  Over-attribution — the engine believes more fees exist than the chain holds —
+ *                  is the only direction that could overpay, and halts new payouts.
+ * 2. ledger:       per round, fees + rolloverIn = retained + dust + rolloverOut + Σ payouts,
+ *                  and payout rows equal perRecipient × recipientCount.
+ * 3. payout_wallet: wallet balance ≥ pending live payouts + reserve.
+ */
+import type { AppConfig } from "../config/env";
+import type { SettingsStore } from "../config/runtime";
+import type { ChainRpc } from "../chain/rpc";
+import type { Models } from "../db/models";
+import { big, dec } from "../db/decimal";
+import type { LaunchProvider } from "../providers/LaunchProvider";
+import type { TerminalWriter } from "../terminal/terminal";
+import { cursorId, readCursor, syncAddress } from "../indexer/signatureSync";
+import { rootLogger, type Logger } from "../util/logger";
+
+export interface ReconcileDeps {
+  db: Models;
+  cfg: AppConfig;
+  settings: SettingsStore;
+  rpc: ChainRpc;
+  provider: () => LaunchProvider;
+  payoutWallet: string | null;
+  terminal: TerminalWriter;
+  log?: Logger;
+}
+
+export interface ReconcileReport {
+  feeSource: { status: string; expected: bigint; actual: bigint; diff: bigint; slot: number } | null;
+  ledger: { status: string; checked: number; problems: string[] };
+  payoutWallet: { status: string; balance: bigint; pending: bigint } | null;
+}
+
+export class Reconciler {
+  private readonly log: Logger;
+  constructor(private readonly d: ReconcileDeps) {
+    this.log = (d.log ?? rootLogger()).child({ component: "reconcile" });
+  }
+
+  async run(): Promise<ReconcileReport> {
+    const report: ReconcileReport = { feeSource: null, ledger: { status: "ok", checked: 0, problems: [] }, payoutWallet: null };
+    report.feeSource = await this.feeSource().catch((err) => {
+      this.log.warn({ err: String(err) }, "fee source reconciliation skipped");
+      return null;
+    });
+    report.ledger = await this.ledger();
+    report.payoutWallet = await this.payoutWalletCheck().catch(() => null);
+    return report;
+  }
+
+  async feeSource() {
+    const provider = this.d.provider();
+    if (provider.id === "mock") return null;
+    const info = provider.info();
+    const state = await provider.getFeeSourceState();
+    // Ingest up to (at least) the slot the balance was read at, so both sides are comparable.
+    const settings = await this.d.settings.get();
+    for (const address of info.watchAddresses) {
+      const cursor = await readCursor(this.d.db, cursorId(info.provider, info.poolAddress, address));
+      await syncAddress({ db: this.d.db, provider, minBuyQuote: settings.minBuyQuote, rpc: this.d.rpc, terminal: this.d.terminal }, address, { untilSignature: cursor?.lastSignature ?? null, source: "catchup", cap: 20_000, concurrency: 4 });
+    }
+    const poolDoc: any = await this.d.db.Pool.findOne({ key: `${info.provider}:${info.poolAddress}` }).lean();
+    const baseline = poolDoc?.baseline ?? { slot: -1, quote: "0" };
+    const fees: any[] = await this.d.db.Swap.aggregate([{ $match: { pool: info.poolAddress, status: "active", eligibleFeeMint: info.quoteMint, slot: { $gt: baseline.slot, $lte: state.slot } } }, { $group: { _id: null, t: { $sum: "$eligibleFee" } } }]);
+    const claims: any[] = await this.d.db.FeeClaim.aggregate([{ $match: { pool: info.poolAddress, status: "confirmed", slot: { $gt: baseline.slot, $lte: state.slot } } }, { $group: { _id: null, t: { $sum: "$quoteAmount" } } }]);
+    const expected = big(fees[0]?.t ?? 0) - big(claims[0]?.t ?? 0) + big(baseline.quote ?? "0");
+    const actual = state.unclaimedQuote;
+    const diff = actual - expected;
+    const tol = this.d.cfg.reconciliation.toleranceLamports;
+    let status: "ok" | "mismatch" | "over_attribution" | "shared_vault";
+    if (diff < -tol) status = "over_attribution";
+    else if (state.mayIncludeOtherPools) status = diff > tol ? "shared_vault" : "ok";
+    else status = diff > tol ? "mismatch" : "ok";
+    await this.d.db.Reconciliation.create({ kind: "fee_source", status, slot: state.slot, expected: dec(expected), actual: dec(actual), diff: dec(diff), details: { source: state.source, baselineSlot: baseline.slot, pool: info.poolAddress } });
+    if (status === "over_attribution" && this.d.cfg.reconciliation.haltOnOverAttribution) {
+      await this.d.db.SystemState.updateOne({ _id: "payout_halt" }, { $set: { value: { reason: `over-attribution: engine expected ${expected}, chain holds ${actual} at slot ${state.slot}`, at: new Date() } } }, { upsert: true });
+      await this.d.terminal.error("Fee reconciliation found less on-chain than attributed; new payouts are halted pending operator review.", `halt:${state.slot}`);
+    } else if (status === "mismatch") {
+      await this.d.terminal.warn("Fee reconciliation: on-chain fees exceed attributed fees (possible missed transactions); investigating.", `recon-mismatch:${Math.floor(Date.now() / 3_600_000)}`);
+    }
+    return { status, expected, actual, diff, slot: state.slot };
+  }
+
+  async ledger() {
+    const rounds: any[] = await this.d.db.Round.find({ state: { $in: ["paying", "awaiting_funds", "completed", "rolled_over", "attention"] } }).sort({ roundNumber: -1 }).limit(500).lean();
+    const problems: string[] = [];
+    for (const r of rounds) {
+      const payouts: any[] = await this.d.db.Payout.find({ roundNumber: r.roundNumber }, { amount: 1 }).lean();
+      const paidTotal = payouts.reduce((s, p) => s + big(p.amount), 0n);
+      const lhs = big(r.fees) + big(r.rolloverIn);
+      const rhs = big(r.retained) + big(r.dust) + big(r.rolloverOut) + paidTotal;
+      if (lhs !== rhs) problems.push(`round #${r.roundNumber}: fees+rollover ${lhs} ≠ retained+dust+rollover+payouts ${rhs}`);
+      if (payouts.length !== r.recipientCount || paidTotal !== big(r.perRecipient) * BigInt(r.recipientCount)) problems.push(`round #${r.roundNumber}: payout rows do not match allocation`);
+      const ledger: any[] = await this.d.db.LedgerEntry.aggregate([{ $match: { roundNumber: r.roundNumber, type: "PAYOUT_SCHEDULED" } }, { $group: { _id: null, t: { $sum: "$amount" } } }]);
+      if (big(ledger[0]?.t ?? 0) !== paidTotal) problems.push(`round #${r.roundNumber}: ledger PAYOUT_SCHEDULED ≠ payout rows`);
+    }
+    const confirmedNoSig = await this.d.db.Payout.countDocuments({ state: "confirmed", confirmedSignature: null });
+    if (confirmedNoSig) problems.push(`${confirmedNoSig} confirmed payouts without a signature`);
+    const status = problems.length ? "mismatch" : "ok";
+    await this.d.db.Reconciliation.create({ kind: "ledger", status, details: { checked: rounds.length, problems: problems.slice(0, 50) } });
+    if (problems.length) await this.d.terminal.error("Ledger invariant check failed; operators notified.", `ledger:${Math.floor(Date.now() / 3_600_000)}`);
+    return { status, checked: rounds.length, problems };
+  }
+
+  async payoutWalletCheck() {
+    if (!this.d.payoutWallet) return null;
+    const s = await this.d.settings.get();
+    if (s.payoutMode !== "live") return null;
+    const balance = await this.d.rpc.getBalance(this.d.payoutWallet);
+    const r: any[] = await this.d.db.Payout.aggregate([{ $match: { mode: "live", state: { $in: ["pending", "signing", "submitted"] } } }, { $group: { _id: null, t: { $sum: "$amount" } } }]);
+    const pending = big(r[0]?.t ?? 0);
+    const status = balance >= pending + this.d.cfg.payout.minReserveLamports ? "ok" : "mismatch";
+    await this.d.db.Reconciliation.create({ kind: "payout_wallet", status, expected: dec(pending), actual: dec(balance), diff: dec(balance - pending) });
+    return { status, balance, pending };
+  }
+}

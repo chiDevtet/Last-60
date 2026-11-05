@@ -1,0 +1,4 @@
+[test]
+# MongoMemoryReplSet startup can take a few seconds on first run (binary download).
+timeout = 60000
+preload = []
