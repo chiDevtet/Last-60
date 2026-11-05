@@ -244,10 +244,11 @@ describe("U5 — funds preflight under concurrency", () => {
     await r.db.Payout.insertMany([0, 1].map((i) => ({ roundNumber: 1, recipient: wallet(), position: i, amount: dec(10_000_000n), mint: WSOL, mode: "live", state: "pending" })));
     const b = r.newWorker("test-b");
     // Concurrent passes (retrying until one gets through): never more than one payout is signed.
-    for (let i = 0; i < 10 && !(await r.db.Payout.exists({ state: "submitted" })); i++) {
+    // Time advances in 1 s steps like the real loop; jittered retries let one payout go alone.
+    for (let i = 0; i < 120 && !(await r.db.Payout.exists({ state: "submitted" })); i++) {
       await Promise.all([r.worker.payouts.processDue(), b.payouts.processDue()]);
       expect(await r.db.Payout.countDocuments({ state: { $in: ["signing", "submitted"] } })).toBeLessThanOrEqual(1);
-      r.clock.set(r.clock.now() + 21_000);
+      r.clock.set(r.clock.now() + 1_000);
     }
     const rows: any[] = await r.db.Payout.find({}).lean();
     expect(rows.filter((x) => x.state === "submitted").length).toBe(1);

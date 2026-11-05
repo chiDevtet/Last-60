@@ -27,7 +27,9 @@
    land (finalized height past its `lastValidBlockHeight` and signature unknown, or failed at
    `finalized`). Rebroadcasts reuse identical bytes.
 4. "Paid" is written only at `PAYOUT_COMMITMENT` (default `finalized`).
-5. Funds are checked before signing (balance ≥ payout + in-flight + fees + reserve).
+5. Funds are checked before signing, *after* the payout is reserved (`signing`), counting every other
+   reserved or in-flight live payout, so concurrent workers cannot rely on the same balance. SPL
+   payouts also check the token balance and SOL for fees + recipient token-account rent.
 6. A round's allocation, payouts and ledger entries commit in one MongoDB transaction; a round
    executes once (CAS on state + lease + fencing).
 7. Reconciliation halts new payouts on over-attribution.
@@ -36,6 +38,13 @@
 9. Snapshot slots strictly increase; a lagging RPC slot is refused instead of re-opening a paid period.
 10. "Expired" requires the signature to be unknown to nodes at or past the finalized slot that proves
     expiry (`getEpochInfo` + status context slot), so a lagging backend cannot trigger a re-sign.
+11. Confirmation, its ledger entry and buyer statistics commit atomically; legacy rows are repaired
+    idempotently.
+12. Only payout-eligible, creator-allocated fees are distributed. Unproven or mismatching allocations
+    (vs. the operator's declaration), unverified migrations and unsupported destinations are recorded
+    but never paid.
+13. Fee collection stays `manual` until the real claim signer, authority, beneficiary and claim
+    permissions are verified; auto-claim is gated by the same signer-side live checks as payouts.
 
 Tests: `test/rewards.test.ts` (fault-injected chain), `test/payouts-runtime.test.ts` (real Solana
 runtime via LiteSVM).
@@ -62,11 +71,17 @@ Off-curve (program) addresses are never paid.
 
 ## Admin
 
-Wallet-signature login (single-use, domain-bound, expiring nonces; ed25519 verification), HMAC
-session tokens checked against the current allow-list, per-IP rate limits, version-checked and
-audited configuration changes, confirmation + reason for critical keys, no secret editable or
-readable. The web app sends a strict CSP, `frame-ancestors 'none'`, `nosniff`, and the API adds
-`nosniff`, `no-referrer`, `DENY` framing and a CORS allow-list.
+Sign-In With Solana: single-use, expiring nonces in a SIWS (CAIP-122) message bound to
+`PUBLIC_SITE_URL`'s host — required in production, never derived from `Host`; wallets implementing
+`solana:signIn` (and SIWS-aware `signMessage`) refuse or warn when the requesting page is not that
+domain, and `/auth/verify` rejects altered SIWS fields and browser requests from another origin
+(phishing relay). ed25519 verification, HMAC session tokens re-checked against the current
+allow-list, per-IP rate limits, version-checked and audited configuration changes, confirmation +
+reason for critical keys, no secret editable or readable. The API sends `nosniff`, `no-referrer`,
+`DENY` framing; CORS allows only `CORS_ORIGINS` (required in production; development without it
+allows loopback origins only — arbitrary origins are never reflected). SSE connections are capped
+per client address and in total with a maximum lifetime; the Bun server has a finite idle timeout.
+The web app sends a strict CSP and `frame-ancestors 'none'`.
 
 ## Reporting
 

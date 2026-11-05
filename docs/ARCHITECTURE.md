@@ -6,9 +6,10 @@
 
 ## 1. What the system does
 
-Every five minutes (a *round*), the engine pays 75% of the trading fees that the project is
-entitled to (the *eligible fees*) to the five most recent unique wallets that bought at least
-0.05 SOL. The moment the snapshot is taken is chosen by a CSPRNG somewhere inside the last 60
+Every five minutes (a *round*), the engine allocates the configured reward share of the
+**eligible creator fees** — only the fees that on-chain configuration and position ownership allocate
+to the creator (the configured beneficiary), never a pool's gross fees — to the five most recent
+unique wallets that bought at least 0.05 SOL. The moment the snapshot is taken is chosen by a CSPRNG somewhere inside the last 60
 seconds of the round and is kept secret until it happens. Randomness decides **when**, never
 **who**: winners are a deterministic function of on-chain purchase history at the snapshot slot.
 
@@ -103,13 +104,13 @@ transactions.
   LaunchLab).
 
 ### Known integration limits (documented, not papered over)
-1. **Graduated pools.** After migration, trading (and fees) move to a different program (DAMM
-   v1/v2, Raydium AMM/CPMM) with position-based fee claiming. The adapters detect migration,
-   raise a `WARN` + degraded health, and stop attributing new fees. A post-migration adapter is
-   required before the token graduates (see `docs/PROVIDERS.md` §Post-migration).
-2. **LaunchLab shared creator vault.** Reconciliation is exact only if the creator wallet
-   launched a single pool for the quote mint; otherwise the vault surplus is reported as
-   "other sources" and per-event attribution is authoritative.
+1. **Graduated pools.** After a migration is *strictly verified*, the destination adapter is
+   attached (DAMM v2 or Raydium CPMM) and the launch's periods cover both pools; creator entitlement
+   comes from creator-held LP positions / locks and collected creator fees (`docs/PROVIDERS.md`
+   §Post-migration). DAMM v1 and AMM v4 destinations are unsupported and never accounted.
+2. **LaunchLab shared creator vault.** Deposits from the creator's other pools are indexed and
+   recorded as excluded inflows, so reconciliation is exact for deposits observed since indexing
+   began; per-instruction attribution is authoritative.
 3. **Non-SOL quote assets.** v1 supports SOL-quoted pools for SOL payouts, and SPL payouts only
    when `PAYOUT_ASSET` equals the pool's quote mint. No price conversion is ever performed;
    misconfiguration fails validation at startup.
@@ -157,8 +158,10 @@ leaders safe.
 4. Select buyers (Mongo aggregation): buys in the period, `status=active`,
    `quoteAmount ≥ MIN_BUY`, trader not excluded → sort by `(slot desc, intra-slot order desc)`
    → first row per wallet → top `BUYER_COUNT`.
-5. Eligible fees = Σ `eligibleFee` of all swaps (buys **and** sells) in the period whose fee
-   asset equals the payout asset. Fees in other assets are recorded, not converted.
+5. Destination LP-position checkpoints (if a verified DAMM v2 destination is attached) are written
+   for the snapshot slot. Eligible fees = Σ payout-eligible creator allocations in the period (swap
+   `eligibleFee` + attribution `creatorAmount`) in the payout asset. Other assets are recorded, not
+   converted; ineligible amounts are recorded as `FEE_EXCLUDED`.
 6. Allocation (pure integer function, `rewards/allocation.ts`):
    * `reward = ⌊fees · REWARD_BPS / 10000⌋ + rolloverIn`, `retained = fees − ⌊…⌋`
    * `per = ⌊reward / n⌋`, `dust = reward − per·n` (recorded as retained dust)
@@ -187,8 +190,12 @@ pending ─CAS(lock+fence)─► signing ─persist sig+blockhash+raw tx─► s
   signature is unknown, or it landed with an error at `finalized`.
 * `confirmed` is written only after the signature reaches `PAYOUT_COMMITMENT`
   (default `finalized`).
-* Balance check before signing: `balance − reserve − in-flight ≥ amount`, otherwise the round
-  becomes `awaiting_funds` and is retried with exponential backoff.
+* Funds check after reserving the payout (`pending → signing`), counting every other reserved or
+  in-flight live payout: SOL payouts need `amount + in-flight + fees + reserve`; SPL payouts need the
+  token balance and SOL for fees + the recipient's token-account rent. Otherwise the reservation is
+  released, the round becomes `awaiting_funds`, and the payout retries with jitter.
+* Confirmation, its `PAYOUT_CONFIRMED` ledger entry and the recipient statistics commit in one
+  MongoDB transaction; the reconciler repairs legacy rows idempotently.
 * `PAYOUT_MODE=dry_run` (the default) records `simulated` payouts and never signs. `live` on
   mainnet additionally requires `ALLOW_MAINNET_PAYOUTS=true`.
 
@@ -225,7 +232,7 @@ See `docs/FEE_ACCOUNTING.md` for the full ledger specification. Summary:
 | RPC down / 429 | endpoint failover, jittered exponential backoff; indexer cursor never skips |
 | WS drops | auto-reconnect; polling backstop guarantees completeness |
 | Duplicate notifications | unique `(signature, eventIndex)` upserts |
-| Fork / dropped tx | finality tracker marks `dropped` and excludes from selection |
+| Fork / dropped tx | finality tracker marks `dropped` only after two passes in which nodes at/after the finalized slot (well past the swap's slot) report it unknown; dropped rows are re-checked separately and never block promotion of newer swaps |
 | Worker crash mid-snapshot | lock expiry → re-run with persisted `snapshotSlot` (deterministic) |
 | Crash mid-payout | persisted attempt → status check → rebroadcast or wait for expiry |
 | Mongo interruption | loops back off; all writes are CAS/idempotent; no partial allocations (txn) |
@@ -233,3 +240,4 @@ See `docs/FEE_ACCOUNTING.md` for the full ledger specification. Summary:
 | Two workers | lease + CAS + fencing tokens + unique indexes |
 | Long sync / long snapshot | heartbeat and lease renewal run on independent timers; sync passes are bounded |
 | Pool/provider switched mid-period | the indexer re-attaches and ingests the whole current reward period |
+| Graduation | migration verified strictly; destination indexed from the migration slot; periods cover bonding + destination pools by slot (no gap, no overlap) |

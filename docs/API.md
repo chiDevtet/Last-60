@@ -1,6 +1,6 @@
 # API
 
-Bun + Hono, `apps/api`. Public routes are read-only, rate-limited per IP (20 rps, burst 60) and
+Bun + Hono, `apps/api`. CORS: only `CORS_ORIGINS` (required in production; loopback only in development when empty). Public routes are read-only, rate-limited per IP (20 rps, burst 60) and
 built exclusively from the whitelisted DTO builders in `packages/engine/src/public/publicData.ts`
 (types in `packages/shared/src/dto.ts`). Amounts are base-unit decimal strings.
 
@@ -11,7 +11,7 @@ built exclusively from the whitelisted DTO builders in `packages/engine/src/publ
 | `GET /health` | `HealthDTO`: database, indexer, rewards, api status from heartbeats; provider, cluster, payout mode |
 | `GET /round/current` | `CurrentRoundDTO`: number, start/end, final-window start, server time, phase, buyer count, min buy, reward bps, unique qualifying buyers in the current period |
 | `GET /countdown` | compact subset of the above |
-| `GET /pool` | `RewardPoolDTO`: period fees, period reward (incl. rollover), retained, pending payouts, distributed 24h / all-time |
+| `GET /pool` | `RewardPoolDTO`: payout-eligible creator fees of the current period (bonding pool + verified destination), period reward (incl. rollover), retained, pending payouts, distributed 24h / all-time; `asset.decimals` is the payout mint's on-chain decimals |
 | `GET /buys/recent?limit=` | latest buys with qualification flag |
 | `GET /rounds?cursor=&limit=` | settled/rolled-over/missed rounds, newest first, cursor = round number |
 | `GET /rounds/:n` | `RoundDetailDTO` incl. snapshot slot and payouts (signature only once confirmed) |
@@ -20,7 +20,7 @@ built exclusively from the whitelisted DTO builders in `packages/engine/src/publ
 | `GET /chart?limit=` | fees / reward / recipients per executed round |
 | `GET /terminal?before=&limit=` | terminal events, newest first, cursor = seq |
 | `GET /dashboard` | everything the home page needs, in one object |
-| `GET /stream` | **Server-Sent Events**: `snapshot` (dashboard, every `STREAM_SNAPSHOT_INTERVAL_MS`), `terminal` (each new event), `heartbeat` (15 s) |
+| `GET /stream` | **Server-Sent Events**: `snapshot` (dashboard, every `STREAM_SNAPSHOT_INTERVAL_MS`), `terminal` (each new event), `heartbeat` (15 s). Limited to 4 concurrent streams per client address and 5 000 in total (`429`); each stream closes after 30 min and `EventSource` reconnects |
 
 One snapshot computation and one terminal query per interval are shared by all SSE clients, so
 database load does not grow with the audience. Slow clients have a bounded queue.
@@ -34,10 +34,15 @@ asserts this across every public route both during the final window and after se
 
 Wallet-signature authentication (rate-limited 3 rps):
 
-1. `POST /auth/nonce {wallet}` → `{nonce, message, expiresAt}` — only for `ADMIN_WALLETS`; the
-   message is bound to `PUBLIC_SITE_URL`'s host, single-use, 5-minute TTL.
-2. Sign `message` with the wallet (ed25519, `solana:signMessage`).
-3. `POST /auth/verify {wallet, nonce, signature}` → `{token, expiresAt}` (HMAC session,
+1. `POST /auth/nonce {wallet}` → `{nonce, message, signInInput, expiresAt}` — only for
+   `ADMIN_WALLETS`; `message` is a Sign-In-With-Solana message bound to `PUBLIC_SITE_URL`'s host
+   (required in production — `503` otherwise; never taken from the `Host` header), single-use,
+   5-minute TTL.
+2. Sign with the wallet: `solana:signIn(signInInput)` (preferred — the wallet checks the domain) or
+   `solana:signMessage(message)`.
+3. `POST /auth/verify {wallet, nonce, signature, signedMessage?}` → `{token, expiresAt}`.
+   `signedMessage` (from `signIn`) must carry exactly the issued SIWS fields; a browser `Origin`
+   other than the sign-in site is refused (`403`). Session: HMAC,
    `ADMIN_SESSION_TTL_SECONDS`). Send as `Authorization: Bearer <token>`. Tokens are re-checked
    against `ADMIN_WALLETS` on every request, so removing a wallet revokes it immediately.
 
@@ -47,7 +52,7 @@ Wallet-signature authentication (rate-limited 3 rps):
 | `GET /config` | settings version, overrides, effective settings (RPC keys masked), redacted environment, critical keys |
 | `PUT /config {patch, expectedVersion, reason?, confirmCritical?}` | validated update; `null` removes an override; critical keys require `confirmCritical` + `reason`; `409` on a stale version |
 | `GET /audit` | change history |
-| `GET /status` | workers, payout halt, pool, recent reconciliation reports, failed payouts, payout wallet balance |
+| `GET /status` | workers, payout halt, pool (incl. allocation basis + verification, warnings, migration status / failed checks), recent reconciliation reports, failed payouts, payout wallet balance |
 | `POST /workers/:indexer\|payouts\|scheduler/:pause\|resume` | audited kill switches |
 | `POST /payouts/:id/requeue` | requeue a `failed` payout |
 | `POST /halt/clear {reason}` | clear a reconciliation halt |

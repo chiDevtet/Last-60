@@ -63,15 +63,17 @@ location /api/v1/stream {
 }
 location / { proxy_pass http://127.0.0.1:4000; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
 ```
-Set `CORS_ORIGINS=https://last60.io`, `PUBLIC_SITE_URL=https://last60.io` and
-`API_TRUST_PROXY_HOPS=1` (one nginx). The API takes the client address from the right-most
+Set `CORS_ORIGINS=https://last60.io`, `PUBLIC_SITE_URL=https://last60.io` (both **required** for the
+API in production) and `API_TRUST_PROXY_HOPS=1` (one nginx). The API takes the client address from the right-most
 X-Forwarded-For entry appended by your proxy; with `0` it ignores forwarding headers and uses the
 socket peer. Bind the API to `127.0.0.1` when it sits behind the proxy (`API_HOST`).
 
 ## 5. Go-live sequence (do not skip)
 
 1. **Mock / local** — `LAUNCH_PROVIDER=mock`, `bun run test`.
-2. **Mainnet, dry-run** — real token + pool, `PAYOUT_MODE=dry_run`. Let it run for at least a few
+2. **Mainnet, dry-run** — real token + pool, `PAYOUT_MODE=dry_run`, `FEE_COLLECTION_MODE=manual`,
+   and the declared creator allocation (`EXPECTED_*`, see `.env.example`). Confirm the pool's
+   `allocation.verification` is `verified` (no `ALLOCATION MISMATCH` warning). Let it run for at least a few
    hours. Check `bun run cli reconcile` reports `ok`, run `scripts/verify-round.ts` on several
    rounds, and review the simulated payouts.
 3. **Devnet or small-value live test** of the payout wallet path if desired.
@@ -81,7 +83,10 @@ socket peer. Bind the API to `127.0.0.1` when it sits behind the proxy (`API_HOS
    worker re-checks `ALLOW_MAINNET_PAYOUTS` in **its own** environment before every signature, so
    a live override set from the admin console (or written to the database) cannot bypass it;
    such payouts stay queued.
-5. Before the token graduates: deploy the post-migration adapter (`docs/PROVIDERS.md`).
+5. Graduation: the indexer verifies the migration and attaches the destination automatically
+   (DAMM v2 / CPMM). Check `pools.migration.status = verified` in the admin status (or run
+   `bun scripts/resolve-migration.ts …`, exit 0) before relying on post-migration rounds; DAMM v1 /
+   AMM v4 destinations are unsupported and are not accounted.
 
 ## 6. Health & monitoring
 
