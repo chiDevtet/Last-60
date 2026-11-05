@@ -228,6 +228,29 @@ describe("round lifecycle (live mode)", () => {
     expect(p.map((x) => x.recipient)).toEqual([early]);
   });
 
+  test("snapshot catch-up without an indexer cursor is bounded to the reward period (never crawls history)", async () => {
+    const r = await rig();
+    // 300 historical trades from an hour before genesis
+    for (let i = 0; i < 300; i++) r.chain.addMockTrade({ trader: wallet(), pool: MOCK_POOL, kind: "buy", quote: SOL, eligibleFee: 1000n, slot: 10 + i, blockTime: Math.floor((T0 - 3_600_000) / 1000) });
+    r.chain.slot = 5_000;
+    await r.worker.scheduler.tick(r.clock.now());
+    const buyer = wallet();
+    r.trade({ trader: buyer, quote: SOL });
+    let fetched = 0;
+    const orig = r.chain.getTransactionRaw.bind(r.chain);
+    r.chain.getTransactionRaw = async (s: string) => {
+      fetched++;
+      return orig(s);
+    };
+    r.clock.set(T0 + W);
+    await r.worker.scheduler.tick(r.clock.now());
+    r.clock.set(EXEC);
+    await r.worker.scheduler.tick(r.clock.now());
+    expect(fetched).toBe(1); // only the in-period transaction
+    expect(await r.db.Swap.countDocuments()).toBe(1);
+    expect(((await r.db.Payout.findOne({}).lean()) as any).recipient).toBe(buyer);
+  });
+
   test("no qualifying buyers: nothing paid, skipped round recorded, reward rolls into the next round", async () => {
     const r = await rig();
     await r.worker.scheduler.tick(r.clock.now());

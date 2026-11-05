@@ -77,24 +77,52 @@ export class RewardsWorker {
     return p;
   }
 
+  private leader = false;
+  private status: { status: string; detail: string | null } = { status: "running", detail: null };
+
+  /** Heartbeat + lease renewal on an independent timer (a long snapshot never looks like a crash). */
+  private startHeartbeat() {
+    const beat = async () => {
+      try {
+        if (this.leader && !(await this.lease.tryAcquire())) {
+          this.leader = false;
+          this.log.warn("lost rewards leadership");
+        }
+        if (this.leader) {
+          const s = await this.d.settings.get();
+          const halted = await this.payouts.isHalted();
+          const paused = s.pauseScheduler || s.pausePayouts;
+          await heartbeat(this.d.db, "rewards", {
+            status: this.status.status === "degraded" ? "degraded" : paused ? "paused" : halted ? "degraded" : "running",
+            detail: this.status.detail ?? (halted ? `payouts halted: ${halted}` : s.pausePayouts ? "payouts paused by admin" : s.pauseScheduler ? "scheduler paused by admin" : null),
+            instance: this.d.cfg.instanceId,
+            metrics: { payoutMode: s.payoutMode, payer: this.d.payer?.publicKey.toBase58() ?? null },
+          });
+        } else {
+          await heartbeat(this.d.db, `rewards:standby:${this.d.cfg.instanceId}`, { status: "standby", instance: this.d.cfg.instanceId });
+        }
+      } catch {
+        /* next beat retries */
+      }
+    };
+    return setInterval(beat, 5000);
+  }
+
   async run(signal: AbortSignal) {
     let failures = 0;
-    const t = { payouts: 0, recon: 0, heartbeat: 0, claim: 0 };
-    let leader = false;
+    const t = { payouts: 0, recon: 0, claim: 0 };
+    const hb = this.startHeartbeat();
     while (!signal.aborted && !this.stopped) {
       const now = this.clock.now();
       try {
-        const isLeader = await this.lease.tryAcquire(now);
-        if (isLeader !== leader) {
-          leader = isLeader;
-          this.log.info({ leader }, isLeader ? "acquired rewards leadership" : "standing by (another instance is leader)");
-          if (isLeader) await this.terminal.system("Reward engine online.", `online:${this.d.cfg.instanceId}:${Math.floor(now / 60_000)}`);
-        }
-        if (!isLeader) {
-          if (now - t.heartbeat > 5000) {
-            await heartbeat(this.d.db, `rewards:standby:${this.d.cfg.instanceId}`, { status: "standby", instance: this.d.cfg.instanceId });
-            t.heartbeat = now;
+        if (!this.leader) {
+          this.leader = await this.lease.tryAcquire(now);
+          if (this.leader) {
+            this.log.info("acquired rewards leadership");
+            await this.terminal.system("Reward engine online.", `online:${this.d.cfg.instanceId}:${Math.floor(now / 60_000)}`);
           }
+        }
+        if (!this.leader) {
           await this.clock.sleep(2000, signal);
           continue;
         }
@@ -114,16 +142,7 @@ export class RewardsWorker {
           t.recon = now;
           await this.reconciler.run().catch((err) => this.log.warn({ err: String(err) }, "reconciliation failed"));
         }
-        if (now - t.heartbeat >= 5000) {
-          const halted = await this.payouts.isHalted();
-          await heartbeat(this.d.db, "rewards", {
-            status: s.pauseScheduler || s.pausePayouts ? "paused" : halted ? "degraded" : "running",
-            detail: halted ? `payouts halted: ${halted}` : s.pausePayouts ? "payouts paused by admin" : s.pauseScheduler ? "scheduler paused by admin" : null,
-            instance: this.d.cfg.instanceId,
-            metrics: { payoutMode: s.payoutMode, payer: this.d.payer?.publicKey.toBase58() ?? null },
-          });
-          t.heartbeat = now;
-        }
+        this.status = { status: "running", detail: null };
         failures = 0;
         const sleepFor = Math.max(0, Math.min(wake - this.clock.now(), 500));
         await this.clock.sleep(sleepFor, signal);
@@ -131,12 +150,13 @@ export class RewardsWorker {
         failures++;
         const delay = backoffDelay(failures, { baseMs: 500, maxMs: 15_000 });
         this.log.error({ err: String(err?.message ?? err), delay }, "rewards loop error");
-        await heartbeat(this.d.db, "rewards", { status: "degraded", detail: String(err?.message ?? err).slice(0, 300), instance: this.d.cfg.instanceId }).catch(() => undefined);
+        this.status = { status: "degraded", detail: String(err?.message ?? err).slice(0, 300) };
         await this.clock.sleep(delay, signal);
       }
     }
+    clearInterval(hb);
+    if (this.leader) await heartbeat(this.d.db, "rewards", { status: "stopped" }).catch(() => undefined);
     await this.lease.release().catch(() => undefined);
-    await heartbeat(this.d.db, "rewards", { status: "stopped" }).catch(() => undefined);
   }
 
   stop() {

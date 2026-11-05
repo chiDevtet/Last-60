@@ -22,6 +22,7 @@ import { rootLogger, type Logger } from "../util/logger";
 import { sleep } from "../util/time";
 import { backoffDelay } from "../util/backoff";
 import { cursorId, ingestSignature, readCursor, syncAddress } from "./signatureSync";
+import { boundsOf, roundIndexAt } from "../rewards/roundMath";
 
 export interface IndexerDeps {
   db: Models;
@@ -46,6 +47,9 @@ export class Indexer {
   private wsQueue = new Set<string>();
   private recent = new Map<string, number>();
   private stopped = false;
+  private backlog = false;
+  private leader = false;
+  private status: { status: string; detail: string | null } = { status: "running", detail: null };
   metrics = { polls: 0, lastPollAt: 0, lastSlot: 0, swapsIngested: 0, claimsIngested: 0, errors: 0, wsNotifications: 0, finalized: 0, dropped: 0 };
 
   constructor(private readonly deps: IndexerDeps) {
@@ -132,8 +136,8 @@ export class Indexer {
     );
   }
 
-  /** One full synchronisation pass over every watched address. Returns new swaps ingested. */
-  async pollOnce(): Promise<number> {
+  /** One synchronisation pass over every watched address. Returns new swaps ingested. */
+  async pollOnce(signal?: AbortSignal): Promise<number> {
     if (!this.provider || !this.pool || !this.rpc || !this.settings) return 0;
     let total = 0;
     for (const address of this.pool.watchAddresses) {
@@ -141,9 +145,7 @@ export class Indexer {
       const existing = await readCursor(this.deps.db, key);
       const isBackfill = !existing;
       if (isBackfill && this.deps.cfg.indexer.backfill === "none") {
-        // Start from "now": record the newest signature without ingesting history.
-        const latest = await this.rpc.getSignaturesForAddress(address, { limit: 1 });
-        await this.deps.db.WorkerState.updateOne({ _id: key }, { $set: { cursor: { lastSignature: latest[0]?.signature ?? null, lastSlot: latest[0]?.slot ?? 0, backfillComplete: true } } }, { upsert: true });
+        await this.startFromNow(address, key);
         continue;
       }
       const stats = await syncAddress(this.ctx(), address, {
@@ -151,7 +153,10 @@ export class Indexer {
         source: isBackfill ? "backfill" : "indexer",
         cap: isBackfill ? this.deps.cfg.indexer.backfillMaxSignatures : 50_000,
         concurrency: this.deps.cfg.indexer.fetchConcurrency,
+        maxPerPass: 400,
+        signal,
       });
+      this.backlog = stats.more;
       if (isBackfill && stats.fetched) {
         this.log.info({ address, ...stats }, "backfill complete");
         await this.terminal.system(`Backfill complete: ${stats.ingested} historical transactions indexed.`, `backfill:${key}`);
@@ -164,6 +169,42 @@ export class Indexer {
     this.metrics.polls++;
     this.metrics.lastPollAt = Date.now();
     return total;
+  }
+
+  /**
+   * INDEXER_BACKFILL=none: start from "now" with an exact reconciliation baseline. The fee state
+   * is read first (slot S); the cursor is then placed on the newest signature at or below S, so
+   * every transaction is either inside the baseline or indexed — never both, never neither.
+   */
+  private async startFromNow(address: string, key: string) {
+    const pool = this.pool!;
+    let baselineSlot: number | null = null;
+    if (address === pool.poolAddress && this.provider!.id !== "mock") {
+      const state = await this.provider!.getFeeSourceState();
+      baselineSlot = state.slot;
+      await this.deps.db.Pool.updateOne(
+        { key: `${pool.provider}:${pool.poolAddress}`, baseline: { $exists: false } },
+        { $set: { baseline: { slot: state.slot, quote: state.unclaimedQuote.toString(), base: state.unclaimedBase.toString(), at: new Date() } } },
+      );
+    }
+    // "No backfill" still covers the CURRENT reward period: ingest back to the last snapshot slot
+    // (or the start of the genesis round), so the next round's period is fully observed even when
+    // the pool or provider changed mid-period. The reconciliation baseline above is independent
+    // (it only counts swaps after its own slot), so nothing is double counted.
+    const last: any = await this.deps.db.Round.findOne({ snapshotSlot: { $ne: null } }, { snapshotSlot: 1 }).sort({ snapshotSlot: -1 }).lean();
+    const genesis: any = await this.deps.db.SystemState.findById("genesis").lean();
+    const sched = this.deps.cfg.schedule;
+    const params = { roundDurationMs: sched.roundDurationMs, windowStartMs: sched.windowStartMs, windowDurationMs: sched.windowDurationMs, anchorEpochMs: sched.anchorEpochMs };
+    const startIndex = genesis?.value?.roundIndex ?? roundIndexAt(Date.now(), params);
+    const bounds = last ? { afterSlot: last.snapshotSlot as number } : { sinceTime: Math.floor(boundsOf(startIndex, params).startsAt / 1000) };
+    const stats = await syncAddress(this.ctx(), address, { cursorKey: key, untilSignature: null, source: "backfill", cap: this.deps.cfg.indexer.backfillMaxSignatures, concurrency: this.deps.cfg.indexer.fetchConcurrency, bounds });
+    if (!(await readCursor(this.deps.db, key))) {
+      // Nothing in the period yet: anchor at the newest signature at/below the baseline slot.
+      const page = await this.rpc!.getSignaturesForAddress(address, { limit: 1000 });
+      const anchor = baselineSlot === null ? page[0] : page.find((x) => x.slot <= baselineSlot!);
+      await this.deps.db.WorkerState.updateOne({ _id: key }, { $set: { cursor: { lastSignature: anchor?.signature ?? null, lastSlot: anchor?.slot ?? 0, backfillComplete: true } } }, { upsert: true });
+    }
+    this.log.info({ address, baselineSlot, periodBounds: bounds, ingested: stats.ingested }, "attached without history backfill (current reward period ingested)");
   }
 
   /** Drain websocket notifications (fast path). Failures are left to the poll backstop. */
@@ -241,17 +282,44 @@ export class Indexer {
     if (prev && prev !== this.pool.status) await this.migrationWarning(this.pool);
   }
 
+  /**
+   * Heartbeat + lease renewal run on their own timer so that long synchronisation passes can
+   * never make a healthy leader look dead or let its lease lapse.
+   */
+  private startHeartbeat() {
+    const beat = async () => {
+      try {
+        if (this.leader && !(await this.lease.tryAcquire())) {
+          this.leader = false;
+          this.log.warn("lost indexer leadership");
+        }
+        if (this.leader) {
+          await heartbeat(this.deps.db, "indexer", {
+            status: this.status.status,
+            detail: this.status.detail ?? (this.backlog ? "catching up on backlog" : null),
+            instance: this.deps.cfg.instanceId,
+            metrics: { ...this.metrics, wsConnected: this.ws?.connected ?? false, pool: this.pool?.poolAddress ?? null, poolStatus: this.pool?.status ?? null, backlog: this.backlog },
+          });
+        } else {
+          await heartbeat(this.deps.db, "indexer:standby:" + this.deps.cfg.instanceId, { status: "standby", instance: this.deps.cfg.instanceId });
+        }
+      } catch {
+        /* database hiccup: next beat retries */
+      }
+    };
+    void beat();
+    return setInterval(beat, 5000);
+  }
+
   async run(signal: AbortSignal) {
-    const timers = { poll: 0, finality: 0, fees: 0, refresh: 0, heartbeat: 0 };
+    const timers = { poll: 0, finality: 0, fees: 0, refresh: 0 };
     let failures = 0;
+    const hb = this.startHeartbeat();
     while (!signal.aborted && !this.stopped) {
       const now = Date.now();
       try {
-        if (!(await this.lease.tryAcquire(now))) {
-          if (now - timers.heartbeat > 5000) {
-            await heartbeat(this.deps.db, "indexer:standby:" + this.deps.cfg.instanceId, { status: "standby", instance: this.deps.cfg.instanceId });
-            timers.heartbeat = now;
-          }
+        if (!this.leader) this.leader = await this.lease.tryAcquire(now);
+        if (!this.leader) {
           this.ws?.stop();
           this.ws = null;
           this.provider = null;
@@ -260,7 +328,7 @@ export class Indexer {
         }
         const s = await this.deps.settings.get();
         if (s.pauseIndexer) {
-          await heartbeat(this.deps.db, "indexer", { status: "paused", instance: this.deps.cfg.instanceId, detail: "paused by admin" });
+          this.status = { status: "paused", detail: "paused by admin" };
           await sleep(2000, signal);
           continue;
         }
@@ -269,8 +337,8 @@ export class Indexer {
           this.settingsVersion = s.version;
         }
         await this.drainWsQueue();
-        if (now - timers.poll >= s.indexerPollIntervalMs) {
-          await this.pollOnce();
+        if (this.backlog || now - timers.poll >= s.indexerPollIntervalMs) {
+          await this.pollOnce(signal);
           timers.poll = now;
         }
         if (now - timers.finality >= this.deps.cfg.indexer.finalityCheckMs) {
@@ -285,25 +353,23 @@ export class Indexer {
           if (timers.refresh) await this.refreshPool();
           timers.refresh = now;
         }
-        if (now - timers.heartbeat >= 5000) {
-          await heartbeat(this.deps.db, "indexer", { status: "running", instance: this.deps.cfg.instanceId, detail: null, metrics: { ...this.metrics, wsConnected: this.ws?.connected ?? false, pool: this.pool?.poolAddress ?? null, poolStatus: this.pool?.status ?? null } });
-          timers.heartbeat = now;
-        }
+        this.status = { status: "running", detail: null };
         failures = 0;
-        await sleep(Math.min(250, s.indexerPollIntervalMs), signal);
+        if (!this.backlog) await sleep(Math.min(250, s.indexerPollIntervalMs), signal);
       } catch (err: any) {
         failures++;
         this.metrics.errors++;
         const delay = backoffDelay(failures, { baseMs: 500, maxMs: 30_000 });
         this.log.error({ err: String(err?.message ?? err), delay }, "indexer loop error");
-        await heartbeat(this.deps.db, "indexer", { status: "degraded", detail: String(err?.message ?? err).slice(0, 300), instance: this.deps.cfg.instanceId }).catch(() => undefined);
+        this.status = { status: "degraded", detail: String(err?.message ?? err).slice(0, 300) };
         if (failures === 3) await this.terminal.warn("Indexer is retrying after repeated RPC/database errors.", `indexer-retry:${Math.floor(now / 600_000)}`).catch(() => undefined);
         await sleep(delay, signal);
       }
     }
+    clearInterval(hb);
     this.ws?.stop();
+    if (this.leader) await heartbeat(this.deps.db, "indexer", { status: "stopped" }).catch(() => undefined);
     await this.lease.release().catch(() => undefined);
-    await heartbeat(this.deps.db, "indexer", { status: "stopped" }).catch(() => undefined);
   }
 
   stop() {

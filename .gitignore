@@ -12,3 +12,4 @@ coverage/
 *.tsbuildinfo
 secrets/
 *.keypair.json
+apps/web/next-env.d.ts

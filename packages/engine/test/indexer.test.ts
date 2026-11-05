@@ -115,3 +115,24 @@ describe("indexer", () => {
     expect(buys.filter((b) => /below minimum/.test(b.message)).length).toBe(1);
   });
 });
+
+describe("indexer without history backfill", () => {
+  test("attaching mid-period still ingests the whole current reward period, but nothing before it", async () => {
+    const r = await rig({ env: { INDEXER_BACKFILL: "none" } });
+    const old = r.chain.addMockTrade({ trader: wallet(), pool: MOCK_POOL, kind: "buy", quote: SOL, slot: 500 });
+    // a previous round snapshotted at slot 900
+    await r.db.Round.create({ roundNumber: 1, roundIndex: 1, startsAt: new Date(), endsAt: new Date(), windowStartsAt: new Date(), state: "rolled_over", snapshotSlot: 900 });
+    r.chain.slot = 1_000;
+    const inPeriod = r.trade({ trader: wallet(), quote: SOL });
+    const idx = indexer(r);
+    await idx.init();
+    await idx.pollOnce();
+    const sigs = await r.db.Swap.distinct("signature");
+    expect(sigs).toEqual([inPeriod]);
+    expect(sigs).not.toContain(old);
+    r.chain.advance(1);
+    const later = r.trade({ trader: wallet(), quote: SOL });
+    await idx.pollOnce();
+    expect((await r.db.Swap.distinct("signature")).sort()).toEqual([inPeriod, later].sort());
+  });
+});

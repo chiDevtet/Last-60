@@ -1,0 +1,115 @@
+@import "tailwindcss";
+
+/* LAST60 design tokens. Dark-first. Brand accents (signal/pulse) are for chrome and the
+   countdown; chart marks use the validated `series` step; status colours are reserved for state
+   and always ship with an icon + label. */
+@theme {
+  --color-void: #07080c;
+  --color-carbon: #0d1017;
+  --color-graphite: #141924;
+  --color-slate: #1c2230;
+  --color-line: rgb(148 163 184 / 0.11);
+  --color-line-strong: rgb(148 163 184 / 0.2);
+  --color-frost: #e9edf5;
+  --color-mist: #8b93a7;
+  --color-dim: #5c6478;
+  --color-signal: #38e1ff;
+  --color-pulse: #7b61ff;
+  --color-series: #1a9fcc;
+  --color-good: #25a06c;
+  --color-warn: #bf8a16;
+  --color-bad: #e0565a;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+
+  --radius-card: 18px;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: var(--color-void);
+  color: var(--color-frost);
+}
+
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgb(56 225 255 / 0.25);
+}
+
+.card {
+  background: linear-gradient(180deg, rgb(20 25 36 / 0.72), rgb(13 16 23 / 0.72));
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-card);
+  box-shadow: 0 1px 0 rgb(255 255 255 / 0.03) inset, 0 20px 60px -30px rgb(0 0 0 / 0.8);
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-mist);
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.bg-grid {
+  background-image: linear-gradient(to right, rgb(255 255 255 / 0.028) 1px, transparent 1px),
+    linear-gradient(to bottom, rgb(255 255 255 / 0.028) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse at 50% 20%, black 30%, transparent 75%);
+}
+
+/* Countdown scanner sweep (final minute only). */
+@keyframes scan {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.scanner {
+  animation: scan var(--scan-duration, 2.4s) linear infinite;
+  transform-origin: 50% 50%;
+}
+
+@keyframes livepulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.live-dot {
+  animation: livepulse 1.8s ease-in-out infinite;
+}
+
+.terminal-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(148 163 184 / 0.25) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scanner,
+  .live-dot {
+    animation: none;
+  }
+}
+
+.focus-ring:focus-visible {
+  outline: 2px solid var(--color-signal);
+  outline-offset: 2px;
+  border-radius: 8px;
+}

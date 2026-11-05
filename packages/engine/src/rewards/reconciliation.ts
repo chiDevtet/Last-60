@@ -62,6 +62,11 @@ export class Reconciler {
     const settings = await this.d.settings.get();
     for (const address of info.watchAddresses) {
       const cursor = await readCursor(this.d.db, cursorId(info.provider, info.poolAddress, address));
+      if (!cursor?.lastSignature) {
+        // The indexer has not established its position yet; comparing now would be meaningless.
+        await this.d.db.Reconciliation.create({ kind: "fee_source", status: "skipped", details: { reason: "indexer cursor not established" } });
+        return null;
+      }
       await syncAddress({ db: this.d.db, provider, minBuyQuote: settings.minBuyQuote, rpc: this.d.rpc, terminal: this.d.terminal }, address, { untilSignature: cursor?.lastSignature ?? null, source: "catchup", cap: 20_000, concurrency: 4 });
     }
     const poolDoc: any = await this.d.db.Pool.findOne({ key: `${info.provider}:${info.poolAddress}` }).lean();

@@ -231,21 +231,20 @@ export class RoundScheduler {
       }
       await this.d.terminal.processingStarted(roundNumber);
 
-      // 2. Make sure every transaction up to the snapshot slot is ingested.
-      const settleUntil = executedAt.getTime() + this.d.cfg.schedule.snapshotSettleMs;
-      const wait = settleUntil - this.d.clock.now();
-      if (wait > 0) await this.d.clock.sleep(wait);
-      await this.catchUp(snapshotSlot);
-
-      // 3. Reward period: (previous snapshot slot, this snapshot slot].
+      // 2. Reward period: (previous snapshot slot, this snapshot slot]. With no earlier snapshot
+      //    the period starts at genesis, so buys/fees of missed initial rounds are not lost.
       const settings = await this.d.settings.get(true);
       const provider = this.d.provider();
       const pool = provider.info();
       const prev: any = await this.d.db.Round.findOne({ snapshotSlot: { $ne: null, $lt: snapshotSlot }, roundNumber: { $lt: roundNumber }, state: { $nin: ["snapshotting"] } }).sort({ snapshotSlot: -1 }).lean();
-      // With no earlier snapshot the period starts at genesis, so buys/fees of missed initial
-      // rounds are not lost.
       const genesisStart = boundsOf(await this.ensureGenesis(now), this.params).startsAt;
       const period = { pool: pool.poolAddress, afterSlot: prev?.snapshotSlot ?? null, periodStartAt: prev ? null : new Date(genesisStart), snapshotSlot };
+
+      // 3. Make sure every transaction of the period up to the snapshot slot is ingested.
+      const settleUntil = executedAt.getTime() + this.d.cfg.schedule.snapshotSettleMs;
+      const wait = settleUntil - this.d.clock.now();
+      if (wait > 0) await this.d.clock.sleep(wait);
+      await this.catchUp(snapshotSlot, { afterSlot: period.afterSlot, sinceTime: period.periodStartAt ? Math.floor(period.periodStartAt.getTime() / 1000) : null });
       const excluded = new Set([...settings.excludedWallets, pool.beneficiary, pool.creator, ...(this.d.payer ? [this.d.payer.publicKey.toBase58()] : []), ...(settings.expectedPayoutPublicKey ? [settings.expectedPayoutPublicKey] : [])]);
       const selection = await selectRecipients(this.d.db, this.d.rpc, { ...period, minBuyQuote: settings.minBuyQuote, buyerCount: settings.buyerCount, excluded });
       const fees = await periodFees(this.d.db, period, settings.payoutAssetMint);
@@ -347,17 +346,18 @@ export class RoundScheduler {
    * Ingest everything up to the snapshot slot. Read-only w.r.t. the indexer's cursor; idempotent.
    * Throws (round retried) rather than snapshotting incomplete data.
    */
-  async catchUp(snapshotSlot: number) {
+  async catchUp(snapshotSlot: number, bounds: { afterSlot: number | null; sinceTime: number | null }) {
     const provider = this.d.provider();
     const pool = provider.info();
     const settings = await this.d.settings.get();
     for (const address of pool.watchAddresses) {
       const key = cursorId(pool.provider, pool.poolAddress, address);
       const cursor = await readCursor(this.d.db, key);
+      // Bounded: from the indexer's cursor if it has one, never further back than the period.
       await syncAddress(
         { db: this.d.db, provider, terminal: this.d.terminal, minBuyQuote: settings.minBuyQuote, rpc: this.d.rpc, log: this.log },
         address,
-        { untilSignature: cursor?.lastSignature ?? null, source: "catchup", cap: 20_000, concurrency: 4 },
+        { untilSignature: cursor?.lastSignature ?? null, source: "catchup", cap: 20_000, concurrency: 4, bounds },
       );
     }
     // Every signature returned by the RPC at `confirmed` up to now is ingested; the snapshot slot

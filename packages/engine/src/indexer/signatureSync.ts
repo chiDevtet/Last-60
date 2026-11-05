@@ -30,14 +30,26 @@ async function writeCursor(db: Models, id: string, c: Cursor) {
   await db.WorkerState.updateOne({ _id: id }, { $set: { cursor: { ...c, updatedAt: new Date() }, heartbeatAt: new Date() } }, { upsert: true });
 }
 
-/** Fetch all signatures newer than `until` (or the full history if until is null, capped). */
-export async function fetchNewSignatures(rpc: ChainRpc, address: string, until: string | null, cap: number): Promise<SignatureInfo[]> {
+export interface FetchBounds {
+  /** Stop once signatures are at or below this slot (exclusive lower bound). */
+  afterSlot?: number | null;
+  /** Stop once signatures are older than this unix time (seconds). */
+  sinceTime?: number | null;
+}
+
+/**
+ * Fetch signatures newer than `until`, newest-first paging, returned oldest-first.
+ * Without `until`, paging is bounded by `bounds` (catch-up) or by `cap` (backfill).
+ */
+export async function fetchNewSignatures(rpc: ChainRpc, address: string, until: string | null, cap: number, bounds: FetchBounds = {}): Promise<SignatureInfo[]> {
   const out: SignatureInfo[] = [];
   let before: string | undefined;
+  const inBounds = (s: SignatureInfo) => (bounds.afterSlot == null || s.slot > bounds.afterSlot) && (bounds.sinceTime == null || s.blockTime == null || s.blockTime >= bounds.sinceTime);
   for (;;) {
     const page = await rpc.getSignaturesForAddress(address, { until: until ?? undefined, before, limit: 1000, commitment: "confirmed" });
-    out.push(...page);
-    if (page.length < 1000 || out.length >= cap) break;
+    const kept = page.filter(inBounds);
+    out.push(...kept);
+    if (page.length < 1000 || out.length >= cap || kept.length < page.length) break;
     before = page[page.length - 1]!.signature;
   }
   return out.reverse(); // oldest first
@@ -72,23 +84,33 @@ export interface SyncStats {
 export async function syncAddress(
   ctx: IngestContext & { rpc: ChainRpc },
   address: string,
-  o: { cursorKey?: string; untilSignature?: string | null; source: "indexer" | "catchup" | "backfill"; cap: number; concurrency: number; maxSlot?: number },
-): Promise<SyncStats> {
+  o: { cursorKey?: string; untilSignature?: string | null; source: "indexer" | "catchup" | "backfill"; cap: number; concurrency: number; maxSlot?: number; bounds?: FetchBounds; maxPerPass?: number; signal?: AbortSignal },
+): Promise<SyncStats & { more: boolean }> {
   const cursor = o.cursorKey ? await readCursor(ctx.db, o.cursorKey) : null;
   const until = o.untilSignature !== undefined ? o.untilSignature : (cursor?.lastSignature ?? null);
-  const sigs = await fetchNewSignatures(ctx.rpc, address, until, o.cap);
-  const stats: SyncStats = { fetched: sigs.length, ingested: 0, newSwaps: 0, newClaims: 0, lastSlot: cursor?.lastSlot ?? 0 };
+  const all = await fetchNewSignatures(ctx.rpc, address, until, o.cap, o.bounds);
+  // Bounded pass (oldest first); the cursor makes the next pass continue exactly here.
+  const sigs = o.maxPerPass ? all.slice(0, o.maxPerPass) : all;
+  const stats: SyncStats & { more: boolean } = { fetched: all.length, ingested: 0, newSwaps: 0, newClaims: 0, lastSlot: cursor?.lastSlot ?? 0, more: sigs.length < all.length };
   if (!sigs.length) return stats;
 
-  // Fetch transactions concurrently, ingest strictly in chronological order.
+  // Fetch transactions concurrently, ingest strictly in chronological order. Signatures that are
+  // already stored (e.g. ingested by the websocket fast path) are not downloaded again.
   const CHUNK = Math.max(o.concurrency * 4, 8);
   for (let i = 0; i < sigs.length; i += CHUNK) {
+    if (o.signal?.aborted) {
+      stats.more = true;
+      break;
+    }
     const chunk = sigs.slice(i, i + CHUNK);
-    const raws = await mapLimit(chunk, o.concurrency, async (s) => (s.err ? null : await ctx.rpc.getTransactionRaw(s.signature, "confirmed")));
+    const names = chunk.map((s) => s.signature);
+    const [swapSigs, claimSigs] = await Promise.all([ctx.db.Swap.distinct("signature", { signature: { $in: names } }), ctx.db.FeeClaim.distinct("signature", { signature: { $in: names }, status: "confirmed" })]);
+    const known = new Set<string>([...swapSigs, ...claimSigs]);
+    const raws = await mapLimit(chunk, o.concurrency, async (s) => (s.err || known.has(s.signature) ? null : await ctx.rpc.getTransactionRaw(s.signature, "confirmed")));
     for (let j = 0; j < chunk.length; j++) {
       const s = chunk[j]!;
       if (o.maxSlot !== undefined && s.slot > o.maxSlot) continue;
-      if (!s.err) {
+      if (!s.err && !known.has(s.signature)) {
         const raw = raws[j];
         if (!raw) throw new Error(`transaction ${s.signature} not yet available from RPC`); // retried next poll; cursor not advanced
         const commitment = s.confirmationStatus === "finalized" ? "finalized" : "confirmed";
