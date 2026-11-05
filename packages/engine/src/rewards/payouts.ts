@@ -18,6 +18,9 @@ import { RpcError, type ChainRpc } from "../chain/rpc";
 import { buildPayoutTransaction } from "../chain/payoutTx";
 import type { Models } from "../db/models";
 import { big, dec } from "../db/decimal";
+import { inTransaction } from "../db/connection";
+import { ASSOCIATED_TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { PublicKey } from "@solana/web3.js";
 import type { TerminalWriter } from "../terminal/terminal";
 import { backoffDelay } from "../util/backoff";
 import { randomToken } from "../util/crypto";
@@ -37,8 +40,13 @@ export interface PayoutDeps {
 }
 
 const SIGNING_LOCK_MS = 30_000;
+const TOKEN_PROGRAM_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const REBROADCAST_MS = 2_000;
 const TX_FEE_ESTIMATE = 10_000n; // base fee + priority headroom per payout
+const WSOL = "So11111111111111111111111111111111111111112";
+/** Rent-exempt size of a token account (Token: 165 bytes; Token-2022 accounts with extensions are larger). */
+const TOKEN_ACCOUNT_SIZE = 165;
+const TOKEN_2022_ACCOUNT_SIZE = 182;
 
 export class PayoutExecutor {
   private readonly log: Logger;
@@ -109,19 +117,9 @@ export class PayoutExecutor {
     }
     const amount = big(p.amount);
 
-    // Funds check: balance must cover this payout, everything in flight, fees and the reserve.
-    if (p.mint === "So11111111111111111111111111111111111111112") {
-      const [balance, inflight] = await Promise.all([this.d.rpc.getBalance(payerPk, "confirmed"), this.inflightTotal(p._id)]);
-      const need = amount + inflight + TX_FEE_ESTIMATE + this.d.cfg.payout.minReserveLamports;
-      if (balance < need) {
-        await this.d.db.Payout.updateOne({ _id: p._id, state: "pending" }, { $set: { lastError: `insufficient payout wallet balance (have ${balance}, need ${need})`, nextAttemptAt: new Date(this.now() + 15_000) } });
-        await this.d.db.Round.updateOne({ roundNumber: p.roundNumber, state: { $in: ["paying", "awaiting_funds"] } }, { $set: { state: "awaiting_funds" } });
-        await this.d.terminal.warn(`Payout wallet balance is insufficient; round #${p.roundNumber} payouts are queued until it is funded.`, `funds:${p.roundNumber}:${Math.floor(this.now() / 600_000)}`, p.roundNumber);
-        return false;
-      }
-    }
-
-    // CAS pending → signing with a fresh fencing token.
+    // CAS pending → signing with a fresh fencing token. Claiming the row FIRST makes it a
+    // reservation: every concurrent worker (in any process) that checks funds after this point counts
+    // this payout as in flight, so two workers can never both rely on the same available balance.
     const token = randomToken(12);
     const claimed = await this.d.db.Payout.findOneAndUpdate(
       { _id: p._id, state: "pending" },
@@ -130,8 +128,20 @@ export class PayoutExecutor {
     ).lean();
     if (!claimed) return false;
 
+    const token2022 = p.mint !== WSOL ? await this.d.tokenInfo?.(p.mint) : undefined;
+    const shortfall = await this.fundsShortfall(p, amount, payerPk, token2022);
+    if (shortfall) {
+      // Release the reservation (only if we still own it) and wait for funding.
+      // Jittered retry: two workers that reserved at the same instant both see each other and back
+      // off (safe — nothing is over-committed); jitter breaks the symmetry so one proceeds next time.
+      await this.d.db.Payout.updateOne({ _id: p._id, state: "signing", "lock.token": token }, { $set: { state: "pending", lock: null, lastError: shortfall, nextAttemptAt: new Date(this.now() + 5_000 + Math.floor(Math.random() * 15_000)) } });
+      await this.d.db.Round.updateOne({ roundNumber: p.roundNumber, state: { $in: ["paying", "awaiting_funds"] } }, { $set: { state: "awaiting_funds" } });
+      await this.d.terminal.warn(`Payout wallet balance is insufficient; round #${p.roundNumber} payouts are queued until it is funded.`, `funds:${p.roundNumber}:${Math.floor(this.now() / 600_000)}`, p.roundNumber);
+      this.log.warn({ payoutId: String(p._id), roundNumber: p.roundNumber, detail: shortfall }, "payout waiting for funds");
+      return false;
+    }
+
     const { blockhash, lastValidBlockHeight } = await this.d.rpc.getLatestBlockhash("confirmed");
-    const token2022 = p.mint !== "So11111111111111111111111111111111111111112" ? await this.d.tokenInfo?.(p.mint) : undefined;
     const built = buildPayoutTransaction({
       payer: this.d.payer,
       recipient: p.recipient,
@@ -231,42 +241,52 @@ export class PayoutExecutor {
     const p: any = await this.d.db.Payout.findById(payoutId).lean();
     if (!p || p.current?.signature !== signature) return false;
     const exhausted = (p.attemptCount ?? 0) >= this.d.cfg.payout.maxAttempts;
-    const res = await this.d.db.Payout.updateOne(
-      { _id: payoutId, state: "submitted", "current.signature": signature },
-      {
-        $set: {
-          state: exhausted ? "failed" : "pending",
-          current: null,
-          lastError: reason,
-          nextAttemptAt: new Date(this.now() + backoffDelay(p.attemptCount ?? 0, { baseMs: 2000, maxMs: 60_000, jitter: false })),
-          "attempts.$[a].outcome": outcome,
-          "attempts.$[a].error": reason,
+    // The state change and (when exhausted) the PAYOUT_FAILED entry commit atomically.
+    const modified = await inTransaction(this.d.db, async (session) => {
+      const res = await this.d.db.Payout.updateOne(
+        { _id: payoutId, state: "submitted", "current.signature": signature },
+        {
+          $set: {
+            state: exhausted ? "failed" : "pending",
+            current: null,
+            lastError: reason,
+            ...(exhausted ? { ledgerApplied: true } : {}),
+            nextAttemptAt: new Date(this.now() + backoffDelay(p.attemptCount ?? 0, { baseMs: 2000, maxMs: 60_000, jitter: false })),
+            "attempts.$[a].outcome": outcome,
+            "attempts.$[a].error": reason,
+          },
         },
-      },
-      { arrayFilters: [{ "a.signature": signature }] },
-    );
-    if (!res.modifiedCount) return false;
+        { arrayFilters: [{ "a.signature": signature }], session },
+      );
+      if (!res.modifiedCount) return false;
+      if (exhausted) await this.d.db.LedgerEntry.updateOne({ key: `PAYOUT_FAILED:${String(payoutId)}` }, { $setOnInsert: { key: `PAYOUT_FAILED:${String(payoutId)}`, type: "PAYOUT_FAILED", roundNumber: p.roundNumber, amount: p.amount, mint: p.mint, payoutId, memo: reason } }, { upsert: true, session });
+      return true;
+    });
+    if (!modified) return false;
     this.log.warn({ payoutId: String(payoutId), signature, outcome, exhausted, reason }, "payout attempt retired");
     if (exhausted) {
-      await this.d.db.LedgerEntry.updateOne({ key: `PAYOUT_FAILED:${String(payoutId)}` }, { $setOnInsert: { key: `PAYOUT_FAILED:${String(payoutId)}`, type: "PAYOUT_FAILED", roundNumber: p.roundNumber, amount: p.amount, mint: p.mint, payoutId, memo: reason } }, { upsert: true });
       await this.d.terminal.error(`Payout for round #${p.roundNumber} failed after ${p.attemptCount} attempts; queued for operator review (funds not sent).`, `payout-failed:${String(payoutId)}`, p.roundNumber);
     }
     return true;
   }
 
+  /**
+   * U2: the payout's state change, its PAYOUT_CONFIRMED ledger entry and the recipient's statistics
+   * commit in ONE MongoDB transaction. A crash can no longer leave a confirmed payout without its
+   * ledger entry; a retry finds the payout already confirmed (CAS fails) and writes nothing twice.
+   */
   private async confirm(p: any, signature: string, slot: number): Promise<boolean> {
-    const res = await this.d.db.Payout.updateOne(
-      { _id: p._id, state: "submitted", "current.signature": signature },
-      { $set: { state: "confirmed", confirmedSignature: signature, confirmedSlot: slot, confirmedAt: new Date(this.now()), lastError: null, "attempts.$[a].outcome": "confirmed" } },
-      { arrayFilters: [{ "a.signature": signature }] },
-    );
-    if (!res.modifiedCount) return false;
-    await this.d.db.LedgerEntry.updateOne(
-      { key: `PAYOUT_CONFIRMED:${String(p._id)}` },
-      { $setOnInsert: { key: `PAYOUT_CONFIRMED:${String(p._id)}`, type: "PAYOUT_CONFIRMED", roundNumber: p.roundNumber, amount: p.amount, mint: p.mint, payoutId: p._id, signature, memo: p.recipient } },
-      { upsert: true },
-    );
-    await this.d.db.BuyerActivity.updateOne({ wallet: p.recipient }, { $inc: { rewardsReceived: p.amount, roundsWon: 1 } }, { upsert: true });
+    const done = await inTransaction(this.d.db, async (session) => {
+      const res = await this.d.db.Payout.updateOne(
+        { _id: p._id, state: "submitted", "current.signature": signature },
+        { $set: { state: "confirmed", confirmedSignature: signature, confirmedSlot: slot, confirmedAt: new Date(this.now()), lastError: null, ledgerApplied: true, "attempts.$[a].outcome": "confirmed" } },
+        { arrayFilters: [{ "a.signature": signature }], session },
+      );
+      if (!res.modifiedCount) return false;
+      await applyConfirmedLedger(this.d.db, p, signature, session);
+      return true;
+    });
+    if (!done) return false;
     await this.d.terminal.payoutConfirmed(p.roundNumber, { recipient: p.recipient, amount: big(p.amount), signature, commitment: this.d.cfg.payout.commitment });
     return true;
   }
@@ -283,9 +303,43 @@ export class PayoutExecutor {
     return true;
   }
 
-  private async inflightTotal(excludeId: unknown): Promise<bigint> {
-    const r: any[] = await this.d.db.Payout.aggregate([{ $match: { state: { $in: ["signing", "submitted"] }, mode: "live", _id: { $ne: excludeId } } }, { $group: { _id: null, t: { $sum: "$amount" } } }]);
-    return big(r[0]?.t ?? 0);
+  /** Other live payouts currently reserved (signing) or in flight (submitted), per mint and in total. */
+  private async inflight(excludeId: unknown): Promise<{ byMint: Map<string, bigint>; count: number }> {
+    const r: any[] = await this.d.db.Payout.aggregate([{ $match: { state: { $in: ["signing", "submitted"] }, mode: "live", _id: { $ne: excludeId } } }, { $group: { _id: "$mint", t: { $sum: "$amount" }, n: { $sum: 1 } } }]);
+    return { byMint: new Map(r.map((x) => [x._id as string, big(x.t)])), count: r.reduce((s, x) => s + (x.n as number), 0) };
+  }
+
+  /**
+   * U5 preflight. Returns null when funds suffice, else an actionable diagnostic. Called while this
+   * payout is already reserved (state `signing`), and every other reserved/in-flight payout is
+   * counted, so concurrent workers cannot over-commit the same balance.
+   *   SOL payout: SOL ≥ amount + other SOL payouts in flight + fees (this + in flight) + reserve
+   *   SPL payout: token balance ≥ amount + same-mint payouts in flight, AND
+   *               SOL ≥ fees + rent for the recipient's token account if it must be created + reserve
+   */
+  private async fundsShortfall(p: any, amount: bigint, payerPk: string, token?: { program: string; decimals: number }): Promise<string | null> {
+    const inflight = await this.inflight(p._id);
+    const reserve = this.d.cfg.payout.minReserveLamports;
+    const fees = TX_FEE_ESTIMATE * BigInt(1 + inflight.count);
+    const sol = await this.d.rpc.getBalance(payerPk, "confirmed");
+    if (p.mint === WSOL) {
+      const need = amount + (inflight.byMint.get(WSOL) ?? 0n) + fees + reserve;
+      return sol >= need ? null : `insufficient SOL in payout wallet ${payerPk}: have ${sol}, need ${need} (payout ${amount} + in flight ${inflight.byMint.get(WSOL) ?? 0n} + fees ${fees} + reserve ${reserve}); fund it with at least ${need - sol} lamports`;
+    }
+    if (!token) return `token program/decimals for ${p.mint} unavailable; refusing to sign an SPL payout without them`;
+    const program = new PublicKey(token.program);
+    const mint = new PublicKey(p.mint);
+    const source = getAssociatedTokenAddressSync(mint, new PublicKey(payerPk), false, program, ASSOCIATED_TOKEN_PROGRAM_ID).toBase58();
+    const dest = getAssociatedTokenAddressSync(mint, new PublicKey(p.recipient), true, program, ASSOCIATED_TOKEN_PROGRAM_ID).toBase58();
+    const [bal, destAcc] = await Promise.all([this.d.rpc.getTokenAccountBalance(source, "confirmed"), this.d.rpc.getAccountInfo(dest, "confirmed")]);
+    const have = bal?.amount ?? 0n;
+    const needToken = amount + (inflight.byMint.get(p.mint) ?? 0n);
+    if (have < needToken) return `insufficient ${p.mint} in payout token account ${source}: have ${have}, need ${needToken} (payout ${amount} + in flight ${needToken - amount}); fund it with at least ${needToken - have} base units`;
+    const rent = destAcc.value ? 0n : BigInt(await this.d.rpc.getMinimumBalanceForRentExemption(token.program === TOKEN_PROGRAM_2022 ? TOKEN_2022_ACCOUNT_SIZE : TOKEN_ACCOUNT_SIZE));
+    // Other in-flight SPL payouts may also need rent; reserve one account's rent per in-flight payout.
+    const rentOthers = inflight.count > 0 ? BigInt(await this.d.rpc.getMinimumBalanceForRentExemption(TOKEN_2022_ACCOUNT_SIZE)) * BigInt(inflight.count) : 0n;
+    const needSol = fees + rent + rentOthers + (inflight.byMint.get(WSOL) ?? 0n) + reserve;
+    return sol >= needSol ? null : `insufficient SOL for fees/rent in payout wallet ${payerPk}: have ${sol}, need ${needSol} (fees ${fees} + recipient token-account rent ${rent} + in-flight rent ${rentOthers} + reserve ${reserve}); fund it with at least ${needSol - sol} lamports`;
   }
 
   /** Recompute a round's paid/pending/failed totals and its state from its payouts. */
@@ -332,4 +386,46 @@ export async function requeueFailedPayout(db: Models, payoutId: string, actor: s
   await db.LedgerEntry.create({ key: `PAYOUT_REQUEUED:${payoutId}:${now}`, type: "PAYOUT_REQUEUED", roundNumber: p.roundNumber, amount: p.amount, mint: p.mint, payoutId: p._id, memo: `requeued by ${actor}` });
   await db.Round.updateOne({ roundNumber: p.roundNumber, state: "attention" }, { $set: { state: "paying" } });
   return true;
+}
+
+/** Ledger entry + buyer statistics for a confirmed payout (inside the caller's transaction). */
+async function applyConfirmedLedger(db: Models, p: any, signature: string, session: any) {
+  await db.LedgerEntry.updateOne(
+    { key: `PAYOUT_CONFIRMED:${String(p._id)}` },
+    { $setOnInsert: { key: `PAYOUT_CONFIRMED:${String(p._id)}`, type: "PAYOUT_CONFIRMED", roundNumber: p.roundNumber, amount: p.amount, mint: p.mint, payoutId: p._id, signature, memo: p.recipient } },
+    { upsert: true, session },
+  );
+  await db.BuyerActivity.updateOne({ wallet: p.recipient }, { $inc: { rewardsReceived: p.amount, roundsWon: 1 } }, { upsert: true, session });
+}
+
+/**
+ * U2 recovery for legacy / partially completed rows: confirmed or failed payouts whose ledger
+ * effects were not applied atomically (`ledgerApplied` not true). Idempotent — each row is repaired
+ * under a CAS on `ledgerApplied` inside a transaction, so concurrent repairs or retries never
+ * duplicate a ledger entry or a statistics increment.
+ *   - confirmed, PAYOUT_CONFIRMED missing → write it + buyer statistics.
+ *   - confirmed, PAYOUT_CONFIRMED present (legacy write order: ledger then stats) → only mark
+ *     applied; statistics are display-only and cannot be proven missing, so they are left as is.
+ *   - failed, PAYOUT_FAILED missing → write it.
+ */
+export async function repairPayoutLedger(db: Models): Promise<{ repaired: number; marked: number }> {
+  let repaired = 0;
+  let marked = 0;
+  const rows: any[] = await db.Payout.find({ state: { $in: ["confirmed", "failed"] }, ledgerApplied: { $ne: true } }).limit(500).lean();
+  for (const p of rows) {
+    const key = p.state === "confirmed" ? `PAYOUT_CONFIRMED:${String(p._id)}` : `PAYOUT_FAILED:${String(p._id)}`;
+    await inTransaction(db, async (session) => {
+      const cas = await db.Payout.updateOne({ _id: p._id, state: p.state, ledgerApplied: { $ne: true } }, { $set: { ledgerApplied: true } }, { session });
+      if (!cas.modifiedCount) return;
+      const exists = await db.LedgerEntry.exists({ key }).session(session);
+      if (exists) {
+        marked++;
+        return;
+      }
+      if (p.state === "confirmed") await applyConfirmedLedger(db, p, p.confirmedSignature, session);
+      else await db.LedgerEntry.updateOne({ key }, { $setOnInsert: { key, type: "PAYOUT_FAILED", roundNumber: p.roundNumber, amount: p.amount, mint: p.mint, payoutId: p._id, memo: p.lastError ?? "failed" } }, { upsert: true, session });
+      repaired++;
+    });
+  }
+  return { repaired, marked };
 }
