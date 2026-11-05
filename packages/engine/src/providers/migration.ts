@@ -34,6 +34,7 @@
  *   - Raydium AMM v4 has no creator fee.
  */
 import { PublicKey } from "@solana/web3.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { instructionDiscriminator } from "../chain/anchorEvents";
 import type { ChainRpc } from "../chain/rpc";
 import type { NormalizedTx } from "../chain/tx";
@@ -45,6 +46,8 @@ export const DAMM_V2_PROGRAM_ID = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
 export const DAMM_V1_PROGRAM_ID = "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB";
 export const RAYDIUM_CPMM_PROGRAM_ID = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 export const RAYDIUM_AMM_V4_PROGRAM_ID = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+/** Raydium liquidity-lock program ("Burn & Earn"): holds locked CPMM LP and pays LP fees to the fee-key NFT holder. */
+export const RAYDIUM_CP_LOCK_PROGRAM_ID = "LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE";
 /** DBC `pool_authority` PDA — the creator recorded on DAMM v2 pools created by DBC migration. */
 export const DBC_POOL_AUTHORITY = "FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM";
 
@@ -64,6 +67,8 @@ export interface MigrationRecord {
   quoteMint: string;
   /** DAMM v2 LP positions created by the migration (the second may be absent on-chain). */
   positions: { position: string; nftMint: string; nftAccount: string }[];
+  /** LaunchLab → CPMM: LP locks (fee-key NFTs) created by the migration. */
+  locks?: MigrationLpLock[];
 }
 
 const IX = {
@@ -95,7 +100,7 @@ export function parseMigration(tx: NormalizedTx, provider: "meteora_dbc" | "rayd
     }
     if (provider === "raydium_launchlab" && ix.programId === LAUNCHLAB_PROGRAM) {
       if (disc === IX.llCpmm && a[17] === bondingPool) {
-        return { ...base, kind: "launchlab_cpmm", destinationProgram: a[4]!, destinationPool: a[5]!, destinationConfig: a[10] ?? null, baseMint: a[1]!, quoteMint: a[2]!, positions: [] };
+        return { ...base, kind: "launchlab_cpmm", destinationProgram: a[4]!, destinationPool: a[5]!, destinationConfig: a[10] ?? null, baseMint: a[1]!, quoteMint: a[2]!, positions: [], locks: parseMigrationLocks(tx).filter((l) => l.pool === a[5]) };
       }
       if (disc === IX.llAmm && a[23] === bondingPool) {
         return { ...base, kind: "launchlab_amm_v4", destinationProgram: a[12]!, destinationPool: a[13]!, destinationConfig: null, baseMint: a[1]!, quoteMint: a[2]!, positions: [] };
@@ -201,85 +206,248 @@ export function decodeCpmmPool(d: Buffer) {
 }
 
 /** SPL token account (Token / Token-2022 base layout). */
-function decodeTokenAccount(d: Buffer) {
+export function decodeTokenAccount(d: Buffer) {
   return { mint: key(d, 0), owner: key(d, 32), amount: u64(d, 64) };
 }
 
-export interface VerifiedMigration extends MigrationRecord {
-  checks: Record<string, boolean>;
-  /** DAMM v2: each migration position with its current NFT holder and claimable fees. */
-  positionStates: { position: string; holder: string | null; liquidity: bigint; claimableA: bigint; claimableB: bigint; claimedA: bigint; claimedB: bigint }[];
-  /** CPMM: the wallet receiving the CPMM creator fee. */
-  cpmmPoolCreator: string | null;
-  tokenAMint: string | null;
-  tokenBMint: string | null;
+const accountDisc = (name: string) => Buffer.from(sha256(new TextEncoder().encode(`account:${name}`))).subarray(0, 8);
+export const DAMM_V2_POOL_DISC = accountDisc("Pool");
+export const DAMM_V2_POSITION_DISC = accountDisc("Position");
+export const DAMM_V2_CONFIG_DISC = accountDisc("Config");
+export const CPMM_POOL_DISC = accountDisc("PoolState");
+export const CPMM_CONFIG_DISC = accountDisc("AmmConfig");
+export const DAMM_V2_POOL_SIZE = 1112;
+export const DAMM_V2_POSITION_SIZE = 408;
+export const CPMM_POOL_SIZE = 637;
+export const CPMM_CONFIG_SIZE = 236;
+
+/** Raydium CPMM `AmmConfig` (236 bytes): fee rates in millionths. `creator_fee_share_rate` sits in the former padding. */
+export function decodeCpmmConfig(d: Buffer) {
+  return { tradeFeeRate: u64(d, 12), protocolFeeRate: u64(d, 20), fundFeeRate: u64(d, 28), creatorFeeRate: u64(d, 108), creatorFeeShareRate: u64(d, 116) };
 }
 
+/** Raydium CPMM `PoolState` fee fields (offsets from the packed zero-copy layout, 637 bytes). */
+export function decodeCpmmPoolFees(d: Buffer) {
+  return { lpSupply: u64(d, 333), creatorFeeOn: d[389]!, enableCreatorFee: d[390]! === 1, creatorFeesToken0: u64(d, 397), creatorFeesToken1: u64(d, 405) };
+}
+
+/** LP locks created by a LaunchLab → CPMM migration (Raydium LP-lock `lock_cp_liquidity` CPIs). */
+export interface MigrationLpLock {
+  lockPda: string;
+  nftMint: string;
+  nftAccount: string;
+  /** Wallet the fee-key NFT was minted to at migration (platform lock wallet or token creator). */
+  nftOwnerAtMigration: string;
+  lpAmount: bigint;
+  pool: string;
+  lpMint: string;
+}
+
+const LOCK_CP_LIQUIDITY_DISC = Buffer.from([216, 157, 29, 78, 38, 51, 31, 26]);
+export const COLLECT_CP_FEES_DISC = Buffer.from([8, 30, 51, 199, 209, 184, 247, 133]);
+
+/** Pure: the LP locks created inside a migration transaction (account order per the Raydium SDK). */
+export function parseMigrationLocks(tx: NormalizedTx): MigrationLpLock[] {
+  const out: MigrationLpLock[] = [];
+  for (const ix of tx.instructions) {
+    if (ix.programId !== RAYDIUM_CP_LOCK_PROGRAM_ID || !ix.data.subarray(0, 8).equals(LOCK_CP_LIQUIDITY_DISC) || ix.data.length < 16) continue;
+    const a = ix.accounts;
+    out.push({ nftOwnerAtMigration: a[3]!, nftMint: a[4]!, nftAccount: a[5]!, pool: a[6]!, lockPda: a[7]!, lpMint: a[8]!, lpAmount: ix.data.readBigUInt64LE(8) });
+  }
+  return out;
+}
+
+/** Current holder of a position / fee-key NFT: its recorded token account if it still holds it, else the mint's largest account. */
+export async function resolveNftHolder(rpc: ChainRpc, nftMint: string, nftAccount: string, preloaded?: { owner: string; data: Buffer } | null, opts: { minContextSlot?: number } = {}): Promise<string | null> {
+  const direct = preloaded ?? (await rpc.getAccountInfo(nftAccount, "confirmed", opts)).value;
+  if (direct && direct.data.length >= 72) {
+    const t = decodeTokenAccount(direct.data);
+    if (t.mint === nftMint && t.amount === 1n) return t.owner;
+  }
+  const largest = await rpc.getTokenLargestAccounts(nftMint).catch(() => null);
+  const top = largest?.value.find((x) => x.amount === 1n);
+  if (!top) return null;
+  const acc = (await rpc.getAccountInfo(top.address, "confirmed", opts)).value;
+  if (!acc || acc.data.length < 72) return null;
+  const t = decodeTokenAccount(acc.data);
+  return t.mint === nftMint && t.amount === 1n ? t.owner : null;
+}
+
+export interface PositionState {
+  position: string;
+  nftMint: string;
+  nftAccount: string;
+  holder: string | null;
+  liquidity: bigint;
+  claimableA: bigint;
+  claimableB: bigint;
+  claimedA: bigint;
+  claimedB: bigint;
+}
+
+export interface VerifiedMigration extends MigrationRecord {
+  /** False for destinations LAST60 cannot verify and account (DAMM v1, Raydium AMM v4). */
+  supported: boolean;
+  checks: Record<string, boolean>;
+  /** Check names that MUST be present and true for this kind. */
+  requiredChecks: string[];
+  failed: string[];
+  /** DAMM v2: each migration position with its current NFT holder and claimable fees. */
+  positionStates: PositionState[];
+  /** CPMM: the wallet receiving the CPMM creator fee. */
+  cpmmPoolCreator: string | null;
+  cpmmLpMint: string | null;
+  cpmmVaults: { token0: string; token1: string } | null;
+  cpmmEnableCreatorFee: boolean | null;
+  cpmmConfig: { creatorFeeRate: string; creatorFeeShareRate: string; tradeFeeRate: string } | null;
+  /** CPMM: LP locks created by the migration (fee-key NFTs). */
+  locks: (MigrationLpLock & { holder: string | null })[];
+  tokenAMint: string | null;
+  tokenBMint: string | null;
+  /** Human-readable reasons when not verified. */
+  notes: string[];
+}
+
+export interface VerifyContext {
+  base: string;
+  quote: string;
+  /** Bonding pool creator (DBC `pool.creator` / LaunchLab `pool.creator`). */
+  bondingCreator?: string;
+  /** DBC config `fee_claimer` (partner). */
+  feeClaimer?: string;
+  /** LaunchLab platform config facts. */
+  platform?: { cpConfig?: string; platformCpCreator?: string | null; platformLockNftWallet?: string };
+}
+
+const REQUIRED: Record<MigrationKind, string[]> = {
+  dbc_damm_v2: ["destinationExists", "destinationProgramIsDammV2", "ownedByExpectedProgram", "layoutMatches", "mintsMatch", "createdByDbcPoolAuthority", "pdaDerivesFromConfigAndMints", "configOwnedByDammV2", "positionsValid", "positionsResolved", "positionOwnersAreCreatorOrPartner"],
+  launchlab_cpmm: ["destinationExists", "destinationProgramIsCpmm", "ownedByExpectedProgram", "layoutMatches", "mintsMatch", "configMatches", "configOwnedByCpmm", "pdaDerivesFromConfigAndMints", "poolCreatorIsCreatorOrPlatform", "locksValid"],
+  dbc_damm_v1: ["supportedDestination"],
+  launchlab_amm_v4: ["supportedDestination"],
+};
+
 /**
- * Prove a migration record against current chain state. Every check must pass before any
- * post-graduation adapter may attribute fees from the destination pool.
+ * Prove a migration record against chain state. A migration is VERIFIED only if every required
+ * check for its kind is present and true — never because the destination merely exists with the
+ * right owner. Unsupported destinations (DAMM v1, AMM v4) are explicitly unverified and never enter
+ * fee accounting.
  */
-export async function verifyMigration(rpc: ChainRpc, m: MigrationRecord, mints: { base: string; quote: string }): Promise<VerifiedMigration> {
+export async function verifyMigration(rpc: ChainRpc, m: MigrationRecord, ctx: VerifyContext): Promise<VerifiedMigration> {
   const checks: Record<string, boolean> = {};
-  const out: VerifiedMigration = { ...m, checks, positionStates: [], cpmmPoolCreator: null, tokenAMint: null, tokenBMint: null };
+  const out: VerifiedMigration = { ...m, supported: m.kind === "dbc_damm_v2" || m.kind === "launchlab_cpmm", checks, requiredChecks: REQUIRED[m.kind], failed: [], positionStates: [], cpmmPoolCreator: null, cpmmLpMint: null, cpmmVaults: null, cpmmEnableCreatorFee: null, cpmmConfig: null, locks: [], tokenAMint: null, tokenBMint: null, notes: [] };
+  const finish = () => {
+    out.failed = out.requiredChecks.filter((c) => checks[c] !== true);
+    return out;
+  };
+  if (!out.supported) {
+    checks.supportedDestination = false;
+    out.notes.push(`${m.kind} destinations are not supported: their account layouts and fee model are not verified in this codebase, so post-migration activity is NOT accounted (fail safe)`);
+    return finish();
+  }
   const { value: acc } = await rpc.getAccountInfo(m.destinationPool);
   checks.destinationExists = !!acc;
-  if (!acc) return out;
-  checks.ownedByExpectedProgram = acc.owner === m.destinationProgram && [DAMM_V2_PROGRAM_ID, DAMM_V1_PROGRAM_ID, RAYDIUM_CPMM_PROGRAM_ID, RAYDIUM_AMM_V4_PROGRAM_ID].includes(acc.owner);
-  const sameMints = (x: string, y: string) => new Set([x, y]).size === 2 && [x, y].includes(mints.base) && [x, y].includes(mints.quote);
+  if (!acc) return finish();
+  const sameMints = (x: string, y: string) => x !== y && [x, y].includes(ctx.base) && [x, y].includes(ctx.quote);
   const pk = (s: string) => new PublicKey(s);
-  const [hi, lo] = Buffer.compare(pk(mints.base).toBuffer(), pk(mints.quote).toBuffer()) > 0 ? [mints.base, mints.quote] : [mints.quote, mints.base];
 
   if (m.kind === "dbc_damm_v2") {
+    checks.destinationProgramIsDammV2 = m.destinationProgram === DAMM_V2_PROGRAM_ID;
+    checks.ownedByExpectedProgram = acc.owner === DAMM_V2_PROGRAM_ID;
+    checks.layoutMatches = acc.data.length === DAMM_V2_POOL_SIZE && acc.data.subarray(0, 8).equals(DAMM_V2_POOL_DISC);
+    if (!checks.layoutMatches) return finish();
     const p = decodeDammV2Pool(acc.data);
     out.tokenAMint = p.tokenAMint;
     out.tokenBMint = p.tokenBMint;
-    checks.mintsMatch = sameMints(p.tokenAMint, p.tokenBMint);
+    checks.mintsMatch = sameMints(p.tokenAMint, p.tokenBMint) && sameMints(m.baseMint, m.quoteMint);
     checks.createdByDbcPoolAuthority = p.creator === DBC_POOL_AUTHORITY;
     if (m.destinationConfig) {
+      const [hi, lo] = Buffer.compare(pk(ctx.base).toBuffer(), pk(ctx.quote).toBuffer()) > 0 ? [ctx.base, ctx.quote] : [ctx.quote, ctx.base];
       const pda = PublicKey.findProgramAddressSync([Buffer.from("pool"), pk(m.destinationConfig).toBuffer(), pk(hi).toBuffer(), pk(lo).toBuffer()], pk(DAMM_V2_PROGRAM_ID))[0].toBase58();
       checks.pdaDerivesFromConfigAndMints = pda === m.destinationPool;
+      const cfg = (await rpc.getAccountInfo(m.destinationConfig)).value;
+      checks.configOwnedByDammV2 = !!cfg && cfg.owner === DAMM_V2_PROGRAM_ID && cfg.data.subarray(0, 8).equals(DAMM_V2_CONFIG_DISC);
+    } else {
+      checks.pdaDerivesFromConfigAndMints = false;
+      checks.configOwnedByDammV2 = false;
     }
     const accounts = await rpc.getMultipleAccounts(m.positions.flatMap((x) => [x.position, x.nftAccount]));
-    m.positions.forEach((x, i) => {
+    let valid = m.positions.length > 0;
+    for (let i = 0; i < m.positions.length; i++) {
+      const x = m.positions[i]!;
       const posAcc = accounts.value[i * 2];
       const nftAcc = accounts.value[i * 2 + 1];
-      if (!posAcc || posAcc.owner !== DAMM_V2_PROGRAM_ID) return; // second position not created
+      if (!posAcc && i > 0) continue; // the optional second position was not created
+      if (!posAcc || posAcc.owner !== DAMM_V2_PROGRAM_ID || posAcc.data.length !== DAMM_V2_POSITION_SIZE || !posAcc.data.subarray(0, 8).equals(DAMM_V2_POSITION_DISC)) {
+        valid = false;
+        continue;
+      }
       const pos = decodeDammV2Position(posAcc.data);
       if (pos.pool !== m.destinationPool || pos.nftMint !== x.nftMint) {
-        checks[`position:${x.position}`] = false;
-        return;
+        valid = false;
+        continue;
       }
-      const nft = nftAcc ? decodeTokenAccount(nftAcc.data) : null;
       const fees = dammV2ClaimableFees(p, pos);
       out.positionStates.push({
         position: x.position,
-        holder: nft && nft.mint === x.nftMint && nft.amount === 1n ? nft.owner : null, // null: NFT moved — resolve via the mint's largest holder
+        nftMint: x.nftMint,
+        nftAccount: x.nftAccount,
+        holder: await resolveNftHolder(rpc, x.nftMint, x.nftAccount, nftAcc),
         liquidity: pos.unlockedLiquidity + pos.vestedLiquidity + pos.permanentLockedLiquidity,
         claimableA: fees.a,
         claimableB: fees.b,
         claimedA: pos.totalClaimedAFee,
         claimedB: pos.totalClaimedBFee,
       });
-    });
-    checks.positionsResolved = out.positionStates.length > 0;
+    }
+    checks.positionsValid = valid;
+    checks.positionsResolved = out.positionStates.length > 0 && out.positionStates.every((s) => s.holder !== null);
+    // The migration hands each position to the DBC pool creator or the config's fee claimer
+    // (migrate_damm_v2_initialize_pool). A holder outside that set means the NFT moved since —
+    // allowed, but such a position is then simply not the creator's.
+    const parties = [ctx.bondingCreator, ctx.feeClaimer].filter(Boolean) as string[];
+    checks.positionOwnersAreCreatorOrPartner = parties.length > 0 && out.positionStates.some((s) => s.holder !== null && parties.includes(s.holder));
   } else if (m.kind === "launchlab_cpmm") {
+    checks.destinationProgramIsCpmm = m.destinationProgram === RAYDIUM_CPMM_PROGRAM_ID;
+    checks.ownedByExpectedProgram = acc.owner === RAYDIUM_CPMM_PROGRAM_ID;
+    checks.layoutMatches = acc.data.length === CPMM_POOL_SIZE && acc.data.subarray(0, 8).equals(CPMM_POOL_DISC);
+    if (!checks.layoutMatches) return finish();
     const p = decodeCpmmPool(acc.data);
     out.tokenAMint = p.token0Mint;
     out.tokenBMint = p.token1Mint;
     out.cpmmPoolCreator = p.poolCreator;
-    checks.mintsMatch = sameMints(p.token0Mint, p.token1Mint);
-    if (m.destinationConfig) {
-      checks.configMatches = p.ammConfig === m.destinationConfig;
-      const [t0, t1] = Buffer.compare(pk(mints.base).toBuffer(), pk(mints.quote).toBuffer()) < 0 ? [mints.base, mints.quote] : [mints.quote, mints.base];
-      const pda = PublicKey.findProgramAddressSync([Buffer.from("pool"), pk(p.ammConfig).toBuffer(), pk(t0).toBuffer(), pk(t1).toBuffer()], pk(RAYDIUM_CPMM_PROGRAM_ID))[0].toBase58();
-      checks.pdaDerivesFromConfigAndMints = pda === m.destinationPool;
+    out.cpmmLpMint = p.lpMint;
+    out.cpmmVaults = { token0: p.token0Vault, token1: p.token1Vault };
+    out.cpmmEnableCreatorFee = decodeCpmmPoolFees(acc.data).enableCreatorFee;
+    checks.mintsMatch = sameMints(p.token0Mint, p.token1Mint) && sameMints(m.baseMint, m.quoteMint);
+    checks.configMatches = !!m.destinationConfig && p.ammConfig === m.destinationConfig && (!ctx.platform?.cpConfig || ctx.platform.cpConfig === p.ammConfig);
+    const cfg = (await rpc.getAccountInfo(p.ammConfig)).value;
+    checks.configOwnedByCpmm = !!cfg && cfg.owner === RAYDIUM_CPMM_PROGRAM_ID && cfg.data.length === CPMM_CONFIG_SIZE && cfg.data.subarray(0, 8).equals(CPMM_CONFIG_DISC);
+    if (checks.configOwnedByCpmm) {
+      const c = decodeCpmmConfig(cfg!.data);
+      out.cpmmConfig = { creatorFeeRate: c.creatorFeeRate.toString(), creatorFeeShareRate: c.creatorFeeShareRate.toString(), tradeFeeRate: c.tradeFeeRate.toString() };
     }
+    const [t0, t1] = Buffer.compare(pk(ctx.base).toBuffer(), pk(ctx.quote).toBuffer()) < 0 ? [ctx.base, ctx.quote] : [ctx.quote, ctx.base];
+    const pda = PublicKey.findProgramAddressSync([Buffer.from("pool"), pk(p.ammConfig).toBuffer(), pk(t0).toBuffer(), pk(t1).toBuffer()], pk(RAYDIUM_CPMM_PROGRAM_ID))[0].toBase58();
+    checks.pdaDerivesFromConfigAndMints = pda === m.destinationPool && p.token0Mint === t0 && p.token1Mint === t1;
+    const allowedCreators = [ctx.bondingCreator, ctx.platform?.platformCpCreator].filter(Boolean) as string[];
+    checks.poolCreatorIsCreatorOrPlatform = allowedCreators.includes(p.poolCreator);
+    // LP locks minted at migration: each must lock THIS pool's LP mint, in a lock-program account.
+    const locks = m.locks ?? [];
+    let locksOk = locks.every((l) => l.pool === m.destinationPool && l.lpMint === p.lpMint);
+    if (locks.length) {
+      const la = await rpc.getMultipleAccounts(locks.flatMap((l) => [l.lockPda, l.nftAccount]));
+      for (let i = 0; i < locks.length; i++) {
+        const l = locks[i]!;
+        const lockAcc = la.value[i * 2];
+        if (!lockAcc || lockAcc.owner !== RAYDIUM_CP_LOCK_PROGRAM_ID) locksOk = false;
+        out.locks.push({ ...l, holder: await resolveNftHolder(rpc, l.nftMint, l.nftAccount, la.value[i * 2 + 1]) });
+      }
+    }
+    checks.locksValid = locksOk;
   }
-  return out;
+  return finish();
 }
 
 export function migrationVerified(v: VerifiedMigration): boolean {
-  const vals = Object.values(v.checks);
-  return vals.length > 0 && vals.every(Boolean);
+  return v.supported && v.requiredChecks.length > 0 && v.requiredChecks.every((c) => v.checks[c] === true);
 }

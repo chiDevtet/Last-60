@@ -26,6 +26,7 @@ import { cursorId, readCursor, syncAddress } from "../indexer/signatureSync";
 import { allocate } from "./allocation";
 import { boundsOf, drawExecuteAt, roundIndexAt, type ScheduleParams } from "./roundMath";
 import { periodFees, selectRecipients } from "./selection";
+import { persistAttributions } from "../indexer/ingest";
 
 export interface SchedulerDeps {
   db: Models;
@@ -255,7 +256,12 @@ export class RoundScheduler {
       // bonding-curve trades before graduation). Without this those fees and buyers would belong to
       // no round at all — silently.
       const previousPool: string | null = prev?.config?.pool && prev.config.pool !== pool.poolAddress ? prev.config.pool : null;
-      const pools = previousPool ? [previousPool, pool.poolAddress] : [pool.poolAddress];
+      // Accounting pools: the bonding pool plus, once VERIFIED, the graduation destination — so the
+      // final bonding-curve trades and the first destination trades fall into consecutive periods
+      // by slot, never both and never neither.
+      const current = pool.accountingPools?.length ? pool.accountingPools : [pool.poolAddress];
+      const carried: string[] = previousPool ? [previousPool, ...((prev?.config?.pools as string[] | undefined) ?? []).filter((x) => x !== pool.poolAddress)] : [];
+      const pools = [...new Set([...carried, ...current])];
       const period = { pool: pools.length === 1 ? pools[0]! : pools, afterSlot: prev?.snapshotSlot ?? null, periodStartAt: prev ? null : new Date(genesisStart), snapshotSlot };
 
       // 3. Make sure every transaction of the period up to the snapshot slot is ingested.
@@ -265,6 +271,15 @@ export class RoundScheduler {
       await this.catchUp(snapshotSlot, { afterSlot: period.afterSlot, sinceTime: period.periodStartAt ? Math.floor(period.periodStartAt.getTime() / 1000) : null });
       if (previousPool) {
         await this.d.terminal.warn(`Pool changed since round #${prev.roundNumber}: this period also includes the previous pool's indexed activity up to the switch.`, `pool-switch:${roundNumber}`, roundNumber);
+      }
+      // 3b. Checkpointed entitlements (e.g. DAMM v2 LP position fee growth) up to the snapshot slot.
+      //     Idempotent: records are keyed by snapshot slot, so a resumed execution reuses them.
+      if (provider.checkpoint) {
+        const records = await provider.checkpoint(snapshotSlot, async (key) => {
+          const last: any = await this.d.db.FeeAttribution.findOne({ checkpointKey: key, slot: { $lt: snapshotSlot }, cumulative: { $ne: null } }, { cumulative: 1, slot: 1 }).sort({ slot: -1 }).lean();
+          return last ? { cumulative: BigInt(last.cumulative), slot: last.slot } : null;
+        });
+        if (records.length) await persistAttributions(this.d.db, records);
       }
       const excluded = new Set([...settings.excludedWallets, pool.beneficiary, pool.creator, ...(this.d.payer ? [this.d.payer.publicKey.toBase58()] : []), ...(settings.expectedPayoutPublicKey ? [settings.expectedPayoutPublicKey] : [])]);
       const selection = await selectRecipients(this.d.db, this.d.rpc, { ...period, minBuyQuote: settings.minBuyQuote, buyerCount: settings.buyerCount, excluded });
@@ -294,6 +309,7 @@ export class RoundScheduler {
                 provider: pool.provider,
                 pool: pool.poolAddress,
                 previousPool,
+                pools,
                 tokenMint: pool.tokenMint,
                 skippedRoundPolicy: settings.skippedRoundPolicy,
                 minPayoutLamports: dec(settings.minPayoutLamports),
@@ -301,6 +317,8 @@ export class RoundScheduler {
               },
               fees: dec(a.fees),
               nonPayoutAssetFees: fees.other.map((o) => ({ mint: o.mint, amount: dec(o.amount) })),
+              ineligibleFees: fees.ineligible.map((o) => ({ mint: o.mint, amount: dec(o.amount), reason: o.reason.slice(0, 300) })),
+              feeBreakdown: { byPhase: fees.byPhase, swaps: fees.swaps, attributions: fees.attributions },
               reward: dec(a.pool),
               retained: dec(a.retained + a.retainedPool),
               rolloverIn: dec(a.rolloverIn),
@@ -330,20 +348,24 @@ export class RoundScheduler {
         }
         const L = (type: string, amount: bigint, extra: Record<string, unknown> = {}) => ({ key: `${type}:r${roundNumber}${extra.k ? ":" + extra.k : ""}`, type, roundNumber, amount: dec(amount), mint: (extra.mint as string) ?? mint, memo: (extra.memo as string) ?? null });
         const entries = [
-          L("FEE_ACCRUED", a.fees, { memo: `${fees.swaps} swaps in slots (${period.afterSlot ?? "start"}, ${snapshotSlot}]` }),
+          L("FEE_ACCRUED", a.fees, { memo: `${fees.swaps} swaps + ${fees.attributions} attributions in slots (${period.afterSlot ?? "start"}, ${snapshotSlot}]; payout-eligible creator allocation only` }),
           L("REWARD_ALLOCATED", a.rewardShare),
           L("RETAINED", a.retained + a.retainedPool, { memo: a.retainedPool > 0n ? "includes skipped-round pool (retain policy)" : null }),
           ...(a.rolloverIn > 0n ? [L("ROLLOVER_IN", a.rolloverIn, { memo: `from round #${prev?.roundNumber}` })] : []),
           ...(a.rolloverOut > 0n ? [L("ROLLOVER_OUT", a.rolloverOut, { memo: a.outcome })] : []),
           ...(a.dust > 0n ? [L("DUST_RETAINED", a.dust)] : []),
           ...fees.other.map((o) => L("FEE_NON_PAYOUT_ASSET", o.amount, { mint: o.mint, k: o.mint, memo: "recorded only; never converted" })),
+          ...fees.ineligible.map((o, i) => L("FEE_EXCLUDED", o.amount, { mint: o.mint, k: `${o.mint}:${i}`, memo: `not payout-eligible: ${o.reason.slice(0, 200)}` })),
           ...a.payouts.map((p) => L("PAYOUT_SCHEDULED", p.amount, { k: p.recipient, memo: `position ${p.position}` })),
         ];
         await this.d.db.LedgerEntry.insertMany(entries, { session });
       });
 
       // 5. Non-critical bookkeeping (after commit).
-      await this.d.db.Swap.updateMany({ pool: { $in: pools }, slot: { $lte: snapshotSlot, ...(period.afterSlot !== null ? { $gt: period.afterSlot } : {}) }, roundNumber: null }, { $set: { roundNumber } });
+      const slotRange = { $lte: snapshotSlot, ...(period.afterSlot !== null ? { $gt: period.afterSlot } : {}) };
+      await this.d.db.Swap.updateMany({ pool: { $in: pools }, slot: slotRange, roundNumber: null }, { $set: { roundNumber } });
+      await this.d.db.FeeAttribution.updateMany({ pool: { $in: pools }, slot: slotRange, roundNumber: null }, { $set: { roundNumber } });
+      if (fees.ineligible.length) await this.d.terminal.warn(`Round #${roundNumber}: some creator fees in this period are recorded but not eligible for payout (unverified or mismatching allocation); operators notified.`, `ineligible:${roundNumber}`, roundNumber);
       if (a.payouts.length) {
         await this.d.terminal.accounting(roundNumber, { fees: a.fees, reward: a.pool, retained: a.retained, recipients: a.payouts.length, perRecipient: a.perRecipient, rolloverIn: a.rolloverIn });
       } else {

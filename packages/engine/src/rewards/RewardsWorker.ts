@@ -7,7 +7,8 @@ import type { AppConfig } from "../config/env";
 import type { EffectiveSettings, SettingsStore } from "../config/runtime";
 import { RpcClient, type ChainRpc } from "../chain/rpc";
 import type { Models } from "../db/models";
-import { createProvider, type LaunchProvider } from "../providers";
+import { attachStoredMigration, createProvider, type LaunchProvider } from "../providers";
+import { roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
 import { rootLogger, type Logger } from "../util/logger";
@@ -72,12 +73,24 @@ export class RewardsWorker {
     this.reconciler = new Reconciler({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, payoutWallet: payoutWallet?.toBase58() ?? null, terminal: this.terminal, log: this.log });
   }
 
+  private lastAttachCheck = 0;
   async ensureProvider(s: EffectiveSettings) {
     const key = JSON.stringify([s.launchProvider, s.poolAddress, s.tokenMint, s.feeBeneficiaryRole, s.payoutAssetMint, s.rpcUrls]);
-    if (this.provider && (key === this.providerKey || this.d.provider)) return this.provider;
+    if (this.provider && (key === this.providerKey || this.d.provider)) {
+      // Pick up a destination the indexer verified since (cheap DB read, throttled).
+      if (this.clock.now() - this.lastAttachCheck > 10_000) {
+        this.lastAttachCheck = this.clock.now();
+        if (await attachStoredMigration(this.d.db, this.provider)) this.log.info({ destination: this.provider.info().destination }, "verified graduation destination attached");
+      }
+      return this.provider;
+    }
     if (this.rpc instanceof RpcClient) this.rpc.setUrls(s.rpcUrls);
-    const p = createProvider({ id: s.launchProvider, poolAddress: s.poolAddress, tokenMint: s.tokenMint, role: s.feeBeneficiaryRole, payoutMint: s.payoutAssetMint }, this.rpc);
-    await p.load();
+    const p = createProvider({ id: s.launchProvider, poolAddress: s.poolAddress, tokenMint: s.tokenMint, role: s.feeBeneficiaryRole, payoutMint: s.payoutAssetMint, expected: this.d.cfg.provider.expected }, this.rpc);
+    const info = await p.load();
+    const blocked = await roleChangeBlockReason(this.d.db, info.poolAddress, info.feeBeneficiaryRole);
+    if (blocked) throw new Error(blocked);
+    await attachStoredMigration(this.d.db, p);
+    this.lastAttachCheck = this.clock.now();
     this.provider = p;
     this.providerKey = key;
     this.log.info({ provider: p.id, pool: p.info().poolAddress, beneficiary: p.info().beneficiary }, "rewards provider loaded");
