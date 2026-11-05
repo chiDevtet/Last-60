@@ -267,10 +267,12 @@ export class Indexer {
       const r = await this.deps.db.Swap.aggregate([{ $match: { pool: this.pool!.poolAddress, status: "active", eligibleFeeMint: mint, ...match } }, { $group: { _id: null, t: { $sum: "$eligibleFee" } } }]);
       return big(r[0]?.t ?? 0);
     };
-    const delta = await sum({ ingestedAt: { $gte: new Date(bucketStart), $lt: new Date(bucketEnd) } });
-    if (delta <= 0n) return;
+    // Only fees of the CURRENT period count, so the line always agrees with the live pool.
     const last: any = await this.deps.db.Round.findOne({ snapshotSlot: { $ne: null } }, { snapshotSlot: 1 }).sort({ snapshotSlot: -1 }).lean();
-    const periodTotal = await sum(last?.snapshotSlot ? { slot: { $gt: last.snapshotSlot } } : {});
+    const period = last?.snapshotSlot ? { slot: { $gt: last.snapshotSlot } } : {};
+    const delta = await sum({ ...period, ingestedAt: { $gte: new Date(bucketStart), $lt: new Date(bucketEnd) } });
+    if (delta <= 0n) return;
+    const periodTotal = await sum(period);
     await this.terminal.feesAccrued({ delta, periodTotal, bucket: `${this.pool.poolAddress}:${bucketEnd}` });
   }
 

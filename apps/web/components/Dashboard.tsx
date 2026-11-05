@@ -76,7 +76,7 @@ export function Dashboard({ initial, initialTerminal, tradeUrl }: { initial: Das
 
         <section id="stats" className="mx-auto mt-20 max-w-7xl px-4 sm:px-6">
           <SectionTitle eyebrow="Totals" title="Paid & waiting" />
-          <Stats stats={stats} chart={chart} />
+          <Stats stats={stats} chart={chart} dryRun={meta.payoutMode === "dry_run"} />
         </section>
 
         <section id="history" className="mx-auto mt-20 max-w-7xl px-4 sm:px-6">

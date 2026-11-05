@@ -29,7 +29,7 @@ export function LiveBuys({ buys, now, explorer, cluster, minBuy }: { buys: BuyDT
               <a href={accountUrl(explorer, b.wallet, cluster)} target="_blank" rel="noreferrer" className="focus-ring font-mono text-[13px] text-frost hover:text-signal">
                 {shortAddress(b.wallet, 4, 4)}
               </a>
-              <span className="ml-auto font-semibold tabular">{sol(b.quoteAmount, 3)} <span className="font-normal text-mist">SOL</span></span>
+              <span className="ml-auto font-semibold tabular">{BigInt(b.quoteAmount) < 1_000_000n ? "<0.001" : sol(b.quoteAmount, 3)} <span className="font-normal text-mist">SOL</span></span>
               <span className={`w-[72px] text-right text-[11px] ${b.qualifies ? "text-signal" : "text-dim"}`}>{b.qualifies ? "qualifies" : "below min"}</span>
               <a href={txUrl(explorer, b.signature, cluster)} target="_blank" rel="noreferrer" className="focus-ring w-[64px] text-right text-[11px] text-dim hover:text-mist" title={b.commitment}>
                 {relative(b.blockTime, now)}

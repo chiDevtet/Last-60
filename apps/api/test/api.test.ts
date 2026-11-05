@@ -50,7 +50,7 @@ describe("public API privacy", () => {
       }
     };
     await check("final window, before execution");
-    const cur = await (await app.request("/api/v1/round/current")).json();
+    const cur = await (await app.request("/api/v1/round/current")).json() as any;
     expect(cur.phase).toBe("final_minute");
     expect(cur.qualifyingBuyers).toBe(3);
     r.clock.set(executeAt);
@@ -72,14 +72,14 @@ describe("public API privacy", () => {
     r.chain.advance(40);
     await r.worker.payouts.processDue();
     const { app } = api(r);
-    const round = await (await app.request("/api/v1/rounds/1")).json();
+    const round = await (await app.request("/api/v1/rounds/1")).json() as any;
     expect(round.phase).toBe("settled");
     expect(round.recipientCount).toBe(3);
     expect(round.payouts.every((p: any) => p.state === "confirmed" && typeof p.signature === "string")).toBe(true);
-    const stats = await (await app.request("/api/v1/stats")).json();
+    const stats = await (await app.request("/api/v1/stats")).json() as any;
     expect(BigInt(stats.totalPaid)).toBe(BigInt(round.perRecipient) * 3n);
     expect(stats.uniqueRecipients).toBe(3);
-    const term = await (await app.request("/api/v1/terminal?limit=200")).json();
+    const term = await (await app.request("/api/v1/terminal?limit=200")).json() as any;
     expect(term.items.some((e: any) => e.type === "CONFIRMED")).toBe(true);
     expect((await app.request("/api/v1/rounds/999")).status).toBe(404);
   });
@@ -87,10 +87,10 @@ describe("public API privacy", () => {
 
 describe("admin API", () => {
   async function login(app: ReturnType<typeof api>["app"], kp = admin) {
-    const n = await (await app.request("/api/admin/auth/nonce", { method: "POST", body: JSON.stringify({ wallet: kp.publicKey.toBase58() }), headers: { "content-type": "application/json" } })).json();
+    const n = await (await app.request("/api/admin/auth/nonce", { method: "POST", body: JSON.stringify({ wallet: kp.publicKey.toBase58() }), headers: { "content-type": "application/json" } })).json() as any;
     const sig = ed25519.sign(new TextEncoder().encode(n.message), kp.secretKey.slice(0, 32));
     const v = await app.request("/api/admin/auth/verify", { method: "POST", body: JSON.stringify({ wallet: kp.publicKey.toBase58(), nonce: n.nonce, signature: bs58.encode(sig) }), headers: { "content-type": "application/json" } });
-    return { res: v, body: await v.json(), nonce: n.nonce, sig: bs58.encode(sig) };
+    return { res: v, body: await v.json() as any, nonce: n.nonce, sig: bs58.encode(sig) };
   }
 
   test("wallet-signature login; nonces are single use; non-admins and forged signatures are rejected", async () => {
@@ -106,7 +106,7 @@ describe("admin API", () => {
     const stranger = await app.request("/api/admin/auth/nonce", { method: "POST", body: JSON.stringify({ wallet: wallet() }), headers: { "content-type": "application/json" } });
     expect(stranger.status).toBe(403);
     // forged signature (signed by another key)
-    const n = await (await app.request("/api/admin/auth/nonce", { method: "POST", body: JSON.stringify({ wallet: admin.publicKey.toBase58() }), headers: { "content-type": "application/json" } })).json();
+    const n = await (await app.request("/api/admin/auth/nonce", { method: "POST", body: JSON.stringify({ wallet: admin.publicKey.toBase58() }), headers: { "content-type": "application/json" } })).json() as any;
     const forged = ed25519.sign(new TextEncoder().encode(n.message), Keypair.generate().secretKey.slice(0, 32));
     const bad = await app.request("/api/admin/auth/verify", { method: "POST", body: JSON.stringify({ wallet: admin.publicKey.toBase58(), nonce: n.nonce, signature: bs58.encode(forged) }), headers: { "content-type": "application/json" } });
     expect(bad.status).toBe(401);
@@ -120,7 +120,7 @@ describe("admin API", () => {
     const { app } = api(r);
     const { body } = await login(app);
     const H = { authorization: `Bearer ${body.token}`, "content-type": "application/json" };
-    const cfg = await (await app.request("/api/admin/config", { headers: H })).json();
+    const cfg = await (await app.request("/api/admin/config", { headers: H })).json() as any;
     expect(cfg.effective.buyerCount).toBe(5);
     expect(JSON.stringify(cfg)).not.toMatch(/"(privateKey|secretKey)"/);
     const put = (patch: unknown, extra: Record<string, unknown> = {}) => app.request("/api/admin/config", { method: "PUT", headers: H, body: JSON.stringify({ patch, expectedVersion: cfg.version, ...extra }) });
@@ -128,9 +128,9 @@ describe("admin API", () => {
     expect((await put({ rewardBps: 8000 })).status).toBe(400); // critical without confirmation
     const ok = await put({ rewardBps: 8000, buyerCount: 3 }, { confirmCritical: true, reason: "governance vote #12" });
     expect(ok.status).toBe(200);
-    expect((await ok.json()).effective.rewardBps).toBe(8000);
+    expect((await ok.json() as any).effective.rewardBps).toBe(8000);
     expect((await put({ buyerCount: 4 })).status).toBe(409); // stale version
-    const audit = await (await app.request("/api/admin/audit", { headers: H })).json();
+    const audit = await (await app.request("/api/admin/audit", { headers: H })).json() as any;
     expect(audit[0].actor).toBe(admin.publicKey.toBase58());
     expect(audit[0].reason).toBe("governance vote #12");
     expect(audit[0].changes.map((c: any) => c.key).sort()).toEqual(["buyerCount", "rewardBps"]);

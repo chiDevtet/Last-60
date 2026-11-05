@@ -4,8 +4,10 @@ import type { FeeChartPointDTO, StatsDTO } from "@last60/shared";
 import { AnimatedInt, AnimatedSol } from "./AnimatedNumber";
 import { lamportsToFloat, sol } from "@/lib/format";
 
-export function Stats({ stats, chart }: { stats: StatsDTO; chart: FeeChartPointDTO[] }) {
+export function Stats({ stats, chart, dryRun }: { stats: StatsDTO; chart: FeeChartPointDTO[]; dryRun?: boolean }) {
   return (
+    <>
+    {dryRun && <p className="mb-3 text-xs text-mist">Dry-run: simulated payouts are never counted as paid. Paid totals only include transfers confirmed on-chain.</p>}
     <div className="grid gap-4 lg:grid-cols-[1fr_1.15fr]">
       <dl className="grid grid-cols-2 gap-3">
         <Tile label="Total fees accrued" value={<AnimatedSol lamports={stats.totalFeesAccrued} />} unit="SOL" />
@@ -17,6 +19,7 @@ export function Stats({ stats, chart }: { stats: StatsDTO; chart: FeeChartPointD
       </dl>
       <RoundsChart data={chart} />
     </div>
+    </>
   );
 }
 

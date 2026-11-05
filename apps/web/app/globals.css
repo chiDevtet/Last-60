@@ -83,6 +83,20 @@ body {
   transform-origin: 50% 50%;
 }
 
+@keyframes tick-in {
+  from {
+    transform: translateY(-14%);
+    opacity: 0.45;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+.tick-in {
+  animation: tick-in 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
 @keyframes livepulse {
   0%,
   100% {
@@ -103,7 +117,8 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .scanner,
-  .live-dot {
+  .live-dot,
+  .tick-in {
     animation: none;
   }
 }

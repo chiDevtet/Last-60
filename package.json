@@ -21,7 +21,11 @@
     "test": "bun test packages apps/api apps/worker",
     "typecheck": "tsc -p packages/engine && tsc -p packages/shared && tsc -p apps/api && tsc -p apps/worker && bun --cwd apps/web run typecheck",
     "brand:render": "bun scripts/render-brand.ts",
-    "fixtures:fetch": "bun scripts/fetch-fixtures.ts"
+    "fixtures:fetch": "bun scripts/fetch-fixtures.ts",
+    "verify:fees": "bun scripts/verify-fee-attribution.ts",
+    "verify:round": "bun scripts/verify-round.ts",
+    "find:pool": "bun scripts/find-active-pool.ts",
+    "screenshot": "bun scripts/screenshot.ts"
   },
   "devDependencies": {
     "@types/bun": "1.4.4",

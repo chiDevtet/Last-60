@@ -7,7 +7,7 @@
  * The countdown targets the ROUND END only. The client never receives the hidden execution
  * instant, so nothing here can reveal it.
  */
-import { AnimatePresence, motion, useReducedMotion } from "motion/react";
+import { motion, useReducedMotion } from "motion/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CurrentRoundDTO, RewardPoolDTO, RoundSummaryDTO } from "@last60/shared";
 import { AnimatedSol } from "./AnimatedNumber";
@@ -200,13 +200,10 @@ export function Countdown({ round, pool, now, latest }: { round: CurrentRoundDTO
             style={{ fontSize: "clamp(56px, 17vw, 96px)", color: inFinal ? `color-mix(in oklab, #38E1FF ${40 + intensity * 60}%, #E9EDF5)` : "#E9EDF5", textShadow: inFinal ? `0 0 ${12 + intensity * 28}px rgb(56 225 255 / ${0.25 + intensity * 0.35})` : "none" }}
           >
             <span>{String(mm).padStart(2, "0")}</span>
-            <span className={inFinal ? "opacity-80" : "opacity-40"}>:</span>
-            <span className="relative inline-block overflow-hidden align-bottom">
-              <AnimatePresence initial={false} mode="popLayout">
-                <motion.span key={ss} className="inline-block" initial={reduce ? false : { y: "-35%", opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={reduce ? undefined : { y: "35%", opacity: 0 }} transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}>
-                  {String(ss).padStart(2, "0")}
-                </motion.span>
-              </AnimatePresence>
+            <span className={inFinal ? "opacity-80" : "opacity-50"}>:</span>
+            {/* Always rendered (never blank): the key replays a short CSS tick on every second. */}
+            <span key={ss} className={reduce ? "inline-block" : "tick-in inline-block"}>
+              {String(ss).padStart(2, "0")}
             </span>
           </div>
           <div className={`mt-3 text-sm font-medium ${inFinal ? "text-signal" : "text-mist"}`}>{label}</div>
