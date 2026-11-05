@@ -1,0 +1,16 @@
+{
+  "name": "@last60/worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "indexer": "bun src/indexer.ts",
+    "rewards": "bun src/rewards.ts",
+    "cli": "bun src/cli.ts"
+  },
+  "dependencies": {
+    "@last60/engine": "workspace:*",
+    "@last60/shared": "workspace:*",
+    "@solana/web3.js": "1.98.4"
+  }
+}

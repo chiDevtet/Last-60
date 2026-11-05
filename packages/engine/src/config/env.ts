@@ -1,0 +1,543 @@
+/**
+ * Environment configuration. Validated once at process start; any error is fatal with a clear
+ * message listing every problem. Secrets are never logged and never exposed via NEXT_PUBLIC_*.
+ */
+import { PublicKey } from "@solana/web3.js";
+import { z } from "zod";
+import { parseUnits, WSOL_MINT } from "@last60/shared";
+import { jsonSafe } from "../util/json";
+
+export type ProcessRole = "indexer" | "rewards" | "api" | "cli" | "test";
+
+const bool = (def: boolean) =>
+  z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      if (v === undefined || v === "") return def;
+      if (/^(1|true|yes|on)$/i.test(v)) return true;
+      if (/^(0|false|no|off)$/i.test(v)) return false;
+      ctx.addIssue({ code: "custom", message: `expected boolean, got "${v}"` });
+      return z.NEVER;
+    });
+
+const int = (def: number, min = 0, max = Number.MAX_SAFE_INTEGER) =>
+  z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      if (v === undefined || v === "") return def;
+      if (!/^-?\d+$/.test(v.trim())) {
+        ctx.addIssue({ code: "custom", message: `expected integer, got "${v}"` });
+        return z.NEVER;
+      }
+      const n = Number(v);
+      if (n < min || n > max) {
+        ctx.addIssue({ code: "custom", message: `must be between ${min} and ${max}, got ${n}` });
+        return z.NEVER;
+      }
+      return n;
+    });
+
+const bigintStr = (def: bigint, min = 0n) =>
+  z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      if (v === undefined || v === "") return def;
+      if (!/^\d+$/.test(v.trim())) {
+        ctx.addIssue({ code: "custom", message: `expected a non-negative integer, got "${v}"` });
+        return z.NEVER;
+      }
+      const n = BigInt(v.trim());
+      if (n < min) {
+        ctx.addIssue({ code: "custom", message: `must be >= ${min}` });
+        return z.NEVER;
+      }
+      return n;
+    });
+
+export function isValidPubkey(v: string): boolean {
+  try {
+    return new PublicKey(v).toBase58() === v;
+  } catch {
+    return false;
+  }
+}
+
+const pubkey = z.string().trim().refine(isValidPubkey, { message: "must be a base58 Solana public key" });
+const optionalPubkey = z
+  .string()
+  .optional()
+  .transform((v) => (v ? v.trim() : undefined))
+  .refine((v) => v === undefined || isValidPubkey(v), { message: "must be a base58 Solana public key" });
+
+const csv = (item: z.ZodType<string, string>) =>
+  z
+    .string()
+    .optional()
+    .transform((v) => (v ? v.split(",").map((s) => s.trim()).filter(Boolean) : []))
+    .pipe(z.array(item));
+
+const url = (protocols: string[]) =>
+  z
+    .string()
+    .trim()
+    .refine((v) => {
+      try {
+        return protocols.includes(new URL(v).protocol);
+      } catch {
+        return false;
+      }
+    }, { message: `must be a URL (${protocols.join(" ")})` });
+
+/** "75" → 7500 bps, "75.5" → 7550. At most 2 decimal places. */
+export function percentToBps(v: string): number {
+  if (!/^\d{1,3}(\.\d{1,2})?$/.test(v.trim())) throw new Error(`invalid percentage "${v}"`);
+  const bps = Number(parseUnits(v.trim(), 2));
+  if (bps <= 0 || bps > 10_000) throw new Error(`percentage must be in (0, 100], got ${v}`);
+  return bps;
+}
+
+const RawEnv = z.object({
+  NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
+  LOG_LEVEL: z.enum(["trace", "debug", "info", "warn", "error", "fatal"]).default("info"),
+  INSTANCE_ID: z.string().optional(),
+
+  SOLANA_CLUSTER: z.enum(["mainnet-beta", "devnet", "testnet", "localnet"]),
+  SOLANA_RPC_URL: z.string().optional(),
+  SOLANA_RPC_FALLBACK_URLS: csv(url(["http:", "https:"])),
+  SOLANA_WS_URL: z.string().optional(),
+  SOLANA_MAX_TX_VERSION: int(1, 0, 255),
+  SOLANA_RPC_TIMEOUT_MS: int(15_000, 1000, 120_000),
+  SOLANA_RPC_MAX_RPS: int(20, 1, 1000),
+  HELIUS_API_KEY: z.string().optional(),
+
+  LAUNCH_PROVIDER: z.enum(["meteora_dbc", "raydium_launchlab", "mock"]).default("meteora_dbc"),
+  TOKEN_MINT: optionalPubkey,
+  POOL_ADDRESS: optionalPubkey,
+  FEE_BENEFICIARY_ROLE: z.enum(["creator", "partner", "platform"]).default("creator"),
+
+  BUYER_COUNT: int(5, 1, 50),
+  MIN_BUY_SOL: z.string().default("0.05"),
+  MIN_BUY_QUOTE_AMOUNT: z.string().optional(),
+  EXCLUDED_WALLETS: csv(pubkey),
+
+  ROUND_DURATION_SECONDS: int(300, 30, 86_400),
+  RANDOM_WINDOW_START_SECONDS: int(240, 0, 86_400),
+  RANDOM_WINDOW_DURATION_SECONDS: int(60, 1, 86_400),
+  ROUND_ANCHOR_EPOCH_SECONDS: int(0, 0),
+  ROUND_GENESIS_AT: z.string().optional(),
+  LATE_EXECUTION_GRACE_SECONDS: int(5, 0, 600),
+  SNAPSHOT_SETTLE_MS: int(1500, 0, 30_000),
+
+  REWARD_PERCENTAGE: z.string().default("75"),
+  SKIPPED_ROUND_POLICY: z.enum(["rollover", "retain"]).default("rollover"),
+  MIN_PAYOUT_LAMPORTS: bigintStr(1_000_000n),
+
+  PAYOUT_ASSET: z.string().default("SOL"),
+  PAYOUT_MODE: z.enum(["dry_run", "live"]).default("dry_run"),
+  ALLOW_MAINNET_PAYOUTS: bool(false),
+  PAYOUT_WALLET_PUBLIC_KEY: optionalPubkey,
+  PAYOUT_WALLET_PRIVATE_KEY: z.string().optional(),
+  PAYOUT_WALLET_KEYPAIR_PATH: z.string().optional(),
+  PAYOUT_COMMITMENT: z.enum(["confirmed", "finalized"]).default("finalized"),
+  PAYOUT_PRIORITY_FEE_MICROLAMPORTS: int(10_000, 0, 100_000_000),
+  PAYOUT_COMPUTE_UNIT_LIMIT: int(40_000, 1_000, 1_400_000),
+  PAYOUT_MAX_ATTEMPTS: int(5, 1, 50),
+  PAYOUT_WALLET_MIN_RESERVE_LAMPORTS: bigintStr(10_000_000n),
+  PAYOUT_CONCURRENCY: int(3, 1, 20),
+  PAYOUT_MEMO: bool(true),
+
+  FEE_COLLECTION_MODE: z.enum(["manual", "auto_claim"]).default("manual"),
+  FEE_CLAIM_AUTHORITY_PRIVATE_KEY: z.string().optional(),
+  FEE_CLAIM_AUTHORITY_KEYPAIR_PATH: z.string().optional(),
+  FEE_CLAIM_MIN_LAMPORTS: bigintStr(10_000_000n),
+
+  SCHEDULE_ENCRYPTION_KEY: z.string().optional(),
+
+  MONGODB_URI: z.string().min(1, "is required"),
+  MONGODB_DB_NAME: z.string().default("last60"),
+
+  INDEXER_POLL_INTERVAL_MS: int(2000, 250, 60_000),
+  INDEXER_USE_WEBSOCKET: bool(true),
+  INDEXER_BACKFILL: z.enum(["full", "none"]).default("full"),
+  INDEXER_BACKFILL_MAX_SIGNATURES: int(100_000, 0),
+  INDEXER_FINALITY_CHECK_MS: int(10_000, 1000),
+  INDEXER_DROP_AFTER_SECONDS: int(180, 30),
+  INDEXER_FETCH_CONCURRENCY: int(4, 1, 32),
+
+  API_HOST: z.string().default("0.0.0.0"),
+  API_PORT: int(4000, 1, 65_535),
+  CORS_ORIGINS: csv(z.string()),
+  PUBLIC_SITE_URL: z.string().optional(),
+  ADMIN_WALLETS: csv(pubkey),
+  ADMIN_SESSION_SECRET: z.string().optional(),
+  ADMIN_SESSION_TTL_SECONDS: int(3600, 60, 86_400),
+  STREAM_SNAPSHOT_INTERVAL_MS: int(2000, 500, 60_000),
+
+  RECONCILIATION_INTERVAL_SECONDS: int(300, 30),
+  RECONCILIATION_HALT_ON_OVER_ATTRIBUTION: bool(true),
+  RECONCILIATION_TOLERANCE_LAMPORTS: bigintStr(0n),
+  TERMINAL_RETENTION_DAYS: int(30, 1, 3650),
+
+  NEXT_PUBLIC_APP_NAME: z.string().default("LAST60"),
+  NEXT_PUBLIC_SOLANA_EXPLORER: z.string().default("https://solscan.io"),
+});
+
+export interface AppConfig {
+  nodeEnv: "development" | "production" | "test";
+  logLevel: string;
+  instanceId: string;
+  solana: {
+    cluster: "mainnet-beta" | "devnet" | "testnet" | "localnet";
+    rpcUrls: string[];
+    wsUrl: string | null;
+    maxTxVersion: number;
+    timeoutMs: number;
+    maxRps: number;
+  };
+  provider: {
+    id: "meteora_dbc" | "raydium_launchlab" | "mock";
+    tokenMint: string | null;
+    poolAddress: string | null;
+    feeBeneficiaryRole: "creator" | "partner" | "platform";
+  };
+  rewards: {
+    buyerCount: number;
+    /** Minimum qualifying buy in quote base units (lamports for SOL). */
+    minBuyQuote: bigint;
+    minBuySolInput: string;
+    rewardBps: number;
+    skippedRoundPolicy: "rollover" | "retain";
+    minPayoutLamports: bigint;
+    excludedWallets: string[];
+  };
+  schedule: {
+    roundDurationMs: number;
+    windowStartMs: number;
+    windowDurationMs: number;
+    anchorEpochMs: number;
+    genesisAt: Date | null;
+    lateGraceMs: number;
+    snapshotSettleMs: number;
+    encryptionKey: Buffer | null;
+  };
+  payout: {
+    asset: "SOL" | string;
+    assetMint: string;
+    mode: "dry_run" | "live";
+    allowMainnet: boolean;
+    walletPublicKey: string | null;
+    commitment: "confirmed" | "finalized";
+    priorityFeeMicroLamports: number;
+    computeUnitLimit: number;
+    maxAttempts: number;
+    minReserveLamports: bigint;
+    concurrency: number;
+    memo: boolean;
+  };
+  feeCollection: { mode: "manual" | "auto_claim"; minClaimLamports: bigint };
+  mongo: { uri: string; dbName: string };
+  indexer: {
+    pollIntervalMs: number;
+    useWebsocket: boolean;
+    backfill: "full" | "none";
+    backfillMaxSignatures: number;
+    finalityCheckMs: number;
+    dropAfterSeconds: number;
+    fetchConcurrency: number;
+  };
+  api: {
+    host: string;
+    port: number;
+    corsOrigins: string[];
+    publicSiteUrl: string | null;
+    adminWallets: string[];
+    adminSessionSecret: string | null;
+    adminSessionTtlSeconds: number;
+    streamSnapshotIntervalMs: number;
+  };
+  reconciliation: { intervalMs: number; haltOnOverAttribution: boolean; toleranceLamports: bigint };
+  terminal: { retentionDays: number };
+  public: { appName: string; explorer: string };
+  /** Secrets are kept out of the main object so it can be logged/inspected safely. */
+  secrets: SecretSources;
+}
+
+export interface SecretSources {
+  payoutWalletPrivateKey?: string;
+  payoutWalletKeypairPath?: string;
+  feeClaimAuthorityPrivateKey?: string;
+  feeClaimAuthorityKeypairPath?: string;
+}
+
+export class ConfigError extends Error {
+  constructor(public readonly problems: string[]) {
+    super(`Invalid configuration:\n  - ${problems.join("\n  - ")}`);
+    this.name = "ConfigError";
+  }
+}
+
+const SECRET_KEYS = [
+  "PAYOUT_WALLET_PRIVATE_KEY",
+  "FEE_CLAIM_AUTHORITY_PRIVATE_KEY",
+  "SCHEDULE_ENCRYPTION_KEY",
+  "ADMIN_SESSION_SECRET",
+  "HELIUS_API_KEY",
+  "MONGODB_URI",
+];
+
+/** Rejects any NEXT_PUBLIC_* variable that looks like or contains a secret. */
+export function assertNoPublicSecrets(env: Record<string, string | undefined>): string[] {
+  const problems: string[] = [];
+  const secretValues = SECRET_KEYS.map((k) => env[k]).filter((v): v is string => !!v && v.length >= 8);
+  for (const [key, value] of Object.entries(env)) {
+    if (!key.startsWith("NEXT_PUBLIC_") || !value) continue;
+    if (/PRIVATE|SECRET|PASSWORD|MNEMONIC|SEED|API_KEY|MONGO/i.test(key)) {
+      problems.push(`${key}: secrets must never use the NEXT_PUBLIC_ prefix (it is shipped to browsers)`);
+    }
+    for (const s of secretValues) {
+      if (value.includes(s)) problems.push(`${key}: contains the value of a server secret`);
+    }
+  }
+  return problems;
+}
+
+function deriveRpcUrl(raw: z.infer<typeof RawEnv>): string | undefined {
+  if (raw.SOLANA_RPC_URL) return raw.SOLANA_RPC_URL;
+  if (raw.HELIUS_API_KEY) {
+    const host = raw.SOLANA_CLUSTER === "devnet" ? "devnet.helius-rpc.com" : "mainnet.helius-rpc.com";
+    return `https://${host}/?api-key=${raw.HELIUS_API_KEY}`;
+  }
+  return undefined;
+}
+
+export function deriveWsUrl(httpUrl: string): string {
+  const u = new URL(httpUrl);
+  u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+  // Public Solana RPC serves websockets on port+1 for localnet only.
+  if (u.hostname === "127.0.0.1" || u.hostname === "localhost") u.port = String(Number(u.port || "8899") + 1);
+  return u.toString();
+}
+
+export function loadConfig(role: ProcessRole, env: Record<string, string | undefined> = process.env): AppConfig {
+  const parsed = RawEnv.safeParse(env);
+  const problems: string[] = [];
+  if (!parsed.success) {
+    for (const issue of parsed.error.issues) problems.push(`${issue.path.join(".") || "(root)"}: ${issue.message}`);
+    throw new ConfigError(problems);
+  }
+  const raw = parsed.data;
+  problems.push(...assertNoPublicSecrets(env));
+
+  const rpcUrl = deriveRpcUrl(raw);
+  if (!rpcUrl) problems.push("SOLANA_RPC_URL: is required (or set HELIUS_API_KEY)");
+  else if (!url(["http:", "https:"]).safeParse(rpcUrl).success) problems.push("SOLANA_RPC_URL: must be an http(s) URL");
+  let wsUrl: string | null = raw.SOLANA_WS_URL?.trim() || null;
+  if (wsUrl && !url(["ws:", "wss:"]).safeParse(wsUrl).success) problems.push("SOLANA_WS_URL: must be a ws(s) URL");
+  if (!wsUrl && rpcUrl) {
+    try {
+      wsUrl = deriveWsUrl(rpcUrl);
+    } catch {
+      /* reported above */
+    }
+  }
+
+  // Reward parameters
+  let rewardBps = 7500;
+  try {
+    rewardBps = percentToBps(raw.REWARD_PERCENTAGE);
+  } catch (e) {
+    problems.push(`REWARD_PERCENTAGE: ${(e as Error).message}`);
+  }
+
+  const payoutAssetMint = raw.PAYOUT_ASSET.toUpperCase() === "SOL" ? WSOL_MINT : raw.PAYOUT_ASSET.trim();
+  if (raw.PAYOUT_ASSET.toUpperCase() !== "SOL" && !isValidPubkey(payoutAssetMint)) {
+    problems.push(`PAYOUT_ASSET: must be "SOL" or an SPL mint address`);
+  }
+
+  let minBuyQuote = 0n;
+  if (raw.MIN_BUY_QUOTE_AMOUNT) {
+    if (!/^\d+$/.test(raw.MIN_BUY_QUOTE_AMOUNT)) problems.push("MIN_BUY_QUOTE_AMOUNT: must be an integer amount of quote base units");
+    else minBuyQuote = BigInt(raw.MIN_BUY_QUOTE_AMOUNT);
+  } else {
+    try {
+      minBuyQuote = parseUnits(raw.MIN_BUY_SOL, 9);
+    } catch (e) {
+      problems.push(`MIN_BUY_SOL: ${(e as Error).message}`);
+    }
+  }
+
+  // Schedule
+  if (raw.RANDOM_WINDOW_START_SECONDS + raw.RANDOM_WINDOW_DURATION_SECONDS > raw.ROUND_DURATION_SECONDS) {
+    problems.push("RANDOM_WINDOW_START_SECONDS + RANDOM_WINDOW_DURATION_SECONDS must not exceed ROUND_DURATION_SECONDS");
+  }
+  let genesisAt: Date | null = null;
+  if (raw.ROUND_GENESIS_AT) {
+    const d = new Date(raw.ROUND_GENESIS_AT);
+    if (Number.isNaN(d.getTime())) problems.push("ROUND_GENESIS_AT: must be an ISO-8601 timestamp");
+    else genesisAt = d;
+  }
+  let encryptionKey: Buffer | null = null;
+  if (raw.SCHEDULE_ENCRYPTION_KEY) {
+    const k = Buffer.from(raw.SCHEDULE_ENCRYPTION_KEY, "base64");
+    if (k.length !== 32) problems.push("SCHEDULE_ENCRYPTION_KEY: must be 32 bytes, base64-encoded (openssl rand -base64 32)");
+    else encryptionKey = k;
+  }
+
+  if (raw.MIN_PAYOUT_LAMPORTS < 890_880n && payoutAssetMint === WSOL_MINT) {
+    problems.push("MIN_PAYOUT_LAMPORTS: must be >= 890880 (rent-exempt minimum) so payouts to empty wallets cannot fail");
+  }
+
+  // Role-specific requirements
+  const needsChainTarget = role === "indexer" || role === "rewards";
+  if (needsChainTarget && raw.LAUNCH_PROVIDER !== "mock") {
+    if (!raw.TOKEN_MINT) problems.push("TOKEN_MINT: is required");
+    if (!raw.POOL_ADDRESS) problems.push("POOL_ADDRESS: is required");
+  }
+  if (raw.LAUNCH_PROVIDER === "meteora_dbc" && raw.FEE_BENEFICIARY_ROLE === "platform") {
+    problems.push('FEE_BENEFICIARY_ROLE: "platform" is a Raydium LaunchLab role; use "creator" or "partner" for Meteora DBC');
+  }
+  if (raw.LAUNCH_PROVIDER === "raydium_launchlab" && raw.FEE_BENEFICIARY_ROLE === "partner") {
+    problems.push('FEE_BENEFICIARY_ROLE: "partner" is a Meteora DBC role; use "creator" or "platform" for Raydium LaunchLab');
+  }
+  if (role === "rewards") {
+    if (!encryptionKey) problems.push("SCHEDULE_ENCRYPTION_KEY: is required for the rewards worker");
+    if (!raw.PAYOUT_WALLET_PUBLIC_KEY) problems.push("PAYOUT_WALLET_PUBLIC_KEY: is required for the rewards worker");
+    if (raw.PAYOUT_MODE === "live" && !raw.PAYOUT_WALLET_PRIVATE_KEY && !raw.PAYOUT_WALLET_KEYPAIR_PATH) {
+      problems.push("PAYOUT_WALLET_PRIVATE_KEY or PAYOUT_WALLET_KEYPAIR_PATH: required when PAYOUT_MODE=live");
+    }
+    if (raw.PAYOUT_MODE === "live" && raw.SOLANA_CLUSTER === "mainnet-beta" && !raw.ALLOW_MAINNET_PAYOUTS) {
+      problems.push("ALLOW_MAINNET_PAYOUTS: must be explicitly set to true to send live payouts on mainnet-beta");
+    }
+    if (raw.FEE_COLLECTION_MODE === "auto_claim" && raw.LAUNCH_PROVIDER !== "mock") {
+      const hasClaimKey = raw.FEE_CLAIM_AUTHORITY_PRIVATE_KEY || raw.FEE_CLAIM_AUTHORITY_KEYPAIR_PATH;
+      const hasPayoutKey = raw.PAYOUT_WALLET_PRIVATE_KEY || raw.PAYOUT_WALLET_KEYPAIR_PATH;
+      if (!hasClaimKey && !hasPayoutKey) problems.push("FEE_CLAIM_AUTHORITY_*: auto_claim needs the fee beneficiary's signing key");
+    }
+  }
+  if (role === "api" && raw.ADMIN_WALLETS.length > 0) {
+    if (!raw.ADMIN_SESSION_SECRET || raw.ADMIN_SESSION_SECRET.length < 32) {
+      problems.push("ADMIN_SESSION_SECRET: must be at least 32 characters when ADMIN_WALLETS is set");
+    }
+  }
+  if (raw.NODE_ENV === "production" && raw.PAYOUT_WALLET_PRIVATE_KEY && raw.PAYOUT_WALLET_KEYPAIR_PATH) {
+    problems.push("Set only one of PAYOUT_WALLET_PRIVATE_KEY / PAYOUT_WALLET_KEYPAIR_PATH");
+  }
+
+  if (problems.length) throw new ConfigError(problems);
+
+  return {
+    nodeEnv: raw.NODE_ENV,
+    logLevel: raw.LOG_LEVEL,
+    instanceId: raw.INSTANCE_ID ?? `${role}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`,
+    solana: {
+      cluster: raw.SOLANA_CLUSTER,
+      rpcUrls: [rpcUrl!, ...raw.SOLANA_RPC_FALLBACK_URLS],
+      wsUrl,
+      maxTxVersion: raw.SOLANA_MAX_TX_VERSION,
+      timeoutMs: raw.SOLANA_RPC_TIMEOUT_MS,
+      maxRps: raw.SOLANA_RPC_MAX_RPS,
+    },
+    provider: {
+      id: raw.LAUNCH_PROVIDER,
+      tokenMint: raw.TOKEN_MINT ?? null,
+      poolAddress: raw.POOL_ADDRESS ?? null,
+      feeBeneficiaryRole: raw.FEE_BENEFICIARY_ROLE,
+    },
+    rewards: {
+      buyerCount: raw.BUYER_COUNT,
+      minBuyQuote,
+      minBuySolInput: raw.MIN_BUY_SOL,
+      rewardBps,
+      skippedRoundPolicy: raw.SKIPPED_ROUND_POLICY,
+      minPayoutLamports: raw.MIN_PAYOUT_LAMPORTS,
+      excludedWallets: raw.EXCLUDED_WALLETS,
+    },
+    schedule: {
+      roundDurationMs: raw.ROUND_DURATION_SECONDS * 1000,
+      windowStartMs: raw.RANDOM_WINDOW_START_SECONDS * 1000,
+      windowDurationMs: raw.RANDOM_WINDOW_DURATION_SECONDS * 1000,
+      anchorEpochMs: raw.ROUND_ANCHOR_EPOCH_SECONDS * 1000,
+      genesisAt,
+      lateGraceMs: raw.LATE_EXECUTION_GRACE_SECONDS * 1000,
+      snapshotSettleMs: raw.SNAPSHOT_SETTLE_MS,
+      encryptionKey,
+    },
+    payout: {
+      asset: raw.PAYOUT_ASSET.toUpperCase() === "SOL" ? "SOL" : payoutAssetMint,
+      assetMint: payoutAssetMint,
+      mode: raw.PAYOUT_MODE,
+      allowMainnet: raw.ALLOW_MAINNET_PAYOUTS,
+      walletPublicKey: raw.PAYOUT_WALLET_PUBLIC_KEY ?? null,
+      commitment: raw.PAYOUT_COMMITMENT,
+      priorityFeeMicroLamports: raw.PAYOUT_PRIORITY_FEE_MICROLAMPORTS,
+      computeUnitLimit: raw.PAYOUT_COMPUTE_UNIT_LIMIT,
+      maxAttempts: raw.PAYOUT_MAX_ATTEMPTS,
+      minReserveLamports: raw.PAYOUT_WALLET_MIN_RESERVE_LAMPORTS,
+      concurrency: raw.PAYOUT_CONCURRENCY,
+      memo: raw.PAYOUT_MEMO,
+    },
+    feeCollection: { mode: raw.FEE_COLLECTION_MODE, minClaimLamports: raw.FEE_CLAIM_MIN_LAMPORTS },
+    mongo: { uri: raw.MONGODB_URI, dbName: raw.MONGODB_DB_NAME },
+    indexer: {
+      pollIntervalMs: raw.INDEXER_POLL_INTERVAL_MS,
+      useWebsocket: raw.INDEXER_USE_WEBSOCKET,
+      backfill: raw.INDEXER_BACKFILL,
+      backfillMaxSignatures: raw.INDEXER_BACKFILL_MAX_SIGNATURES,
+      finalityCheckMs: raw.INDEXER_FINALITY_CHECK_MS,
+      dropAfterSeconds: raw.INDEXER_DROP_AFTER_SECONDS,
+      fetchConcurrency: raw.INDEXER_FETCH_CONCURRENCY,
+    },
+    api: {
+      host: raw.API_HOST,
+      port: raw.API_PORT,
+      corsOrigins: raw.CORS_ORIGINS,
+      publicSiteUrl: raw.PUBLIC_SITE_URL ?? null,
+      adminWallets: raw.ADMIN_WALLETS,
+      adminSessionSecret: raw.ADMIN_SESSION_SECRET ?? null,
+      adminSessionTtlSeconds: raw.ADMIN_SESSION_TTL_SECONDS,
+      streamSnapshotIntervalMs: raw.STREAM_SNAPSHOT_INTERVAL_MS,
+    },
+    reconciliation: {
+      intervalMs: raw.RECONCILIATION_INTERVAL_SECONDS * 1000,
+      haltOnOverAttribution: raw.RECONCILIATION_HALT_ON_OVER_ATTRIBUTION,
+      toleranceLamports: raw.RECONCILIATION_TOLERANCE_LAMPORTS,
+    },
+    terminal: { retentionDays: raw.TERMINAL_RETENTION_DAYS },
+    public: { appName: raw.NEXT_PUBLIC_APP_NAME, explorer: raw.NEXT_PUBLIC_SOLANA_EXPLORER },
+    secrets: {
+      payoutWalletPrivateKey: raw.PAYOUT_WALLET_PRIVATE_KEY,
+      payoutWalletKeypairPath: raw.PAYOUT_WALLET_KEYPAIR_PATH,
+      feeClaimAuthorityPrivateKey: raw.FEE_CLAIM_AUTHORITY_PRIVATE_KEY,
+      feeClaimAuthorityKeypairPath: raw.FEE_CLAIM_AUTHORITY_KEYPAIR_PATH,
+    },
+  };
+}
+
+/** Redacted view safe for logs and the admin UI. */
+export function redactConfig(cfg: AppConfig) {
+  const maskUrl = (u: string) => {
+    try {
+      const x = new URL(u);
+      for (const k of [...x.searchParams.keys()]) if (/key|token|secret/i.test(k)) x.searchParams.set(k, "***");
+      if (x.password) x.password = "***";
+      return x.toString();
+    } catch {
+      return "***";
+    }
+  };
+  const { secrets, ...rest } = cfg;
+  return jsonSafe({
+    ...rest,
+    solana: { ...cfg.solana, rpcUrls: cfg.solana.rpcUrls.map(maskUrl), wsUrl: cfg.solana.wsUrl ? maskUrl(cfg.solana.wsUrl) : null },
+    schedule: { ...cfg.schedule, encryptionKey: cfg.schedule.encryptionKey ? "[set]" : null },
+    mongo: { uri: maskUrl(cfg.mongo.uri), dbName: cfg.mongo.dbName },
+    api: { ...cfg.api, adminSessionSecret: cfg.api.adminSessionSecret ? "[set]" : null },
+    secrets: {
+      payoutWalletKey: secrets.payoutWalletPrivateKey ? "[env]" : secrets.payoutWalletKeypairPath ? "[file]" : null,
+      feeClaimKey: secrets.feeClaimAuthorityPrivateKey ? "[env]" : secrets.feeClaimAuthorityKeypairPath ? "[file]" : null,
+    },
+  });
+}

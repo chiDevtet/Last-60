@@ -1,0 +1,15 @@
+node_modules/
+.next/
+out/
+dist/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+.mongo-dev/
+*.tsbuildinfo
+secrets/
+*.keypair.json
+apps/web/next-env.d.ts
