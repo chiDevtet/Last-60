@@ -150,7 +150,10 @@ leaders safe.
 1. CAS `scheduled → snapshotting`; persist `snapshotSlot` immediately (re-runs reuse it).
 2. Terminal: `SYSTEM: Reward processing initiated.`
 3. Catch-up: ingest every pool signature up to the snapshot slot (same idempotent code path as
-   the indexer), after a short settle delay so the RPC has the confirmed slot indexed.
+   the indexer), after a short settle delay so the RPC has the confirmed slot indexed. Catch-up
+   starts from the indexer's cursor and never pages further back than the period's lower bound,
+   so a missing cursor cannot trigger a history crawl. If it cannot complete, the round stays
+   `snapshotting` and resumes — it never snapshots incomplete data.
 4. Select buyers (Mongo aggregation): buys in the period, `status=active`,
    `quoteAmount ≥ MIN_BUY`, trader not excluded → sort by `(slot desc, intra-slot order desc)`
    → first row per wallet → top `BUYER_COUNT`.
@@ -212,6 +215,7 @@ See `docs/FEE_ACCOUNTING.md` for the full ledger specification. Summary:
 | Terminal events | no (writer accepts typed public events only) |
 | Logs | no (scheduler logs "execution scheduled" without time) |
 | Admin API | no (insiders must not be able to front-run) |
+| Public round data | only `settledAt` (settlement finished); the execution instant itself is not published |
 | Chain | payout tx timestamps are public once they happen — unavoidable and fine |
 
 ## 9. Failure handling summary
@@ -227,3 +231,5 @@ See `docs/FEE_ACCOUNTING.md` for the full ledger specification. Summary:
 | Mongo interruption | loops back off; all writes are CAS/idempotent; no partial allocations (txn) |
 | Insufficient balance | `awaiting_funds`, retried; never partially signs |
 | Two workers | lease + CAS + fencing tokens + unique indexes |
+| Long sync / long snapshot | heartbeat and lease renewal run on independent timers; sync passes are bounded |
+| Pool/provider switched mid-period | the indexer re-attaches and ingests the whole current reward period |
