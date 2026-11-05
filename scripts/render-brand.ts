@@ -150,7 +150,7 @@ const banners: { name: string; w: number; h: number; html: string }[] = [
     html: `${grid(1500, 500)}
     <div style="position:absolute;left:96px;top:150px">${wordmark(DARK, 84, "xb").svg}
       <div style="margin-top:34px;font:600 30px Geist;color:${palette.frost};letter-spacing:-0.01em">The final minute pays.</div>
-      <div style="margin-top:12px;font:500 19px GeistMono;color:${palette.mist};letter-spacing:0.02em">75% OF TRADING FEES → THE LAST 5 BUYERS · EVERY 5 MINUTES · SOLANA</div></div>
+      <div style="margin-top:12px;font:500 19px GeistMono;color:${palette.mist};letter-spacing:0.02em">CREATOR FEES → THE LAST 5 BUYERS · EVERY 5 MINUTES · SOLANA</div></div>
     <div style="position:absolute;right:70px;top:30px">${bigRing(440, "xr")}</div>`,
   },
   {
@@ -160,7 +160,7 @@ const banners: { name: string; w: number; h: number; html: string }[] = [
     html: `${grid(1200, 630)}
     <div style="position:absolute;left:80px;top:205px">${wordmark(DARK, 80, "og").svg}
       <div style="margin-top:32px;font:600 34px Geist;color:${palette.frost};letter-spacing:-0.01em;max-width:560px">Every five minutes, the latest buyers get paid.</div>
-      <div style="margin-top:16px;font:500 18px GeistMono;color:${palette.mist}">75% of eligible trading fees · on-chain · verifiable</div></div>
+      <div style="margin-top:16px;font:500 18px GeistMono;color:${palette.mist}">Verified creator fee allocations · on-chain · verifiable</div></div>
     <div style="position:absolute;right:60px;top:95px">${bigRing(440, "or")}</div>`,
   },
   {

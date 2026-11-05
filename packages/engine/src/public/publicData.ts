@@ -22,6 +22,7 @@ import type { Models } from "../db/models";
 import { big, dec } from "../db/decimal";
 import { toTerminalDTO } from "../terminal/terminal";
 import { boundsOf, roundIndexAt, type ScheduleParams } from "../rewards/roundMath";
+import { periodFees, periodMatch } from "../rewards/selection";
 
 const EXECUTED_STATES = ["snapshotting", "paying", "awaiting_funds", "completed", "rolled_over", "attention"];
 const PUBLIC_ROUND_FIELDS = "roundNumber roundIndex startsAt endsAt state completedAt snapshotSlot fees reward retained rolloverIn rolloverOut dust perRecipient recipientCount paid dryRun config.buyerCount config.minBuyQuote config.rewardBps";
@@ -82,20 +83,31 @@ export class PublicData {
     return r ? { slot: r.snapshotSlot, rolloverOut: big(r.rolloverOut), roundNumber: r.roundNumber } : null;
   }
 
-  private async pool(): Promise<{ pool: string | null; mint: string; status: string }> {
+  private async pool(): Promise<{ pool: string | null; pools: string[]; mint: string; status: string; decimals: number | null }> {
     const s = await this.settings.get();
     const p: any = s.poolAddress ? await this.db.Pool.findOne({ poolAddress: s.poolAddress }).lean() : await this.db.Pool.findOne({}).sort({ refreshedAt: -1 }).lean();
-    return { pool: p?.poolAddress ?? s.poolAddress, mint: s.payoutAssetMint, status: p?.status ?? "unknown" };
+    const pool = p?.poolAddress ?? s.poolAddress;
+    // A graduated launch's activity continues on the destination pool — but only once the migration
+    // was verified on-chain and its destination is supported for accounting.
+    const dest = p?.migration?.verified && p?.migration?.supported ? (p.migration.destinationPool as string) : null;
+    const decimals = p && p.quoteMint === s.payoutAssetMint && typeof p.quoteDecimals === "number" ? p.quoteDecimals : null;
+    return { pool, pools: pool ? (dest ? [pool, dest] : [pool]) : [], mint: s.payoutAssetMint, status: p?.status ?? "unknown", decimals };
   }
 
   /** Match for swaps in the current (not yet snapshotted) reward period. */
   private async currentPeriodMatch(): Promise<Record<string, unknown> | null> {
-    const { pool } = await this.pool();
-    if (!pool) return null;
+    const period = await this.currentPeriod();
+    return period ? periodMatch(period) : null;
+  }
+
+  private async currentPeriod() {
+    const { pools } = await this.pool();
+    if (!pools.length) return null;
     const last = await this.lastSnapshot();
-    if (last) return { pool, status: "active", slot: { $gt: last.slot } };
+    const pool = pools.length === 1 ? pools[0]! : pools;
+    if (last) return { pool, afterSlot: last.slot, periodStartAt: null, snapshotSlot: Number.MAX_SAFE_INTEGER };
     const g = boundsOf(await this.genesisIndex(), this.params);
-    return { pool, status: "active", blockTime: { $gte: new Date(g.startsAt) } };
+    return { pool, afterSlot: null, periodStartAt: new Date(g.startsAt), snapshotSlot: Number.MAX_SAFE_INTEGER };
   }
 
   async currentRound(): Promise<CurrentRoundDTO> {
@@ -131,21 +143,19 @@ export class PublicData {
     });
   }
 
-  private asset(mint: string) {
-    return mint === WSOL_MINT ? { symbol: "SOL", mint, decimals: 9 } : { symbol: "TOKEN", mint, decimals: 9 };
+  /** Payout asset descriptor. SPL payouts must equal the pool's quote mint, whose decimals were read on-chain. */
+  private asset(mint: string, decimals: number | null) {
+    return mint === WSOL_MINT ? { symbol: "SOL", mint, decimals: 9 } : { symbol: "TOKEN", mint, decimals: decimals ?? 0 };
   }
 
   async rewardPool(): Promise<RewardPoolDTO> {
     return this.cached("pool", 1000, async () => {
       const s = await this.settings.get();
-      const { mint } = await this.pool();
-      const match = await this.currentPeriodMatch();
+      const { mint, decimals } = await this.pool();
+      const period = await this.currentPeriod();
       const last = await this.lastSnapshot();
-      let fees = 0n;
-      if (match) {
-        const r: any[] = await this.db.Swap.aggregate([{ $match: { ...match, eligibleFeeMint: mint } }, { $group: { _id: null, t: { $sum: "$eligibleFee" } } }]);
-        fees = big(r[0]?.t ?? 0);
-      }
+      // Only payout-eligible, creator-allocated fees (never gross pool fees).
+      const fees = period ? (await periodFees(this.db, period, mint)).payout : 0n;
       const rolloverIn = last?.rolloverOut ?? 0n;
       const share = (fees * BigInt(s.rewardBps)) / 10_000n;
       const sum = async (m: Record<string, unknown>) => {
@@ -154,7 +164,7 @@ export class PublicData {
       };
       const [pending, total, day] = await Promise.all([sum({ state: { $in: ["pending", "signing", "submitted"] } }), sum({ state: "confirmed" }), sum({ state: "confirmed", confirmedAt: { $gte: new Date(this.now() - 86_400_000) } })]);
       return {
-        asset: this.asset(mint),
+        asset: this.asset(mint, decimals),
         periodFees: fees.toString(),
         periodReward: (share + rolloverIn).toString(),
         periodRetained: (fees - share).toString(),
@@ -171,9 +181,9 @@ export class PublicData {
     limit = clampInt(limit, 30, 100); // also bounds the number of cache keys
     return this.cached(`buys:${limit}`, 750, async () => {
       const s = await this.settings.get();
-      const { pool } = await this.pool();
-      if (!pool) return [];
-      const rows: any[] = await this.db.Swap.find({ pool, side: "buy", status: "active" }, "signature trader quoteAmount baseAmount slot blockTime commitment").sort({ slot: -1, orderInSlot: -1 }).limit(limit).lean();
+      const { pools } = await this.pool();
+      if (!pools.length) return [];
+      const rows: any[] = await this.db.Swap.find({ pool: { $in: pools }, side: "buy", status: "active" }, "signature trader quoteAmount baseAmount slot blockTime commitment").sort({ slot: -1, orderInSlot: -1 }).limit(limit).lean();
       return rows.map((r) => ({
         signature: r.signature,
         wallet: r.trader,
@@ -255,7 +265,7 @@ export class PublicData {
 
   async stats(): Promise<StatsDTO> {
     return this.cached("stats", 2000, async () => {
-      const { mint } = await this.pool();
+      const { mint, decimals } = await this.pool();
       const ledgerSum = async (types: string[]) => {
         const r: any[] = await this.db.LedgerEntry.aggregate([{ $match: { type: { $in: types }, mint } }, { $group: { _id: null, t: { $sum: "$amount" } } }]);
         return big(r[0]?.t ?? 0);
@@ -272,7 +282,7 @@ export class PublicData {
         this.rewardPool(),
       ]);
       return {
-        asset: this.asset(mint),
+        asset: this.asset(mint, decimals),
         totalFeesAccrued: fees.toString(),
         totalPaid: paid.toString(),
         totalPending: big(pendingRows[0]?.t ?? 0).toString(),

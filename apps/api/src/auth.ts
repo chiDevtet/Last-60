@@ -1,9 +1,13 @@
 /**
- * Admin authentication: Sign-In-With-Solana style challenge/response.
- *   1. POST /nonce   → server issues a single-use, domain-bound message (5 min TTL)
- *   2. wallet signs it (ed25519) → POST /verify
- *   3. server verifies the signature against the allow-listed public key and returns a short-lived
- *      HMAC session token. Tokens are re-checked against ADMIN_WALLETS on every request.
+ * Admin authentication: Sign-In-With-Solana (SIWS / CAIP-122 message format) challenge/response.
+ *   1. POST /nonce   → server issues a single-use message bound to PUBLIC_SITE_URL's host (5 min TTL),
+ *                      plus the equivalent `signInInput` for wallets implementing `solana:signIn`.
+ *   2. the wallet signs it → POST /verify. Wallets recognise the SIWS format and refuse / warn when
+ *      the message's domain differs from the page requesting the signature, which defeats phishing
+ *      sites that relay our challenge to an admin.
+ *   3. server verifies the ed25519 signature against the allow-listed key over EXACTLY the issued
+ *      message (or, for `solana:signIn`, a message whose SIWS fields equal the issued ones) and
+ *      returns a short-lived HMAC session token, re-checked against ADMIN_WALLETS on every request.
  */
 import { ed25519 } from "@noble/curves/ed25519.js";
 import bs58 from "bs58";
@@ -17,8 +21,47 @@ export interface AdminAuthConfig {
   ttlSeconds: number;
 }
 
-export function buildMessage(o: { appName: string; domain: string; wallet: string; nonce: string; issuedAt: string; expiresAt: string }) {
-  return `${o.appName} admin sign-in\n\nDomain: ${o.domain}\nWallet: ${o.wallet}\nNonce: ${o.nonce}\nIssued At: ${o.issuedAt}\nExpires At: ${o.expiresAt}\n\nSigning this message does not authorize any transaction.`;
+export interface SiwsFields {
+  domain: string;
+  address: string;
+  statement: string;
+  uri: string;
+  version: string;
+  chainId: string;
+  nonce: string;
+  issuedAt: string;
+  expirationTime: string;
+}
+
+/** SIWS message (the format `solana:signIn` wallets construct and parse). */
+export function buildMessage(o: { appName: string; domain: string; uri?: string; chainId?: string; wallet: string; nonce: string; issuedAt: string; expiresAt: string }) {
+  return siwsMessage(siwsFields(o));
+}
+
+export function siwsFields(o: { appName: string; domain: string; uri?: string; chainId?: string; wallet: string; nonce: string; issuedAt: string; expiresAt: string }): SiwsFields {
+  return {
+    domain: o.domain,
+    address: o.wallet,
+    statement: `${o.appName} admin sign-in. Signing this message does not authorize any transaction.`,
+    uri: o.uri ?? `https://${o.domain}`,
+    version: "1",
+    chainId: o.chainId ?? "mainnet",
+    nonce: o.nonce,
+    issuedAt: o.issuedAt,
+    expirationTime: o.expiresAt,
+  };
+}
+
+export function siwsMessage(f: SiwsFields): string {
+  return `${f.domain} wants you to sign in with your Solana account:\n${f.address}\n\n${f.statement}\n\nURI: ${f.uri}\nVersion: ${f.version}\nChain ID: ${f.chainId}\nNonce: ${f.nonce}\nIssued At: ${f.issuedAt}\nExpiration Time: ${f.expirationTime}`;
+}
+
+/** Parse a SIWS message; null if it is not one. */
+export function parseSiws(msg: string): SiwsFields | null {
+  const m = /^(\S+) wants you to sign in with your Solana account:\n(\S+)\n\n([\s\S]*?)\n\n([\s\S]+)$/.exec(msg);
+  if (!m) return null;
+  const kv = Object.fromEntries(m[4]!.split("\n").map((l) => { const i = l.indexOf(": "); return [l.slice(0, i), l.slice(i + 2)]; }));
+  return { domain: m[1]!, address: m[2]!, statement: m[3]!, uri: kv["URI"] ?? "", version: kv["Version"] ?? "", chainId: kv["Chain ID"] ?? "", nonce: kv["Nonce"] ?? "", issuedAt: kv["Issued At"] ?? "", expirationTime: kv["Expiration Time"] ?? "" };
 }
 
 export class AdminAuth {
@@ -36,7 +79,7 @@ export class AdminAuth {
     return this.cfg.adminWallets.includes(wallet);
   }
 
-  async issueNonce(wallet: string, domain: string) {
+  async issueNonce(wallet: string, domain: string, opts: { uri?: string; chainId?: string } = {}) {
     if (!this.enabled) throw new AuthError(503, "admin access is not configured");
     try {
       new PublicKey(wallet);
@@ -47,12 +90,13 @@ export class AdminAuth {
     const nonce = randomToken(18);
     const issuedAt = new Date(this.now());
     const expiresAt = new Date(this.now() + 5 * 60_000);
-    const message = buildMessage({ appName: this.cfg.appName, domain, wallet, nonce, issuedAt: issuedAt.toISOString(), expiresAt: expiresAt.toISOString() });
+    const fields = siwsFields({ appName: this.cfg.appName, domain, uri: opts.uri, chainId: opts.chainId, wallet, nonce, issuedAt: issuedAt.toISOString(), expiresAt: expiresAt.toISOString() });
+    const message = siwsMessage(fields);
     await this.db.AdminNonce.create({ nonce, wallet, message, expiresAt });
-    return { nonce, message, expiresAt: expiresAt.toISOString() };
+    return { nonce, message, expiresAt: expiresAt.toISOString(), signInInput: fields };
   }
 
-  async verify(wallet: string, nonce: string, signature: string) {
+  async verify(wallet: string, nonce: string, signature: string, signedMessage?: string) {
     if (!this.enabled) throw new AuthError(503, "admin access is not configured");
     // Single use: atomically consume the nonce.
     const rec: any = await this.db.AdminNonce.findOneAndDelete({ nonce, wallet, expiresAt: { $gt: new Date(this.now()) } }).lean();
@@ -65,7 +109,17 @@ export class AdminAuth {
       throw new AuthError(400, "malformed signature");
     }
     if (sig.length !== 64) throw new AuthError(400, "malformed signature");
-    const ok = ed25519.verify(sig, new TextEncoder().encode(rec.message), new PublicKey(wallet).toBytes());
+    // `solana:signIn` wallets build the message themselves from the input fields: accept it only if
+    // every SIWS field equals the issued challenge; otherwise the signature must cover our exact text.
+    let message = rec.message as string;
+    if (signedMessage !== undefined && signedMessage !== rec.message) {
+      const got = parseSiws(signedMessage);
+      const want = parseSiws(rec.message);
+      const same = !!got && !!want && (Object.keys(want) as (keyof SiwsFields)[]).every((k) => got[k] === want[k]);
+      if (!same) throw new AuthError(401, "signed message does not match the issued challenge");
+      message = signedMessage;
+    }
+    const ok = ed25519.verify(sig, new TextEncoder().encode(message), new PublicKey(wallet).toBytes());
     if (!ok) throw new AuthError(401, "signature verification failed");
     return this.issueToken(wallet);
   }

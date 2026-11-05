@@ -117,6 +117,13 @@ const RawEnv = z.object({
   TOKEN_MINT: optionalPubkey,
   POOL_ADDRESS: optionalPubkey,
   FEE_BENEFICIARY_ROLE: z.enum(["creator", "partner", "platform"]).default("creator"),
+  // Operator-declared EXPECTED creator allocation. Used only to VERIFY what the chain says; the
+  // accounting always uses the on-chain value. A mismatch flags the pool and makes the affected fees
+  // ineligible for payout. Unset = not declared (warned).
+  EXPECTED_DBC_CREATOR_TRADING_FEE_PERCENTAGE: z.string().optional(),
+  EXPECTED_DBC_CREATOR_LP_PERCENTAGE: z.string().optional(),
+  EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE: z.string().optional(),
+  EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE: z.string().optional(),
 
   BUYER_COUNT: int(5, 1, 50),
   MIN_BUY_SOL: z.string().default("0.05"),
@@ -187,6 +194,20 @@ const RawEnv = z.object({
   NEXT_PUBLIC_SOLANA_EXPLORER: z.string().default("https://solscan.io"),
 });
 
+/**
+ * Declared creator allocation for Forgepad-style launches (all optional, integers):
+ *   dbcCreatorTradingFeePercentage — DBC `creator_trading_fee_percentage` (0-100, share of the LP trading fee while bonding)
+ *   dbcCreatorLpPercentage         — DBC creator liquidity + permanently locked + vesting LP percentages (0-100)
+ *   launchlabCreatorFeeRate        — LaunchLab `creator_fee_rate`, a FEE RATE on trade value in millionths (5000 = 0.5% of the trade)
+ *   launchlabCreatorLpScale        — LaunchLab `creator_scale`, the creator's share of migrated LP in millionths (500000 = 50%)
+ */
+export interface ExpectedAllocation {
+  dbcCreatorTradingFeePercentage: number | null;
+  dbcCreatorLpPercentage: number | null;
+  launchlabCreatorFeeRate: number | null;
+  launchlabCreatorLpScale: number | null;
+}
+
 export interface AppConfig {
   nodeEnv: "development" | "production" | "test";
   logLevel: string;
@@ -204,6 +225,7 @@ export interface AppConfig {
     tokenMint: string | null;
     poolAddress: string | null;
     feeBeneficiaryRole: "creator" | "partner" | "platform";
+    expected: ExpectedAllocation;
   };
   rewards: {
     buyerCount: number;
@@ -430,6 +452,34 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     problems.push("Set only one of PAYOUT_WALLET_PRIVATE_KEY / PAYOUT_WALLET_KEYPAIR_PATH");
   }
 
+  const expectedInt = (name: string, v: string | undefined, max: number): number | null => {
+    if (v === undefined || v.trim() === "") return null;
+    if (!/^\d+$/.test(v.trim()) || Number(v) > max) {
+      problems.push(`${name}: must be an integer between 0 and ${max}`);
+      return null;
+    }
+    return Number(v);
+  };
+  const expected: ExpectedAllocation = {
+    dbcCreatorTradingFeePercentage: expectedInt("EXPECTED_DBC_CREATOR_TRADING_FEE_PERCENTAGE", raw.EXPECTED_DBC_CREATOR_TRADING_FEE_PERCENTAGE, 100),
+    dbcCreatorLpPercentage: expectedInt("EXPECTED_DBC_CREATOR_LP_PERCENTAGE", raw.EXPECTED_DBC_CREATOR_LP_PERCENTAGE, 100),
+    launchlabCreatorFeeRate: expectedInt("EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE", raw.EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE, 1_000_000),
+    launchlabCreatorLpScale: expectedInt("EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE", raw.EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE, 1_000_000),
+  };
+  if (role === "api" && raw.NODE_ENV === "production") {
+    // Never fall back to request headers for the sign-in domain, and never reflect arbitrary origins.
+    if (raw.ADMIN_WALLETS.length > 0 && !raw.PUBLIC_SITE_URL) problems.push("PUBLIC_SITE_URL: is required in production when ADMIN_WALLETS is set (admin sign-in messages are bound to it)");
+    if (raw.CORS_ORIGINS.length === 0) problems.push("CORS_ORIGINS: is required in production (cross-origin requests are otherwise refused)");
+  }
+  if (raw.PUBLIC_SITE_URL) {
+    try {
+      const u = new URL(raw.PUBLIC_SITE_URL);
+      if (raw.NODE_ENV === "production" && u.protocol !== "https:") problems.push("PUBLIC_SITE_URL: must be https in production");
+    } catch {
+      problems.push("PUBLIC_SITE_URL: must be an absolute URL");
+    }
+  }
+
   if (problems.length) throw new ConfigError(problems);
 
   return {
@@ -449,6 +499,7 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
       tokenMint: raw.TOKEN_MINT ?? null,
       poolAddress: raw.POOL_ADDRESS ?? null,
       feeBeneficiaryRole: raw.FEE_BENEFICIARY_ROLE,
+      expected,
     },
     rewards: {
       buyerCount: raw.BUYER_COUNT,

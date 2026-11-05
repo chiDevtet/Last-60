@@ -3,7 +3,9 @@
 What was verified, how, and against what. Everything listed as verified was observed, not
 assumed. Date: 2026-11-05.
 
-## 1. Automated tests — 90 passing (`bun run test`)
+## 1. Automated tests — 172 passing (`bun run test`)
+
+Round-1 suites (counts as of the original report; several were extended since):
 
 | Suite | What it proves |
 |---|---|
@@ -15,8 +17,17 @@ assumed. Date: 2026-11-05.
 | `test/config.test.ts` (20) | Env defaults = spec, all problems reported at once, `NEXT_PUBLIC_` secret guard, role/provider validation, rent-exempt minimum, exact percentage parsing, URL key redaction, runtime-override validation, mainnet live switch, key parsing, sealed values bound to round, Decimal128 exactness, float-free parsing. |
 | `apps/api/test/api.test.ts` (6) | **No public route ever contains the execute time, delay, ciphertext or locks** (checked during the final window and after settlement); real engine state via API; wallet-signature login, nonce replay, forged signature, non-admin rejection; validated, version-checked, audited config changes; public cannot reach admin; SSE snapshot + live terminal. |
 
-Typecheck: `bun run typecheck` clean across engine, shared, api, worker, web. Production web
-build: `next build` succeeds.
+Added in round 2 (creator-fee accounting, migration, U1–U8):
+
+| Suite | What it proves |
+|---|---|
+| `test/attribution.test.ts` | On real DBC / LaunchLab transactions: creator share only (protocol, partner, referral, platform excluded with reasons); allocation basis per record; declared-vs-on-chain verification (`verified` / `not_declared` / `mismatch` → ineligible, chain value kept); LaunchLab `creator_fee_rate` is a **fee rate on trade value**, not a share; event cross-checked with the vault transfer; shared-vault deposits of other pools excluded; U4 claim + deposit in one transaction and two claims in one transaction. |
+| `test/migration.test.ts` | Strict verification on the real DBC → DAMM v2 and LaunchLab → CPMM migrations, and refusal on tampered copies: wrong owner, layout (size / discriminator), mint, PDA, DBC authority, DAMM config, foreign position owners, position of another pool, CPMM config ≠ platform `cp_config`, foreign pool creator, lock account owner; DAMM v1 / AMM v4 unsupported; failed migration tx ignored. |
+| `test/destination.test.ts` | Real DAMM v2 swap (buyer, quote, fee side; no per-swap creator fee) and position-fee claim; checkpoints = creator-held position fee growth, exactly once; unrelated positions excluded; LP mismatch ineligible; closed position unresolved; counter decrease flagged; pre-migration activity rejected; wrapper attach/detach. Real CPMM swap (buyer from transfers, creator fee only estimated) and real creator-fee collection (exact instruction transfer; whole-tx delta differs); non-beneficiary pool creator excluded; LP-lock collections attributed only from the creator's migration lock. |
+| `test/creator-fee-regressions.test.ts` | Periods across graduation tile exactly; keyed idempotent attributions (duplicate ingestion); ineligible amounts reported, never paid, gross never used; a full round over a migrated launch writes the checkpoint once at the snapshot slot; U1 role-change refusal (settings and worker attach); U2 crash between payout update and ledger write → nothing half-done, exact-once retry, legacy repair; U3 lagging node never drops, dropped rows don't block the window; U5 concurrent workers never both sign, SPL token / rent shortfalls; U8 SPL decimals; shared-vault reconciliation exact and over-attribution halts. |
+| `apps/api/test/hardening.test.ts` (extended) | U6: production requires `PUBLIC_SITE_URL` + `CORS_ORIGINS`; Host header never used; SIWS fields tamper-proof; foreign browser origin refused at verify; SSE per-IP cap. U8: CORS never reflects arbitrary origins. |
+
+Typecheck: `bun run typecheck` clean (exit 0) across engine, shared, api, worker, web. Production web build: `bun run build:web` succeeds (exit 0).
 
 ## 2. Fee attribution vs. on-chain accounting (real pools, full history)
 
@@ -78,11 +89,15 @@ test added). Logs: `docs/evidence/launchlab-*.log`.
   the public RPC (HTTP 410), so no devnet transfer was performed.
 * **Auto-claim** transactions are built from the IDLs and tested against the IDL / Raydium SDK, but
   were not executed on-chain (requires the beneficiary's key).
-* **Post-migration adapters** (DAMM v2 / Raydium AMM/CPMM) are specified but not implemented —
-  required before the token graduates (`docs/PROVIDERS.md`).
-* **Forgepad**'s specific DBC configuration could not be verified from public sources; the adapter
-  reads everything from chain, so the operator only needs the pool address and the correct
-  `FEE_BENEFICIARY_ROLE`.
+* **Post-migration accounting** (DAMM v2, CPMM) is implemented and verified offline on real mainnet
+  transactions and accounts, but **no live round across a real graduation** has been run, and no
+  real `collect_cp_fees` from a *creator* LP lock has been observed (the sampled platform locks 100 %
+  of the LP to itself). DAMM v1 and AMM v4 destinations are unsupported.
+* **Fee collection** (auto-claim, post-migration claims) was not executed on-chain; it stays manual.
+* **Forgepad**'s specific configuration could not be verified from public sources. The adapters read
+  the allocation from chain and check it against the operator's declaration (`EXPECTED_*`); this must
+  be done on the real Forgepad pool in dry-run before going live.
+* The `docs/evidence/*.log` files cited in §2–§3 were never committed to the repository.
 * Social handle availability for the brand was not verifiable without authenticated APIs.
 * The brief's ordering example lists "A, E, D, C, B", but under its own rule A's latest buy (3rd
   transaction) is older than C, D, E, giving "E, D, C, A, B". The selected set — and every payout

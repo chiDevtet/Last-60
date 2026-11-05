@@ -9,9 +9,10 @@ locally). Multi-document transactions are required for round allocation. Models:
 | `system_state` | genesis round index + schedule params, `payout_halt` | `_id` |
 | `settings` | admin runtime overrides, optimistic `version` | `_id: "active"` |
 | `config_audit` | every settings change / operator action: actor wallet, diff, reason, IP | `at` |
-| `pools` | provider pool metadata, fee params, vaults, status, reconciliation `baseline` | `key` unique |
-| `swaps` | every decoded trade (buys and sells) | **`(signature, eventIndex)` unique**; `(pool, side, status, slot, orderInSlot)`; `(pool, status, slot)`; `(trader, slot)`; `(commitment, status, slot)` |
-| `fee_claims` | on-chain claims of the beneficiary's fees | **`signature` unique** |
+| `pools` | provider pool metadata, fee params, vaults, status, allocation basis + verification, reconciliation `baseline`, `migration` (status, checks, failed checks, destination spec) | `key` unique |
+| `swaps` | every decoded trade (buys and sells) on the bonding pool and the verified destination; attribution fields `feePhase`, `excludedFee`, `excludedReason`, `feeStatus`, `payoutEligible`, `basisId` + `basis`, `beneficiary`, `sourcePool`, `evidence`; `orderInSlot` is the event index (NOT the block position; `txIndex` holds it when resolved) | **`(signature, eventIndex)` unique**; `(pool, side, status, slot, orderInSlot)`; `(pool, status, slot)`; `(trader, slot)`; `(commitment, status, slot)` |
+| `fee_claims` | on-chain claims of the beneficiary's fees (bonding curve, DAMM v2 positions) | **`(signature, index)` unique** — several claims per transaction |
+| `fee_attributions` | non-swap fee facts: LP-position checkpoints, CPMM creator-fee and locked-LP collections, other pools' shared-vault inflows, unresolved observations — each with gross / creator / excluded amounts, reason, evidence, status, payout eligibility, basis | **`key` unique**; `(pool, slot)`; `(checkpointKey, slot)` |
 | `buyer_activity` | per-wallet totals: buys, qualifying buys, spent, rewards, rounds paid | `wallet` unique |
 | `rounds` | one per round: schedule, sealed execute time, snapshot, config snapshot, allocation, totals, state, lock | **`roundNumber` unique**, **`roundIndex` unique**, `(state, roundNumber)` |
 | `payouts` | one per (round, recipient): amount, state machine, attempts with signatures/blockhashes | **`(roundNumber, recipient)` unique**, **`confirmedSignature` unique (partial)**, `(state, nextAttemptAt)` |
@@ -50,3 +51,13 @@ alone, using `scripts/verify-round.ts`.
 * Back up with `mongodump` or Atlas snapshots; `swaps` can be rebuilt from chain, the rest cannot.
 * `terminal_events` expire after `TERMINAL_RETENTION_DAYS`. Nothing else is deleted.
 * Indexes are synchronised at process start (`syncIndexes`).
+
+## Migrations for existing deployments
+
+No manual data migration is required; indexes are synchronised at process start (`syncIndexes`):
+* `fee_claims`: the unique index changes from `signature` to `(signature, index)` (existing rows get
+  `index` 0 implicitly; single-claim transactions keep index 0, so rows are not duplicated).
+* New collection `fee_attributions` and new swap / payout / round fields default safely: legacy swap
+  rows without `payoutEligible` count as eligible (same program formula), legacy confirmed payouts
+  without `ledgerApplied` are repaired once by the reconciler.
+* Legacy swap rows have no stored `basis`: a beneficiary-role change on such a pool is refused.

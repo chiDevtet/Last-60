@@ -1,39 +1,37 @@
 # LAST60 production-readiness audit
 
-Date: 2026-11-05 · Scope: the whole repository at `main` (`fa115b1`) · Fixes: branch
-`fix/production-readiness-critical`. No live payouts were enabled, no mainnet transaction was sent,
-no wallet or deployment was touched. All chain evidence below comes from read-only mainnet RPC
-calls (`getAccountInfo`, `getSignaturesForAddress`, `getTransaction`) and the programs' public
-source code.
+**Round 1** (2026-11-05, `fa115b1` → merged to `main` as `4cf1bd3`): critical payout/accounting fixes
+C1–C14 (below). **Round 2** (2026-11-05, branch `fix/creator-fee-accounting` on top of `4cf1bd3`):
+creator-fee-only accounting, strict migration verification, post-migration providers and the
+previously unresolved findings U1–U8. No live payouts were enabled, no mainnet transaction was sent,
+no fee was claimed and no wallet or deployment was touched; all chain evidence comes from read-only
+RPC calls (`getAccountInfo`, `getMultipleAccounts`, `getSignaturesForAddress`, `getTransaction`) and
+the programs' public source code.
 
 ## 1. Verdict
 
-**Not production-ready yet.** The architecture is sound and most of the money-movement design
-(persist-before-broadcast, fencing, unique constraints, integer allocation, CAS state machines) is
-well executed. However, the audit found **three ways real funds could be sent twice or without
-authorization** (C1–C3), several silent accounting gaps, and deployment tooling that reported
-success without doing anything. Those are fixed on the feature branch with regression tests that
-failed before the fix. Remaining blockers (§7) are the missing post-graduation adapter, verification
-of the actual Forgepad pool configuration, and a handful of unfixed P1 issues (§3).
+**Not production-ready for live payouts yet** — but no longer for code reasons known to us. The
+remaining blockers (§7) are operational verifications that require the real Forgepad pool, an
+observed graduation, and an authorized small-value live test. The code now accounts only for
+on-chain-verified creator allocations, fails safe (records but never pays) whenever an allocation
+cannot be proven, and keeps every payout safeguard of round 1.
 
 ## 2. Test evidence
 
 | Run | Result |
 |---|---|
-| `main` — `bun run test` (real MongoDB 8.0.4 replica set, FakeChain, LiteSVM, mainnet fixtures) | **90 pass / 0 fail**, 44.4 s |
-| `main` — `tsc` engine, shared, api, worker | clean |
-| `main` — `bun run typecheck` / `bun run build:web` | exit 0 **but the web steps never ran**: `bun --cwd apps/web run X` prints usage and exits 0 under Bun 1.4.4 — even for a script that does not exist (`exit=0`) |
-| `main` — web typecheck / `next build` run directly in `apps/web` | clean / builds (Next 16.4.5) |
-| New regression tests against **unfixed** code (`test/audit-regressions.test.ts`, `apps/api/test/hardening.test.ts`) | **0 pass / 11 fail** — every defect reproduced (e.g. buyer paid twice, 1 001 of 2 501 transactions indexed, second transfer for a landed payout) |
-| Branch — `bun run test` | **109 pass / 0 fail**, 52 s (90 original + 13 regression + 6 migration) |
-| Branch — `bun run typecheck` (now includes web) / `bun run build:web` (now builds) | clean / builds |
+| `main` (`4cf1bd3`) — `bun run test`, re-run for this round | **109 pass / 0 fail** (55.1 s) — confirms the round-1 figure |
+| Branch — `bun run test` | **172 pass / 0 fail** across 14 files (57.2 s) |
+| Branch — `bun run typecheck` (engine, shared, api, worker, web) | clean (exit 0) |
+| Branch — `bun run build:web` | builds (exit 0) |
+| Branch — `bun scripts/resolve-migration.ts raydium_launchlab 8AH7Rbje… <mint> creator` against mainnet (read-only) | verified, exit 0 |
 
 ## 3. Confirmed issues
 
 Severity: **Critical** = funds can move incorrectly; **High** = incorrect payments, silent accounting
 loss, or broken deployment; **Medium** = wrong-but-safe behaviour, false halts, abuse vectors.
 
-### Fixed on the branch (each with a regression test)
+### Round 1 — fixed and merged into `main` (`4cf1bd3`), each with a regression test
 
 | # | Sev. | Issue | Where | Fix |
 |---|---|---|---|---|
@@ -52,24 +50,36 @@ loss, or broken deployment; **Medium** = wrong-but-safe behaviour, false halts, 
 | C13 | High (deploy) | Root `typecheck`, `build:web`, `dev:web`, `start:web` were **no-ops that exit 0** under Bun 1.4.4 (web never type-checked; `build:web` built nothing, so `next start` would fail after a "successful" deploy). | `package.json` | `bun run --cwd apps/web <script>` (verified it fails on a missing script). |
 | C14 | High (deploy/security) | **Per-process env isolation did not exist.** PM2 has no `env_file` option (checked PM2 7.1.2 source) — the setting was silently ignored. Bun auto-loads a root `.env` into every process started without `--env-file`, so with the README quick-start `.env` on the host **the API received the payout key and schedule key**; otherwise every process exited 78. | `ecosystem.config.cjs` | `interpreter_args: --env-file=.env.<role>` (`node_args` for web); verified `--env-file` suppresses `.env` auto-load. |
 
-### Not fixed (need a decision or a larger change)
+### Round 2 — fixed on `fix/creator-fee-accounting` (each with regression tests)
 
-| # | Sev. | Issue | Recommendation |
-|---|---|---|---|
-| U1 | **High** | Changing `feeBeneficiaryRole` (or anything that changes `eligibleFee`) on a pool with history: stored swaps keep the old role's `eligibleFee` (`$setOnInsert`), so the current period mixes bases → wrong reward; reconciliation compares mismatched bases (possible false halt). | Store the fee basis (`provider:pool:role`) on each swap and re-attribute on change, or reject role changes for a pool with ingested swaps. Until then: **never change the role on a live pool** (runbook). |
-| U2 | Medium | `confirm()` updates the payout, then writes `PAYOUT_CONFIRMED` and buyer stats in separate non-transactional writes; a crash in between leaves the ledger short (`totalPaid` low) with no repair. Same for `PAYOUT_FAILED`. | One transaction, or an idempotent reconciler repair. |
-| U3 | Medium | Finality pass marks a swap `dropped` on a single null status (same lagging-node problem as C3 → a real buyer excluded); dropped swaps stay `commitment=confirmed` and occupy the oldest-first 256-row window forever, eventually stalling promotion of newer swaps. | Context-slot check; exclude `dropped` from the main window and re-check them separately. |
-| U4 | Medium | LaunchLab claim amount = **net** vault delta of the whole transaction; a claim plus a trade by the same creator in one tx is mis-recorded → reconciliation mismatch / false halt. The shared creator vault also lets other pools' fees mask over-attribution (documented). | Derive the claim from the claim instruction's inner transfer. |
-| U5 | Low | SPL payouts have no token-balance or SOL fee/rent check before signing; the SOL funds check is not atomic across `PAYOUT_CONCURRENCY` workers. Both end in preflight failures consuming attempts (never double payment). | Check token balance + SOL for ATA rent; reserve in-flight amounts atomically. |
-| U6 | Low | Admin sign-in: domain line falls back to the request `Origin`/`Host` when `PUBLIC_SITE_URL` is unset, and the plain `signMessage` format lets wallets skip origin checks (phishing relay). No per-IP SSE connection cap; Bun `idleTimeout: 0` server-wide. | Require `PUBLIC_SITE_URL` with `ADMIN_WALLETS`; use SIWS `signIn`; cap SSE connections. |
-| U7 | Low | `orderInSlot` is the event index inside a transaction, not the transaction's block position (schema comment says otherwise); only the selection boundary is tie-broken with `getBlock`. Payouts unaffected; ranking display within a slot is arbitrary. | Store the transaction index (available from `getBlock`) or fix the comment. |
-| U8 | Low | Public DTOs report 9 decimals for every SPL payout mint; CORS reflects any origin when `CORS_ORIGINS` is empty (bearer tokens, so not directly exploitable). | Use the mint's decimals; require `CORS_ORIGINS` in production. |
+| # | Sev. | Issue | Fix | Tests |
+|---|---|---|---|---|
+| U1 | High | Changing `feeBeneficiaryRole` on a pool with history mixed allocation bases. | Every fee record stores its allocation basis (`basisId` + snapshot: role, beneficiary, on-chain parameters, source, verification), written once. Role changes on a pool with records under another basis (or legacy records without one) are **refused** by the settings store and when a worker attaches with a conflicting environment role. History is never re-attributed implicitly. | `creator-fee-regressions` U1 ×2, `attribution` basis tests |
+| U2 | Medium | Payout confirmation and ledger/stats were separate writes. | Confirmation, `PAYOUT_CONFIRMED` and buyer stats (and exhausted → `PAYOUT_FAILED`) commit in one MongoDB transaction; `ledgerApplied` flag; `repairPayoutLedger` (run by the reconciler) fixes legacy/partial rows idempotently. | crash between writes → nothing half-done, retry exactly once; legacy repair idempotent |
+| U3 | Medium | A single null status dropped swaps; dropped rows blocked the finality window. | Drop requires status answers from nodes at/after the finalized slot, the swap's slot ≥ 150 slots below it, and two observations `INDEXER_DROP_AFTER_SECONDS` apart; dropped rows are re-checked in a separate bounded window and revived if seen. | lagging node never drops; 300 dropped rows don't block promotion; updated fork test |
+| U4 | Medium | LaunchLab claims used whole-transaction vault deltas; shared vault masked over-attribution. | Claims = transfers out of the vault executed by that claim instruction (several claims per tx supported); other pools' deposits into the shared vault are indexed as excluded `shared_vault_inflow` records and counted in reconciliation, which is therefore exact. | claim + deposit in one tx, two claims in one tx, shared-vault inflow, exact and over-attribution reconciliation |
+| U5 | Low | No SPL/SOL-rent checks; balance check not concurrency-safe. | The payout is reserved (`signing`) *before* the funds check, which counts all other reserved/in-flight payouts per mint; SPL checks token balance and SOL for fees + recipient ATA rent; actionable diagnostics; jittered retry. | two concurrent workers never both sign; SPL token and rent shortfalls |
+| U6 | Low | Sign-in domain fell back to Origin/Host; plain message format; no SSE caps; `idleTimeout: 0`. | `PUBLIC_SITE_URL` required in production (config error), never `Host`; SIWS (CAIP-122) message + `solana:signIn` support; verify rejects altered SIWS fields and foreign browser origins; SSE per-IP/total caps and max lifetime; Bun `idleTimeout: 30` with heartbeats. | production config, Host ignored, SIWS tamper, origin relay, SSE cap |
+| U7 | Low | `orderInSlot` documented as transaction position. | Documented as the event index (no cross-transaction ordering guarantee); selection keeps the `getBlock` tie-break at the boundary; `txIndex` field reserved for the resolved block position. | existing selection tie-break tests |
+| U8 | Low | SPL payout DTOs assumed 9 decimals; CORS reflected any origin when empty. | Payout asset decimals from the pool's on-chain quote decimals; CORS: production requires `CORS_ORIGINS`, development allows loopback only, arbitrary origins never reflected. | decimals, CORS policy |
+
+### Round 2 — creator-fee accounting (new requirements)
+
+| Area | Before | Now |
+|---|---|---|
+| What is counted | the configured role's per-swap share while bonding; nothing after graduation | only payout-eligible creator allocations in every phase; gross/protocol/partner/platform/other-LP amounts recorded as excluded with a reason |
+| Allocation source | on-chain params, no cross-check | on-chain params **verified** against the operator declaration (`EXPECTED_*`); mismatch → pool flagged, fees ineligible, declaration never substituted |
+| LaunchLab rate semantics | implicit | `creator_fee_rate` proven to be a fee rate on trade value (real trade), events cross-checked with the vault transfer |
+| Migration verification | DAMM v2 / CPMM partial; DAMM v1 / AMM v4 owner-only could pass | every required check per kind (program, layout + discriminator, mints, PDA, config, authority, positions/locks); DAMM v1 / AMM v4 explicitly unsupported |
+| Post-migration | detection only | DAMM v2 and CPMM adapters: buyer tracking, creator-held position checkpoints, collected creator fees, creator LP-lock collections; periods span both pools |
+| Reconciliation | bonding counters; LaunchLab ≥ only | exact LaunchLab, DAMM v2 checkpoint totals vs on-chain counters, payout-ledger repair |
+| Public copy | advertised a fixed percentage | neutral ("eligible creator fees are allocated to payouts"); social images re-rendered |
 
 ## 4. Live-money execution paths — review notes
 
 * **Native SOL / SPL transfers** — one recipient per transaction, canonical on-curve recipients only,
   amount > 0, `MIN_PAYOUT_LAMPORTS ≥ 890 880` (rent-exempt), Token-2022 aware `transferChecked`.
-  Verified on LiteSVM. ✔ (see U5 for SPL funds checks)
+  Verified on LiteSVM. ✔ SPL token balance and SOL fee/rent preflight added (U5).
 * **Persistence before broadcast** — signature, blockhash, `lastValidBlockHeight` and bytes are
   written under a fencing token; a lost lock never broadcasts; abandoned `signing` rows are provably
   unsent. ✔
@@ -84,7 +94,8 @@ loss, or broken deployment; **Medium** = wrong-but-safe behaviour, false halts, 
   (`ix_claim_creator_trading_fee.rs`); LaunchLab claim is byte-identical to the SDK (existing test).
   Claims transfer only to the beneficiary/payout wallet. See C6/C7/U4.
 * **Accounting** — allocation conserves `fees + rolloverIn = retained + dust + rolloverOut + payouts`
-  (property-tested); reconciliation halts on over-attribution. Gaps were C4/C5/C8/U1.
+  (property-tested); reconciliation halts on over-attribution. Gaps were C4/C5/C8 (round 1) and U1
+  (round 2), all fixed; `fees` is now the payout-eligible creator allocation only.
 
 ## 5. Provider findings
 
@@ -109,7 +120,11 @@ loss, or broken deployment; **Medium** = wrong-but-safe behaviour, false halts, 
 
 ### Raydium LaunchLab
 * Creator/platform fees move per trade into shared vault PDAs; per-event attribution is
-  authoritative; reconciliation can only check `vault ≥ expected` (shared). See U4.
+  authoritative; other pools' deposits are now indexed and excluded, so reconciliation is exact (U4).
+* `creator_fee_rate` is a fee rate in millionths of the **trade value**, added to the total fee rate
+  (e.g. 5 000 = 0.5 % of each trade) — proven on a real trade; it is not a share of the fee.
+* Real platform sampled (`EB2LqTh8…`): `fee_rate` 7 500, `creator_fee_rate` 5 000, `platform_scale`
+  1 000 000, `creator_scale` 0 — i.e. on that platform the creator gets **no** migrated LP.
 * Post-graduation the creator's income changes mechanism entirely (§6).
 
 ## 6. Post-graduation (migration) — findings and work done
@@ -125,39 +140,50 @@ Verified on mainnet (fixtures `test/fixtures/mainnet/migration-*.json`, tests `t
 | Fee entitlement | **LP position NFTs** (pro rata liquidity incl. vested/locked), split by the config's LP percentages — the example creator got 0% while bonding and ~100% of LP fees after | **CPMM creator fee** to `pool_creator` (= LaunchLab creator in the example) **minus a protocol `share_rate` applied at collection**; collection is permissionless; locked-LP fee keys per platform/creator scales; AMM v4: none |
 | Exactness | `claimable = pending + liquidity × Δfee_per_liquidity >> 128` reproduces the pool's own `total_lp_fee` to 2 base units | swap-event `creator_fee` ≠ amount received |
 
-Implemented: `providers/migration.ts` (find, parse, verify, position fee math), indexer records the
-verified destination (`pools.migration`) and announces it, provider config warnings,
-`scripts/resolve-migration.ts`. **Not implemented:** destination swap decoding (buyers) and
-position/creator-fee period accounting — specified in `docs/PROVIDERS.md`. Until then rounds after
-graduation have no buyers and no fees.
+**Round 2 — implemented:** strict verification for every supported kind (DAMM v1 / AMM v4 explicitly
+unsupported); DAMM v2 and CPMM destination adapters (buyer tracking; creator-held position
+checkpoints; collected CPMM creator fees; creator LP-lock collections); verified destinations
+persisted as a spec and attached by both workers; destination indexed from the migration slot;
+periods span bonding + destination pools; DAMM v2 reconciliation; `resolve-migration` uses the same
+logic. Support matrix and evidence: `docs/PROVIDERS.md` §Post-migration. **Not yet observed:** a
+live round across a real graduation, and a real `collect_cp_fees` from a creator lock.
 
-## 7. Production deployment blockers
+## 7. Production deployment blockers (remaining)
 
-1. **Merge the fixes** (C1–C3 are money-safety). Re-run `bun run test` / `typecheck` / `build:web`.
-2. **Post-graduation adapter** (DAMM v2 and/or CPMM) — required before the token graduates.
-3. **Verify the real Forgepad pool** in dry-run: check `pools.warnings`, `feeParams`, `beneficiary`,
-   run `bun run verify:fees` and `verify:round`; confirm the claim signer equals `pool.creator`.
-4. **Resolve U1** (role change) or forbid it operationally; fix U2/U3 before relying on ledger totals
-   and drop detection.
-5. **Deployment config**: use the fixed `ecosystem.config.cjs`, remove any root `.env` from hosts,
-   set `API_TRUST_PROXY_HOPS=1`, `PUBLIC_SITE_URL`, `CORS_ORIGINS`, bind the API to 127.0.0.1.
-6. **RPC**: one dedicated provider for the rewards worker (heterogeneous failover lists increase
-   inconsistent views; C2/C3 now defend against them but every refusal delays rounds).
-7. **Authorized small-value live test** of the payout path (only LiteSVM / FakeChain so far).
+1. **Review and merge `fix/creator-fee-accounting`**; re-run `bun run test` / `typecheck` / `build:web`.
+2. **Verify the real Forgepad pool in dry-run**: set `EXPECTED_*` to Forgepad's intended allocation
+   and confirm `pools.allocation.verification = verified` (no `ALLOCATION MISMATCH`); check
+   `feeParams` (creator LP percentage / `creator_scale`), `beneficiary`, collect-fee mode (fees in the
+   token are not distributable as SOL); run `verify:fees` and `verify:round`.
+3. **Observe a real graduation end-to-end in dry-run** for the launch type used (DBC → DAMM v2 or
+   LaunchLab → CPMM): `pools.migration.status = verified`, destination buyers indexed, first
+   post-migration round's creator fees re-derived independently. Until then post-migration accounting
+   is verified only offline on real transactions.
+4. **Fee collection stays manual** until the actual Forgepad signer, authority, beneficiary and claim
+   permissions are verified (who is `pool.creator` / CPMM `pool_creator` / position & fee-key NFT
+   holder, and who can sign their claims).
+5. **Deployment config**: fixed `ecosystem.config.cjs`, no root `.env` on hosts, `API_TRUST_PROXY_HOPS=1`,
+   `PUBLIC_SITE_URL` and `CORS_ORIGINS` (now mandatory in production), API bound to 127.0.0.1.
+6. **RPC**: one dedicated provider for the rewards worker.
+7. **Authorized small-value live payout test** (only LiteSVM / FakeChain so far).
 8. **CI**: none in the repository — add one running test, typecheck and build on every PR.
+9. **Dashboard screenshots** in `docs/screenshots/` predate the copy change (they show an older
+   percentage headline); re-capture from a running deployment.
 
 ## 8. Documentation vs. code discrepancies
 
 | Doc says | Reality |
 |---|---|
 | README / VERIFICATION: `bun run typecheck` clean incl. web; `next build` succeeds | True when run directly; the root scripts never ran the web steps (C13). |
-| VERIFICATION / FEE_ACCOUNTING: logs in `docs/evidence/*.log` | Directory not in the repository. |
+| VERIFICATION / FEE_ACCOUNTING: logs in `docs/evidence/*.log` | Directory not in the repository (still true; the evidence logs were never committed — treat those figures as reported, not reproducible from the repo). |
 | SECURITY / README / API: live mainnet requires `ALLOW_MAINNET_PAYOUTS=true` | Not enforced by the signing process (C1, fixed). |
 | DEPLOYMENT: one env file per process via PM2 | PM2 ignored `env_file`; Bun loaded root `.env` everywhere (C14, fixed). |
 | DEPLOYMENT nginx snippet + API "per-IP rate limits" | Left-most XFF trusted; SSE location without XFF (C9, fixed). |
 | `scheduler.catchUp`: "throws rather than snapshotting incomplete data" | Not with > 20 000 signatures (C4, fixed). |
 | ARCHITECTURE: provider switch "ingests the whole current reward period" | Previous pool's tail was dropped from rounds (C8, fixed). |
-| `models.ts`: `orderInSlot` = tx position × 1000 + event index | Event index only (U7). |
-| API.md: nonce message bound to `PUBLIC_SITE_URL` | Falls back to request `Origin`/`Host` when unset (U6). |
-| README: "90 tests" | 109 on the fix branch. |
+| `models.ts`: `orderInSlot` = tx position × 1000 + event index | Event index only (U7) — documentation fixed in round 2. |
+| API.md: nonce message bound to `PUBLIC_SITE_URL` | Fell back to request `Origin`/`Host` when unset (U6) — fixed in round 2. |
+| README: "90 tests" / "109 tests" | 109 on `main` (re-verified); see §2 for this branch. |
 | PROVIDERS (old): post-migration needs checkpoint tracking over time | Refined: claimable is a cumulative counter readable at each snapshot (§6). |
+| PROVIDERS / OPERATIONS: "switch to the post-migration adapter" | Round 2: verified destinations attach automatically; docs updated. |
+| Public copy: fixed percentage headline | Round 2: removed from UI, metadata, README, social images; screenshots pending (§7.9). |

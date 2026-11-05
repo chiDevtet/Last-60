@@ -1,9 +1,9 @@
 <p align="center"><img src="brand/logo-dark.svg" alt="LAST60" height="56"></p>
 
 <p align="center"><b>The final minute pays.</b><br>
-Every five minutes, 75% of a Solana token's eligible trading fees are paid on-chain to the five
-most recent unique buyers — at a moment inside the final 60 seconds chosen by a secure random
-draw and kept private until it happens.</p>
+Every five minutes, eligible creator fees are allocated to on-chain payouts for the five most
+recent unique buyers — at a moment inside the final 60 seconds chosen by a secure random draw and
+kept private until it happens. Payouts are based on verified creator fee allocations.</p>
 
 <p align="center"><img src="docs/screenshots/dashboard-final-minute.png" alt="Dashboard in the final minute" width="860"></p>
 
@@ -13,9 +13,10 @@ draw and kept private until it happens.</p>
 
 | | |
 |---|---|
-| **Rewards engine** (`apps/worker` → `rewards`) | Clock-anchored 5-minute rounds; CSPRNG execution time sealed with AES-GCM and reused across restarts; snapshot at the cluster slot; deterministic unique-buyer selection; integer 75/25 allocation with dust and rollover; one MongoDB transaction per allocation; individual payouts with persisted-before-broadcast signatures and expiry-proven retries; reconciliation that halts on over-attribution. |
+| **Rewards engine** (`apps/worker` → `rewards`) | Clock-anchored 5-minute rounds; CSPRNG execution time sealed with AES-GCM and reused across restarts; snapshot at the cluster slot; deterministic unique-buyer selection; integer reward/retained allocation with dust and rollover; one MongoDB transaction per allocation; individual payouts with persisted-before-broadcast signatures and expiry-proven retries; reconciliation that halts on over-attribution. |
 | **Indexer** (`apps/worker` → `indexer`) | WebSocket fast path + gap-free cursor polling + backfill; idempotent ingestion; finality tracking and fork exclusion; v1-transaction aware. |
-| **Launch providers** | Meteora DBC and Raydium LaunchLab adapters from the official IDLs, validated on real mainnet data; switch with `LAUNCH_PROVIDER` (or live, from the admin console). |
+| **Launch providers** | Meteora DBC and Raydium LaunchLab adapters from the official IDLs, validated on real mainnet data; switch with `LAUNCH_PROVIDER` (or live, from the admin console). Strictly verified graduation to Meteora DAMM v2 and Raydium CPMM with post-migration buyer tracking and creator-entitlement accounting. |
+| **Creator-fee accounting** | Only fees allocated to the creator by on-chain configuration and position ownership are counted; every record carries gross / allocated / excluded amounts, its allocation basis, evidence and payout eligibility ([Fee accounting](docs/FEE_ACCOUNTING.md)). |
 | **API** (`apps/api`) | Public REST + Server-Sent Events from whitelisted DTOs; wallet-signature admin API with audited, version-checked configuration. |
 | **Web** (`apps/web`, Next.js 16) | Countdown centerpiece with final-minute intensification, live reward pool, buyer feed, live engine terminal, payout history with Solscan links, stats and charts, admin console, brand page. |
 | **Brand** (`brand/`) | LAST60 identity — logo (light/dark), icon, favicons, social image, X banner, OG image. |
@@ -48,8 +49,8 @@ INDEXER_BACKFILL=none
 ## Tests
 
 ```bash
-bun run test        # 109 tests: real MongoDB replica set, fault-injecting chain, real Solana runtime (LiteSVM),
-                    # real mainnet transaction fixtures — no network, no real keys
+bun run test        # real MongoDB replica set, fault-injecting chain, real Solana runtime (LiteSVM),
+                    # real mainnet transaction fixtures — no network, no real keys (count: docs/VERIFICATION.md)
 bun run typecheck
 ```
 
@@ -66,7 +67,7 @@ bun run verify:round <n> --fees                           # re-derive a round's 
 |---|---|
 | [Architecture](docs/ARCHITECTURE.md) | processes, rounds, snapshot, payouts, privacy, failure handling |
 | [Fee accounting](docs/FEE_ACCOUNTING.md) | formulas, periods, ledger, collection, reconciliation |
-| [Providers](docs/PROVIDERS.md) | Meteora DBC & Raydium LaunchLab internals, switching, **post-migration requirement** |
+| [Providers](docs/PROVIDERS.md) | Meteora DBC & Raydium LaunchLab internals, graduation support matrix |
 | [Database](docs/DATABASE.md) | collections, constraints, state machines, reconstruction |
 | [API](docs/API.md) | public, SSE and admin endpoints |
 | [Security](docs/SECURITY.md) | keys, money-movement invariants, schedule privacy, admin |
@@ -85,8 +86,8 @@ bun run verify:round <n> --fees                           # re-derive a round's 
 | 3 | Unique buyer tracking | ✔ tests + chain-verified recipients for every live round |
 | 4 | Independent five-minute rounds | ✔ clock-anchored; runs without API/web |
 | 5 | Random execution time survives restarts | ✔ sealed, CAS-persisted, tested; workers restarted mid-run |
-| 6 | Accurate eligible-fee accounting | ✔ exact full-history reconciliation on two real DBC pools; live rounds match the chain to the lamport |
-| 7 | 75% distribution calculated correctly | ✔ integer math, property-tested, chain-verified |
+| 6 | Accurate eligible-fee accounting | ✔ creator allocation only (gross, protocol, partner and other LP fees excluded); exact full-history reconciliation on two real DBC pools; live rounds match the chain to the lamport. Post-migration accounting verified on real transactions offline, **not yet on a live round** |
+| 7 | Reward share calculated correctly | ✔ integer math, property-tested, chain-verified |
 | 8 | Individual payouts executed and verified | ✔ on the real Solana runtime (LiteSVM) and fault-injection suite; **live mainnet transfers not sent (not authorized)** |
 | 9 | Failed payouts recoverable safely | ✔ expiry-proven retries, max attempts → requeue, tested |
 | 10 | Real-time dashboard | ✔ SSE, server-clock-synced countdown |
@@ -96,9 +97,14 @@ bun run verify:round <n> --fees                           # re-derive a round's 
 | 14 | Provider switch by configuration only | ✔ performed live via the admin API |
 | 15 | Runs without the frontend | ✔ separate processes |
 
-**Before going live:** implement the post-migration adapter (DAMM v2 / Raydium AMM-CPMM) — bonding
-pools graduate quickly — and follow the go-live sequence in [Deployment](docs/DEPLOYMENT.md).
-Live mainnet payouts require `PAYOUT_MODE=live` **and** `ALLOW_MAINNET_PAYOUTS=true`.
+**Before going live:** resolve the production blockers in [Audit §7](docs/AUDIT.md) — verify the
+real Forgepad pool and its declared allocation in dry-run, observe a graduation end-to-end, and run
+an authorized small-value payout test — then follow the go-live sequence in
+[Deployment](docs/DEPLOYMENT.md). Live mainnet payouts require `PAYOUT_MODE=live` **and**
+`ALLOW_MAINNET_PAYOUTS=true`; fee collection stays `manual` until the claim signer is verified.
+
+> The dashboard screenshots in `docs/screenshots/` were captured before the copy change and still
+> show an older percentage headline; the live UI no longer advertises a fixed percentage.
 
 ## Layout
 

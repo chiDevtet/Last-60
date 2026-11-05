@@ -39,6 +39,8 @@ export class FakeChain implements ChainRpc {
   private pendingDrops = new Set<string>();
   sendFaults: SendFault[] = [];
   rpcFailures = 0; // next N calls of any method throw a transient error
+  /** Simulates a lagging RPC backend: status answers come from a node this many slots behind. */
+  statusContextLag = 0;
   sent: { signature: string; at: number }[] = [];
   transfers: { signature: string; from: string; to: string; lamports: bigint; slot: number }[] = [];
 
@@ -148,6 +150,13 @@ export class FakeChain implements ChainRpc {
     this.maybeFail("getBalance");
     return this.balances.get(address) ?? 0n;
   }
+  async getTokenLargestAccounts(mint: string) {
+    const value: { address: string; amount: bigint }[] = [];
+    for (const [address, acc] of this.accounts) {
+      if (acc.data.length >= 72 && new PublicKey(acc.data.subarray(0, 32)).toBase58() === mint) value.push({ address, amount: acc.data.readBigUInt64LE(64) });
+    }
+    return { slot: this.slot, value: value.sort((a, b) => (b.amount > a.amount ? 1 : -1)) };
+  }
   async getTokenAccountBalance(address: string) {
     const v = this.tokenBalances.get(address);
     return v === undefined ? null : { slot: this.slot, amount: v };
@@ -218,6 +227,12 @@ export class FakeChain implements ChainRpc {
   }
 
   async getSignatureStatusesWithContext(signatures: string[]): Promise<{ contextSlot: number; value: (SignatureStatus | null)[] }> {
+    if (this.statusContextLag > 0) {
+      // A lagging node has not processed recent slots: transactions above its context are unknown.
+      const ctx = this.slot - this.statusContextLag;
+      const v = await this.getSignatureStatuses(signatures);
+      return { contextSlot: ctx, value: v.map((x) => (x && x.slot > ctx ? null : x)) };
+    }
     return { contextSlot: this.slot, value: await this.getSignatureStatuses(signatures) };
   }
 

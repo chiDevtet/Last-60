@@ -28,7 +28,9 @@ const auth = new AdminAuth(db, { appName: cfg.public.appName, adminWallets: cfg.
 const rpc = new RpcClient({ urls: cfg.solana.rpcUrls, timeoutMs: cfg.solana.timeoutMs, maxRps: 5, logger: log });
 const app = createApp({ db, cfg, settings, data, hub, auth, rpc });
 
-const server = Bun.serve({ hostname: cfg.api.host, port: cfg.api.port, fetch: app.fetch, idleTimeout: 0 });
+// Finite idle timeout server-wide (dead clients are reaped); SSE responses send a heartbeat every
+// 15 s and raise their own per-request timeout (see /api/v1/stream).
+const server = Bun.serve({ hostname: cfg.api.host, port: cfg.api.port, fetch: (req, srv) => app.fetch(req, srv), idleTimeout: 30 });
 log.info({ url: `http://${cfg.api.host}:${cfg.api.port}`, admin: auth.enabled }, "API listening");
 
 const shutdown = async () => {

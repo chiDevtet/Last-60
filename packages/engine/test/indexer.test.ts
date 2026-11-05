@@ -93,8 +93,11 @@ describe("indexer", () => {
     await idx.init();
     await idx.pollOnce();
     r.chain.forkOut(forked);
-    r.chain.advance(40);
+    r.chain.advance(200); // the fork's slot is now well below the finalized slot
+    // First proof of absence only marks a drop candidate (a single null status proves nothing).
     await idx.finalityPass(Date.now() + 60_000);
+    expect(((await r.db.Swap.findOne({ trader: lost }).lean()) as any).status).toBe("active");
+    await idx.finalityPass(Date.now() + 120_000);
     const rows: any[] = await r.db.Swap.find({}).lean();
     expect(rows.find((x) => x.trader === keep).commitment).toBe("finalized");
     expect(rows.find((x) => x.trader === lost).status).toBe("dropped");

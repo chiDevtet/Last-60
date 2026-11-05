@@ -24,6 +24,8 @@ import { AnchorEventDecoder, enumVariant, instructionDiscriminator, toAddr, toBi
 import type { NormalizedTx } from "../../chain/tx";
 import type { ChainRpc } from "../../chain/rpc";
 import { readMint } from "../mint";
+import type { ExpectedAllocation } from "../../config/env";
+import { basisPayable, EXCLUSION, makeBasis, type AllocationBasis, type AllocationVerification } from "../../accounting/attribution";
 import {
   ProviderValidationError,
   resolveTrader,
@@ -78,6 +80,32 @@ export interface DbcConfigState {
   collectFeeMode: number; // 0 = QuoteToken, 1 = OutputToken
   creatorTradingFeePercentage: number;
   migrationOption: number;
+  /** LP split applied at graduation (percent of distributable liquidity). Absent on hand-built test configs. */
+  lp?: {
+    creatorLiquidity: number;
+    creatorPermanentLocked: number;
+    creatorVesting: number;
+    partnerLiquidity: number;
+    partnerPermanentLocked: number;
+    partnerVesting: number;
+  };
+}
+
+/** Creator's total share of migrated LP (liquid + permanently locked + vesting), in percent. */
+export function dbcCreatorLpPercentage(cfg: DbcConfigState): number | null {
+  if (!cfg.lp) return null;
+  return cfg.lp.creatorLiquidity + cfg.lp.creatorPermanentLocked + cfg.lp.creatorVesting;
+}
+
+/**
+ * Compare an on-chain DBC parameter with the operator's declaration. The on-chain value is always
+ * what is accounted; a mismatch only makes the affected fees ineligible and flags the pool.
+ */
+export function verifyDeclared(label: string, onChain: number | null, declared: number | null | undefined): { verification: AllocationVerification; problems: string[] } {
+  if (declared === null || declared === undefined) return { verification: "not_declared", problems: [] };
+  if (onChain === null) return { verification: "unverifiable", problems: [`${label} could not be read on-chain (declared ${declared})`] };
+  if (onChain !== declared) return { verification: "mismatch", problems: [`${label} is ${onChain} on-chain but ${declared} was declared`] };
+  return { verification: "verified", problems: [] };
 }
 
 /**
@@ -94,6 +122,11 @@ export function dbcConfigWarnings(role: FeeBeneficiaryRole, cfg: DbcConfigState)
   return w;
 }
 
+function vestingPct(v: any): number {
+  if (!v || Number(f(v, "is_initialized")) !== 1) return 0;
+  return Number(f(v, "vesting_percentage"));
+}
+
 export class MeteoraDBCProvider implements LaunchProvider {
   readonly id = "meteora_dbc" as const;
   readonly programId = DBC_PROGRAM_ID;
@@ -104,7 +137,7 @@ export class MeteoraDBCProvider implements LaunchProvider {
 
   constructor(
     private readonly rpc: ChainRpc | null,
-    private readonly opts: { poolAddress: string; tokenMint: string; role: FeeBeneficiaryRole; payoutMint?: string },
+    private readonly opts: { poolAddress: string; tokenMint: string; role: FeeBeneficiaryRole; payoutMint?: string; expected?: ExpectedAllocation },
   ) {
     if (opts.role === "platform") throw new ProviderValidationError('Meteora DBC has no "platform" fee role (use creator or partner)');
   }
@@ -141,6 +174,14 @@ export class MeteoraDBCProvider implements LaunchProvider {
       collectFeeMode: Number(f(c, "collect_fee_mode")),
       creatorTradingFeePercentage: Number(f(c, "creator_trading_fee_percentage")),
       migrationOption: Number(f(c, "migration_option")),
+      lp: {
+        creatorLiquidity: Number(f(c, "creator_liquidity_percentage")),
+        creatorPermanentLocked: Number(f(c, "creator_permanent_locked_liquidity_percentage")),
+        creatorVesting: vestingPct(f(c, "creator_liquidity_vesting_info")),
+        partnerLiquidity: Number(f(c, "partner_liquidity_percentage")),
+        partnerPermanentLocked: Number(f(c, "partner_permanent_locked_liquidity_percentage")),
+        partnerVesting: vestingPct(f(c, "partner_liquidity_vesting_info")),
+      },
     };
   }
 
@@ -148,6 +189,26 @@ export class MeteoraDBCProvider implements LaunchProvider {
   hydrate(pool: DbcPoolState, cfg: DbcConfigState, mints: { baseDecimals: number; quoteDecimals: number; baseTokenProgram: string; quoteTokenProgram: string }, slot = 0): PoolInfo {
     this.cfg = cfg;
     const status: PoolStatus = pool.isMigrated ? "migrated" : pool.migrationProgress > 0 ? "migrating" : "bonding";
+    const beneficiary = this.opts.role === "creator" ? pool.creator : cfg.feeClaimer;
+    // The creator's declared bonding-curve share is checked only for the creator role; the partner's
+    // share is the on-chain complement and has no separate declaration.
+    const check = this.opts.role === "creator" ? verifyDeclared("creator_trading_fee_percentage", cfg.creatorTradingFeePercentage, this.opts.expected?.dbcCreatorTradingFeePercentage) : { verification: "not_declared" as const, problems: [] };
+    const allocation: AllocationBasis = makeBasis({
+      provider: this.id,
+      pool: this.opts.poolAddress,
+      phase: "bonding_curve",
+      role: this.opts.role,
+      beneficiary,
+      params: { creatorTradingFeePercentage: cfg.creatorTradingFeePercentage, collectFeeMode: cfg.collectFeeMode, config: pool.config },
+      source: `PoolConfig ${pool.config} (creator_trading_fee_percentage); VirtualPool ${this.opts.poolAddress} (creator)`,
+      verification: check.verification,
+      problems: check.problems,
+    });
+    const lpPct = dbcCreatorLpPercentage(cfg);
+    const lpCheck = this.opts.role === "creator" ? verifyDeclared("creator LP percentage", lpPct, this.opts.expected?.dbcCreatorLpPercentage) : { verification: "not_declared" as const, problems: [] };
+    const warnings = [...dbcConfigWarnings(this.opts.role, cfg), ...check.problems.map((p) => `ALLOCATION MISMATCH: ${p}; bonding-curve fees are recorded but NOT eligible for payout`), ...lpCheck.problems.map((p) => `ALLOCATION MISMATCH: ${p}; migrated LP fees will NOT be eligible for payout`)];
+    if (this.opts.role === "creator" && check.verification === "not_declared") warnings.push("creator bonding-curve allocation not declared (EXPECTED_DBC_CREATOR_TRADING_FEE_PERCENTAGE); the on-chain value is used as read");
+    this.lpCheck = lpCheck;
     this.cached = {
       provider: this.id,
       programId: this.programId,
@@ -157,20 +218,32 @@ export class MeteoraDBCProvider implements LaunchProvider {
       ...mints,
       creator: pool.creator,
       feeBeneficiaryRole: this.opts.role,
-      beneficiary: this.opts.role === "creator" ? pool.creator : cfg.feeClaimer,
+      beneficiary,
       status,
       feeParams: {
         creatorTradingFeePercentage: cfg.creatorTradingFeePercentage,
         collectFeeMode: cfg.collectFeeMode === 0 ? "QuoteToken" : "OutputToken",
         migrationOption: cfg.migrationOption,
         transferHookPool: pool.transferHook,
+        ...(lpPct !== null ? { creatorLpPercentage: lpPct, partnerLpPercentage: cfg.lp!.partnerLiquidity + cfg.lp!.partnerPermanentLocked + cfg.lp!.partnerVesting } : {}),
+        allocationVerification: allocation.verification,
+        migratedLpAllocationVerification: lpCheck.verification,
       },
       accounts: { config: pool.config, baseVault: pool.baseVault, quoteVault: pool.quoteVault, poolAuthority: DBC_POOL_AUTHORITY.toBase58(), feeClaimer: cfg.feeClaimer },
       watchAddresses: [this.opts.poolAddress],
       slot,
-      warnings: dbcConfigWarnings(this.opts.role, cfg),
+      warnings,
+      allocation,
     };
     return this.cached;
+  }
+
+  /** Result of checking the declared creator LP percentage (applies to migrated LP fees). */
+  lpCheck: { verification: AllocationVerification; problems: string[] } = { verification: "not_declared", problems: [] };
+
+  /** Decoded config of the loaded pool (for migration verification). */
+  configState(): DbcConfigState | null {
+    return this.cfg;
   }
 
   async load(): Promise<PoolInfo> {
@@ -235,7 +308,7 @@ export class MeteoraDBCProvider implements LaunchProvider {
         }
         if (toAddr(f(ev.data, "pool")) !== info.poolAddress) continue;
         const swap = ev3 ? this.fromSwap3(tx, ev3.data, parent.accounts[9]) : this.fromSwap2(tx, ev2!.data, parent.accounts[9]);
-        out.swaps.push({ ...swap, eventIndex: ev.ordinal });
+        out.swaps.push({ ...this.attribute(swap, ev3 ? "EvtSwap3" : "EvtSwap2", parent.ordinal), eventIndex: ev.ordinal });
         continue;
       }
       const isCreatorClaim = CLAIM_CREATOR_IX.has(disc);
@@ -256,6 +329,22 @@ export class MeteoraDBCProvider implements LaunchProvider {
       }
     }
     return out;
+  }
+
+  /** Attach provenance: gross vs beneficiary vs excluded, the basis, and payout eligibility. */
+  private attribute(s: Omit<NormalizedSwap, "eventIndex">, event: string, ixOrdinal: number): Omit<NormalizedSwap, "eventIndex"> {
+    const basis = this.info().allocation!;
+    const payable = basisPayable(basis);
+    return {
+      ...s,
+      feePhase: "bonding_curve",
+      excludedFee: s.totalFee - s.eligibleFee,
+      excludedReason: payable ? EXCLUSION.notBeneficiaryShare : `${EXCLUSION.allocationMismatch}: ${basis.problems.join("; ")}`,
+      feeStatus: payable ? "observed" : "unresolved",
+      payoutEligible: payable,
+      basisId: basis.id,
+      evidence: { event, instruction: ixOrdinal, formula: "floor(trading_fee * creator_trading_fee_percentage / 100)", creatorTradingFeePercentage: this.cfg?.creatorTradingFeePercentage ?? null },
+    };
   }
 
   private fromSwap3(tx: NormalizedTx, d: any, payer: string | undefined): Omit<NormalizedSwap, "eventIndex"> {

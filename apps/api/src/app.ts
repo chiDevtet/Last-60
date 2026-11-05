@@ -33,6 +33,7 @@ export interface ApiDeps {
   auth: AdminAuth;
   rpc?: ChainRpc | null;
   now?: () => number;
+  sseLimits?: { perIp: number; total: number; maxLifetimeMs: number };
 }
 
 type Env = { Variables: { admin: string } };
@@ -82,6 +83,56 @@ export function intParam(v: string | undefined, def: number, max: number): numbe
   return n >= 1 ? Math.min(n, max) : def;
 }
 
+function safeHost(u: string): string | null {
+  try {
+    return new URL(u).host;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The site admin sign-in messages are bound to. Production: PUBLIC_SITE_URL only (enforced at
+ * config load; never a request header). Development/test without PUBLIC_SITE_URL: an explicit local
+ * default — the request Origin only when it is a loopback address or an allow-listed CORS origin,
+ * otherwise "localhost". The Host header is never used.
+ */
+export function signInSite(cfg: AppConfig, origin: string | undefined): { host: string; origin: string } | null {
+  if (cfg.api.publicSiteUrl) {
+    const u = new URL(cfg.api.publicSiteUrl);
+    return { host: u.host, origin: u.origin };
+  }
+  if (cfg.nodeEnv === "production") return null;
+  if (origin) {
+    try {
+      const u = new URL(origin);
+      if (["localhost", "127.0.0.1", "[::1]"].includes(u.hostname) || cfg.api.corsOrigins.includes(u.origin)) return { host: u.host, origin: u.origin };
+    } catch {
+      /* fall through */
+    }
+  }
+  return { host: "localhost", origin: "http://localhost" };
+}
+
+/**
+ * CORS policy. With CORS_ORIGINS set, only those origins are allowed. Empty: production allows NO
+ * cross-origin requests (and config load requires CORS_ORIGINS in production anyway); development
+ * and tests allow loopback origins only. Arbitrary origins are never reflected.
+ */
+export function corsOrigin(cfg: AppConfig, origin: string): string | null {
+  if (cfg.api.corsOrigins.length) return cfg.api.corsOrigins.includes(origin) ? origin : null;
+  if (cfg.nodeEnv === "production") return null;
+  try {
+    const u = new URL(origin);
+    return ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname) ? origin : null;
+  } catch {
+    return null;
+  }
+}
+
+/** SSE connection limits: per client address and in total, plus a maximum connection lifetime. */
+export const SSE_LIMITS = { perIp: 4, total: 5_000, maxLifetimeMs: 30 * 60_000 };
+
 export function createApp(d: ApiDeps) {
   const app = new Hono<Env>();
   const now = d.now ?? (() => Date.now());
@@ -99,7 +150,7 @@ export function createApp(d: ApiDeps) {
   app.use(
     "/api/*",
     cors({
-      origin: (origin) => (!d.cfg.api.corsOrigins.length ? origin : d.cfg.api.corsOrigins.includes(origin) ? origin : null),
+      origin: (origin) => corsOrigin(d.cfg, origin),
       allowHeaders: ["Content-Type", "Authorization"],
       allowMethods: ["GET", "POST", "PUT", "OPTIONS"],
       maxAge: 600,
@@ -149,36 +200,55 @@ export function createApp(d: ApiDeps) {
     return c.json(await d.data.terminal({ before: before ? Number(before) : undefined, limit: intParam(c.req.query("limit"), 50, 200) }));
   });
   app.get("/api/v1/dashboard", async (c) => c.json(await d.data.dashboard()));
-  app.get("/api/v1/stream", (c) =>
-    streamSSE(c, async (stream) => {
-      const queue: { event: string; data: string }[] = [];
-      let wake: (() => void) | null = null;
-      const push = (event: string, data: unknown) => {
-        if (queue.length > 500) queue.shift(); // slow client: drop oldest
-        queue.push({ event, data: JSON.stringify(data) });
-        wake?.();
-      };
-      const snap = d.hub.latest() ?? (await d.data.dashboard());
-      push("snapshot", snap);
-      const unsubscribe = d.hub.subscribe(push);
-      stream.onAbort(() => {
-        unsubscribe();
-        wake?.();
-      });
-      while (!stream.aborted) {
-        while (queue.length) {
-          const m = queue.shift()!;
-          await stream.writeSSE({ event: m.event, data: m.data });
-        }
-        await new Promise<void>((r) => {
-          wake = r;
-          setTimeout(r, 20_000);
+  const sse = { total: 0, byIp: new Map<string, number>() };
+  app.get("/api/v1/stream", (c) => {
+    const ip = ipOf(c);
+    const limits = d.sseLimits ?? SSE_LIMITS;
+    if (sse.total >= limits.total || (sse.byIp.get(ip) ?? 0) >= limits.perIp) return c.json({ error: "too many live connections" }, 429);
+    sse.total++;
+    sse.byIp.set(ip, (sse.byIp.get(ip) ?? 0) + 1);
+    const release = () => {
+      sse.total--;
+      const n = (sse.byIp.get(ip) ?? 1) - 1;
+      if (n <= 0) sse.byIp.delete(ip);
+      else sse.byIp.set(ip, n);
+    };
+    // Bun: this connection is long-lived but never idle (heartbeats every 15 s); allow 60 s of silence.
+    (c.env as any)?.timeout?.(c.req.raw, 60);
+    const openedAt = Date.now();
+    return streamSSE(c, async (stream) => {
+      try {
+        const queue: { event: string; data: string }[] = [];
+        let wake: (() => void) | null = null;
+        const push = (event: string, data: unknown) => {
+          if (queue.length > 500) queue.shift(); // slow client: drop oldest
+          queue.push({ event, data: JSON.stringify(data) });
+          wake?.();
+        };
+        const snap = d.hub.latest() ?? (await d.data.dashboard());
+        push("snapshot", snap);
+        const unsubscribe = d.hub.subscribe(push);
+        stream.onAbort(() => {
+          unsubscribe();
+          wake?.();
         });
-        wake = null;
+        while (!stream.aborted && Date.now() - openedAt < limits.maxLifetimeMs) {
+          while (queue.length) {
+            const m = queue.shift()!;
+            await stream.writeSSE({ event: m.event, data: m.data });
+          }
+          await new Promise<void>((r) => {
+            wake = r;
+            setTimeout(r, Math.min(20_000, limits.maxLifetimeMs));
+          });
+          wake = null;
+        }
+        unsubscribe();
+      } finally {
+        release(); // EventSource reconnects automatically after a lifetime close
       }
-      unsubscribe();
-    }),
-  );
+    });
+  });
 
   // ── admin ───────────────────────────────────────────────────────────────────
   const admin = new Hono<Env>();
@@ -188,12 +258,18 @@ export function createApp(d: ApiDeps) {
   });
   admin.post("/auth/nonce", async (c) => {
     const body = z.object({ wallet: z.string() }).parse(await c.req.json());
-    const host = d.cfg.api.publicSiteUrl ? new URL(d.cfg.api.publicSiteUrl).host : (c.req.header("origin") ? new URL(c.req.header("origin")!).host : c.req.header("host") ?? "localhost");
-    return c.json(await d.auth.issueNonce(body.wallet, host));
+    const site = signInSite(d.cfg, c.req.header("origin"));
+    if (!site) return c.json({ error: "admin sign-in is unavailable: PUBLIC_SITE_URL is not configured" }, 503);
+    return c.json(await d.auth.issueNonce(body.wallet, site.host, { uri: site.origin, chainId: d.cfg.solana.cluster === "mainnet-beta" ? "mainnet" : d.cfg.solana.cluster }));
   });
   admin.post("/auth/verify", async (c) => {
-    const body = z.object({ wallet: z.string(), nonce: z.string(), signature: z.string() }).parse(await c.req.json());
-    return c.json(await d.auth.verify(body.wallet, body.nonce, body.signature));
+    const body = z.object({ wallet: z.string(), nonce: z.string(), signature: z.string(), signedMessage: z.string().max(2000).optional() }).parse(await c.req.json());
+    // A browser always sends Origin on a cross-origin POST: when present it must be the site the
+    // challenge was bound to (a phishing page relaying our challenge cannot complete the login).
+    const origin = c.req.header("origin");
+    const site = signInSite(d.cfg, origin);
+    if (origin && site && safeHost(origin) !== site.host) return c.json({ error: "origin does not match the sign-in domain" }, 403);
+    return c.json(await d.auth.verify(body.wallet, body.nonce, body.signature, body.signedMessage));
   });
   admin.use("*", async (c, next) => {
     if (c.req.path.endsWith("/auth/nonce") || c.req.path.endsWith("/auth/verify")) return next();

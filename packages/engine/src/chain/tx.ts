@@ -140,3 +140,93 @@ export function tokenAccountDelta(tx: NormalizedTx, account: string): bigint {
   const pre = tx.preTokenBalances.find((b) => b.account === account)?.amount ?? 0n;
   return post - pre;
 }
+
+export const SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+export const SPL_TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+/**
+ * Instructions executed *directly* by `parent` (one frame down the stack, inside the same top-level
+ * instruction). Requires stack heights (every RPC that returns innerInstructions since v1.14); if a
+ * height is unknown the instruction is attributed conservatively to no parent.
+ */
+export function childInstructions(tx: NormalizedTx, parent: FlatInstruction): FlatInstruction[] {
+  const out: FlatInstruction[] = [];
+  for (const ix of tx.instructions) {
+    if (ix.ordinal <= parent.ordinal || ix.topIndex !== parent.topIndex) continue;
+    if (!ix.stackHeightKnown || !parent.stackHeightKnown) break;
+    if (ix.stackHeight <= parent.stackHeight) break; // the parent frame has returned
+    if (ix.stackHeight === parent.stackHeight + 1) out.push(ix);
+  }
+  return out;
+}
+
+export interface TokenTransfer {
+  ordinal: number;
+  program: string;
+  source: string;
+  destination: string;
+  authority: string;
+  amount: bigint;
+  mint: string | null;
+}
+
+/** Decode an SPL Token / Token-2022 `Transfer` (3) or `TransferChecked` (12) instruction, else null. */
+export function decodeTokenTransfer(ix: FlatInstruction): TokenTransfer | null {
+  if (ix.programId !== SPL_TOKEN_PROGRAM_ID && ix.programId !== SPL_TOKEN_2022_PROGRAM_ID) return null;
+  const tag = ix.data[0];
+  if (tag === 3 && ix.data.length >= 9 && ix.accounts.length >= 3) {
+    return { ordinal: ix.ordinal, program: ix.programId, source: ix.accounts[0]!, destination: ix.accounts[1]!, authority: ix.accounts[2]!, amount: ix.data.readBigUInt64LE(1), mint: null };
+  }
+  if (tag === 12 && ix.data.length >= 10 && ix.accounts.length >= 4) {
+    return { ordinal: ix.ordinal, program: ix.programId, source: ix.accounts[0]!, destination: ix.accounts[2]!, authority: ix.accounts[3]!, amount: ix.data.readBigUInt64LE(1), mint: ix.accounts[1]! };
+  }
+  return null;
+}
+
+/**
+ * Token transfers performed by `parent` itself or by any program it invoked (its whole CPI subtree).
+ * This is the instruction-specific view used instead of whole-transaction balance deltas, so that a
+ * claim and a trade in the same transaction are never conflated.
+ */
+export function subtreeTransfers(tx: NormalizedTx, parent: FlatInstruction): TokenTransfer[] {
+  const out: TokenTransfer[] = [];
+  for (const ix of tx.instructions) {
+    if (ix.ordinal <= parent.ordinal || ix.topIndex !== parent.topIndex) continue;
+    if (!ix.stackHeightKnown || !parent.stackHeightKnown) break;
+    if (ix.stackHeight <= parent.stackHeight) break;
+    const t = decodeTokenTransfer(ix);
+    if (t) out.push(t);
+  }
+  return out;
+}
+
+/** Owner and mint of a token account as reported in the transaction's token balance metadata. */
+export function tokenAccountInfo(tx: NormalizedTx, account: string): { owner: string | null; mint: string } | null {
+  const b = tx.postTokenBalances.find((x) => x.account === account) ?? tx.preTokenBalances.find((x) => x.account === account);
+  return b ? { owner: b.owner, mint: b.mint } : null;
+}
+
+/**
+ * Anchor `emit!` (log-based) events: "Program data: <base64>" lines emitted while `programId` is the
+ * innermost executing program. Returned in log order. `truncated` is true when the runtime cut the
+ * log, in which case callers must not treat a missing event as absence.
+ */
+export function programDataLogs(tx: NormalizedTx, programId: string): { data: Buffer[]; truncated: boolean } {
+  const stack: string[] = [];
+  const data: Buffer[] = [];
+  let truncated = false;
+  for (const line of tx.logMessages) {
+    if (line === "Log truncated") truncated = true;
+    const inv = /^Program (\S+) invoke \[\d+\]$/.exec(line);
+    if (inv) {
+      stack.push(inv[1]!);
+      continue;
+    }
+    if (/^Program (\S+) (success|failed)/.test(line)) {
+      stack.pop();
+      continue;
+    }
+    if (line.startsWith("Program data: ") && stack[stack.length - 1] === programId) data.push(Buffer.from(line.slice(14), "base64"));
+  }
+  return { data, truncated };
+}

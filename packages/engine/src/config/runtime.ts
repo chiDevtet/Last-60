@@ -8,6 +8,7 @@ import { WSOL_MINT } from "@last60/shared";
 import type { AppConfig } from "./env";
 import { isValidPubkey } from "./env";
 import type { Models } from "../db/models";
+import { roleChangeBlockReason } from "../accounting/attribution";
 
 const pubkey = z.string().trim().refine(isValidPubkey, "must be a Solana public key");
 const httpUrl = z.string().trim().refine((v) => /^https?:\/\//.test(v), "must be an http(s) URL");
@@ -169,6 +170,11 @@ export class SettingsStore {
     if (!parsed.success) throw new SettingsValidationError(parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`));
     const effective = resolveSettings(this.cfg, parsed.data, current.version + 1);
     const problems = validateEffective(this.cfg, effective);
+    const before = resolveSettings(this.cfg, RuntimeOverridesSchema.safeParse(current.overrides).data ?? {}, current.version);
+    if (effective.feeBeneficiaryRole !== before.feeBeneficiaryRole) {
+      const blocked = await roleChangeBlockReason(this.db, effective.poolAddress, effective.feeBeneficiaryRole);
+      if (blocked) problems.push(`feeBeneficiaryRole: ${blocked}`);
+    }
     if (problems.length) throw new SettingsValidationError(problems);
     const changes = Object.keys({ ...current.overrides, ...parsed.data })
       .filter((k) => JSON.stringify((current.overrides as any)[k]) !== JSON.stringify((parsed.data as any)[k]))

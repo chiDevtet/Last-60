@@ -195,14 +195,20 @@ export class RpcClient {
     return null;
   }
 
-  async getAccountInfo(address: string, commitment: Commitment = "confirmed"): Promise<{ slot: number; value: AccountInfoRaw | null }> {
-    const r = await this.call<any>("getAccountInfo", [address, { encoding: "base64", commitment }]);
+  async getAccountInfo(address: string, commitment: Commitment = "confirmed", opts: { minContextSlot?: number } = {}): Promise<{ slot: number; value: AccountInfoRaw | null }> {
+    const r = await this.call<any>("getAccountInfo", [address, { encoding: "base64", commitment, ...(opts.minContextSlot !== undefined ? { minContextSlot: opts.minContextSlot } : {}) }]);
     return { slot: r.context.slot, value: r.value ? decodeAccount(r.value) : null };
   }
 
-  async getMultipleAccounts(addresses: string[], commitment: Commitment = "confirmed"): Promise<{ slot: number; value: (AccountInfoRaw | null)[] }> {
-    const r = await this.call<any>("getMultipleAccounts", [addresses, { encoding: "base64", commitment }]);
+  async getMultipleAccounts(addresses: string[], commitment: Commitment = "confirmed", opts: { minContextSlot?: number } = {}): Promise<{ slot: number; value: (AccountInfoRaw | null)[] }> {
+    const r = await this.call<any>("getMultipleAccounts", [addresses, { encoding: "base64", commitment, ...(opts.minContextSlot !== undefined ? { minContextSlot: opts.minContextSlot } : {}) }]);
     return { slot: r.context.slot, value: r.value.map((v: any) => (v ? decodeAccount(v) : null)) };
+  }
+
+  /** Largest token accounts of a mint (used to locate the current holder of an NFT). */
+  async getTokenLargestAccounts(mint: string, commitment: Commitment = "confirmed"): Promise<{ slot: number; value: { address: string; amount: bigint }[] }> {
+    const r = await this.call<any>("getTokenLargestAccounts", [mint, { commitment }]);
+    return { slot: r.context.slot, value: (r.value ?? []).map((v: any) => ({ address: v.address, amount: BigInt(v.amount) })) };
   }
 
   async getBalance(address: string, commitment: Commitment = "confirmed"): Promise<bigint> {
@@ -289,6 +295,7 @@ export type ChainRpc = Pick<
   | "getSignatureStatusesWithContext"
   | "getEpochInfo"
   | "getBlockSignatures"
+  | "getTokenLargestAccounts"
 >;
 
 function decodeAccount(v: any): AccountInfoRaw {

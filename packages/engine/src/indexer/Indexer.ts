@@ -15,8 +15,8 @@ import { RpcClient } from "../chain/rpc";
 import { LogsSubscriber } from "../chain/ws";
 import type { Models } from "../db/models";
 import { big } from "../db/decimal";
-import { createProvider, findMigration, migrationVerified, verifyMigration, type LaunchProvider, type PoolInfo } from "../providers";
-import { jsonSafe } from "../util/json";
+import { attachStoredMigration, createProvider, resolveAndAttachMigration, type LaunchProvider, type PoolInfo } from "../providers";
+import { roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
 import { rootLogger, type Logger } from "../util/logger";
@@ -84,8 +84,18 @@ export class Indexer {
     this.ws?.stop();
     this.ws = null;
     this.rpc = this.deps.rpc ?? new RpcClient({ urls: s.rpcUrls, timeoutMs: this.deps.cfg.solana.timeoutMs, maxRps: this.deps.cfg.solana.maxRps, maxTxVersion: this.deps.cfg.solana.maxTxVersion, logger: this.log });
-    this.provider = createProvider({ id: s.launchProvider, poolAddress: s.poolAddress, tokenMint: s.tokenMint, role: s.feeBeneficiaryRole, payoutMint: s.payoutAssetMint }, this.rpc);
-    this.pool = await this.provider.load();
+    const provider = createProvider({ id: s.launchProvider, poolAddress: s.poolAddress, tokenMint: s.tokenMint, role: s.feeBeneficiaryRole, payoutMint: s.payoutAssetMint, expected: this.deps.cfg.provider.expected }, this.rpc);
+    const loaded = await provider.load();
+    // U1: never index a pool under a different beneficiary role than its existing records (an
+    // environment change bypasses the settings-store check, so it is enforced here too).
+    const blocked = await roleChangeBlockReason(this.deps.db, loaded.poolAddress, loaded.feeBeneficiaryRole);
+    if (blocked) {
+      await this.terminal.error(`Indexer refused to attach: fee beneficiary role conflicts with existing records for this pool.`, `role-conflict:${loaded.poolAddress}:${loaded.feeBeneficiaryRole}`).catch(() => undefined);
+      throw new Error(blocked);
+    }
+    this.provider = provider;
+    await attachStoredMigration(this.deps.db, this.provider);
+    this.pool = this.provider.info();
     await this.savePool(this.pool);
     this.log.info({ provider: this.pool.provider, pool: this.pool.poolAddress, mint: this.pool.tokenMint, beneficiary: this.pool.beneficiary, status: this.pool.status, feeParams: this.pool.feeParams }, "provider loaded");
     await this.terminal.system(`Indexer attached to ${this.pool.provider} pool ${this.pool.poolAddress.slice(0, 4)}…${this.pool.poolAddress.slice(-4)}.`, `attach:${this.pool.provider}:${this.pool.poolAddress}:${s.version}`);
@@ -127,6 +137,8 @@ export class Indexer {
           feeParams: p.feeParams,
           accounts: p.accounts,
           warnings: p.warnings ?? [],
+          allocation: p.allocation ?? null,
+          accountingPools: p.accountingPools ?? [p.poolAddress],
           refreshedAt: new Date(),
         },
         $setOnInsert: { discoveredAt: new Date() },
@@ -137,7 +149,7 @@ export class Indexer {
 
   private async migrationWarning(p: PoolInfo) {
     await this.terminal.warn(
-      `Pool status is "${p.status}": trading is moving to the post-graduation AMM. Fees from the migrated pool are not attributed until a post-migration adapter is configured.`,
+      `Pool status is "${p.status}": trading is moving to the post-graduation pool. Destination activity is accounted only after the migration is verified on-chain.`,
       `migration:${p.poolAddress}:${p.status}`,
     );
   }
@@ -146,10 +158,26 @@ export class Indexer {
   async pollOnce(signal?: AbortSignal): Promise<number> {
     if (!this.provider || !this.pool || !this.rpc || !this.settings) return 0;
     let total = 0;
+    this.backlog = false;
     for (const address of this.pool.watchAddresses) {
       const key = cursorId(this.pool.provider, this.pool.poolAddress, address);
       const existing = await readCursor(this.deps.db, key);
       const isBackfill = !existing;
+      const fromSlot = this.pool.watchFromSlot?.[address];
+      if (isBackfill && fromSlot !== undefined) {
+        // A verified destination pool: index its whole history from the migration slot (it cannot
+        // have activity before it was created), independent of INDEXER_BACKFILL.
+        const stats = await syncAddress(this.ctx(), address, { cursorKey: key, source: "backfill", cap: this.deps.cfg.indexer.backfillMaxSignatures, concurrency: this.deps.cfg.indexer.fetchConcurrency, bounds: { afterSlot: fromSlot - 1 }, maxPerPass: 400, signal });
+        this.backlog = this.backlog || stats.more;
+        total += stats.newSwaps;
+        this.metrics.swapsIngested += stats.newSwaps;
+        if (!(await readCursor(this.deps.db, key))) {
+          // No destination activity yet: anchor at the migration transaction itself.
+          const migSig = this.pool.destination?.migrationSignature ?? null;
+          await this.deps.db.WorkerState.updateOne({ _id: key }, { $set: { cursor: { lastSignature: migSig, lastSlot: fromSlot, backfillComplete: true } } }, { upsert: true });
+        }
+        continue;
+      }
       if (isBackfill && this.deps.cfg.indexer.backfill === "none") {
         await this.startFromNow(address, key);
         continue;
@@ -162,7 +190,7 @@ export class Indexer {
         maxPerPass: 400,
         signal,
       });
-      this.backlog = stats.more;
+      this.backlog = this.backlog || stats.more;
       if (isBackfill && stats.fetched) {
         this.log.info({ address, ...stats }, "backfill complete");
         await this.terminal.system(`Backfill complete: ${stats.ingested} historical transactions indexed.`, `backfill:${key}`);
@@ -233,31 +261,56 @@ export class Indexer {
     if (this.recent.size > 5000) for (const [k, t] of this.recent) if (Date.now() - t > 600_000) this.recent.delete(k);
   }
 
-  /** Promote confirmed → finalized; mark transactions that disappeared (forked out) as dropped. */
+  /**
+   * Promote confirmed → finalized; mark transactions that provably disappeared (forked out) as dropped.
+   *
+   * A null status alone proves nothing: a lagging or freshly restarted RPC backend may not have
+   * processed the landing slot. A swap is dropped only when (a) the finalized slot (from one node,
+   * `getEpochInfo`) is past the swap's slot by a safety margin, (b) the status answers came from
+   * nodes whose context slot is at/after that finalized slot (`searchTransactionHistory` = true, so a
+   * finalized transaction would be found), and (c) this was observed on TWO separate passes at
+   * least `dropAfterSeconds` apart. Active rows are processed oldest first; dropped rows live in a
+   * separate, bounded re-check window so they can never block promotion of newer swaps.
+   */
   async finalityPass(now = Date.now()) {
     if (!this.rpc) return;
-    const candidates: any[] = await this.deps.db.Swap.find({ commitment: "confirmed", ingestedAt: { $lt: new Date(now - 5_000) } }, { signature: 1, status: 1, ingestedAt: 1 }).sort({ slot: 1 }).limit(256).lean();
-    const sigs = [...new Set(candidates.map((c) => c.signature as string))];
+    const rpc = this.rpc;
+    const candidates: any[] = await this.deps.db.Swap.find({ commitment: "confirmed", status: "active", ingestedAt: { $lt: new Date(now - 5_000) } }, { signature: 1, slot: 1, status: 1, ingestedAt: 1, dropCandidateAt: 1 }).sort({ slot: 1 }).limit(256).lean();
+    const dropped: any[] = await this.deps.db.Swap.find({ commitment: "confirmed", status: "dropped" }, { signature: 1, slot: 1, status: 1, ingestedAt: 1, dropCandidateAt: 1 }).sort({ slot: -1 }).limit(64).lean();
+    const all = [...candidates, ...dropped];
+    const sigs = [...new Set(all.map((c) => c.signature as string))];
+    if (!sigs.length) return;
+    const fin = await rpc.getEpochInfo("finalized");
     for (let i = 0; i < sigs.length; i += 128) {
       const chunk = sigs.slice(i, i + 128);
-      const statuses = await this.rpc.getSignatureStatuses(chunk, true);
+      const res = await rpc.getSignatureStatusesWithContext(chunk, true);
+      const authoritative = res.contextSlot >= fin.absoluteSlot;
       for (let j = 0; j < chunk.length; j++) {
-        const st = statuses[j];
+        const st = res.value[j];
         const sig = chunk[j]!;
-        if (st?.confirmationStatus === "finalized" && !st.err) {
-          await this.deps.db.Swap.updateMany({ signature: sig }, { $set: { commitment: "finalized", status: "active" } });
+        const row = all.find((c) => c.signature === sig)!;
+        if (st && st.confirmationStatus === "finalized" && !st.err) {
+          await this.deps.db.Swap.updateMany({ signature: sig }, { $set: { commitment: "finalized", status: "active", dropCandidateAt: null } });
           this.metrics.finalized++;
-        } else if (!st) {
-          const first = candidates.find((c) => c.signature === sig);
-          if (first && now - new Date(first.ingestedAt).getTime() > this.deps.cfg.indexer.dropAfterSeconds * 1000 && first.status !== "dropped") {
-            await this.deps.db.Swap.updateMany({ signature: sig }, { $set: { status: "dropped" } });
-            this.metrics.dropped++;
-            await this.terminal.warn(`Transaction ${sig.slice(0, 8)}… is no longer visible on-chain (fork); excluded from rewards.`, `dropped:${sig}`);
-          }
-        } else if (st && st.confirmationStatus !== "finalized") {
-          // Still confirmed-but-not-finalized; make sure it is active.
-          if (candidates.some((c) => c.signature === sig && c.status === "dropped")) await this.deps.db.Swap.updateMany({ signature: sig }, { $set: { status: "active" } });
+          continue;
         }
+        if (st) {
+          // Known to the cluster (confirmed, not yet finalized): active, not a drop candidate.
+          if (row.status === "dropped" || row.dropCandidateAt) await this.deps.db.Swap.updateMany({ signature: sig }, { $set: { status: "active", dropCandidateAt: null } });
+          continue;
+        }
+        if (row.status === "dropped") continue; // still unknown; stays excluded and re-checked later
+        const pastFinality = fin.absoluteSlot > (row.slot as number) + 150; // > 32 confirmations + margin
+        const oldEnough = now - new Date(row.ingestedAt).getTime() > this.deps.cfg.indexer.dropAfterSeconds * 1000;
+        if (!authoritative || !pastFinality || !oldEnough) continue; // not proven — re-check later
+        if (!row.dropCandidateAt) {
+          await this.deps.db.Swap.updateMany({ signature: sig, status: "active" }, { $set: { dropCandidateAt: new Date(now) } });
+          continue;
+        }
+        if (now - new Date(row.dropCandidateAt).getTime() < this.deps.cfg.indexer.dropAfterSeconds * 1000) continue;
+        await this.deps.db.Swap.updateMany({ signature: sig, status: "active" }, { $set: { status: "dropped" } });
+        this.metrics.dropped++;
+        await this.terminal.warn(`Transaction ${sig.slice(0, 8)}… is no longer visible on-chain (fork); excluded from rewards.`, `dropped:${sig}`);
       }
     }
   }
@@ -293,29 +346,47 @@ export class Indexer {
 
   private migrationRecorded = new Set<string>();
   /**
-   * On graduation, find the migration transaction, verify the destination pool on-chain and persist
-   * it on the pool document (admin status + operators). Fees from the destination are still NOT
-   * attributed: that requires the post-graduation adapter (docs/PROVIDERS.md).
+   * On graduation, find the migration transaction, verify it strictly, persist the outcome on the
+   * pool document and — only if verified and supported — attach the destination adapter so its
+   * swaps (buyers) and the creator's destination entitlement are indexed from the migration slot.
    */
   private async recordMigration(p: PoolInfo) {
-    if (p.status !== "migrated" || p.provider === "mock" || !this.rpc || this.migrationRecorded.has(p.poolAddress)) return;
+    if (p.status !== "migrated" || p.provider === "mock" || !this.rpc || !this.provider || this.migrationRecorded.has(p.poolAddress)) return;
     try {
-      const m = await findMigration(this.rpc, p.provider, p.poolAddress);
-      if (!m) {
+      const before = this.provider.info().destination?.pool ?? null;
+      const r = await resolveAndAttachMigration(this.deps.db, this.rpc, this.provider);
+      if (r.status === "not_found") {
         this.log.warn({ pool: p.poolAddress }, "pool is migrated but its migration transaction was not found in recent history");
         return;
       }
-      const v = await verifyMigration(this.rpc, m, { base: p.tokenMint, quote: p.quoteMint });
-      const verified = migrationVerified(v);
-      await this.deps.db.Pool.updateOne({ key: `${p.provider}:${p.poolAddress}` }, { $set: { migration: jsonSafe({ ...v, verified, resolvedAt: new Date() }) } });
       this.migrationRecorded.add(p.poolAddress);
-      await this.terminal.warn(
-        `Pool graduated (${m.kind.replace("_", " → ")}) to ${m.destinationPool.slice(0, 4)}…${m.destinationPool.slice(-4)}${verified ? " — destination verified on-chain" : " — destination NOT fully verified"}. Fees from the new pool are not attributed yet.`,
-        `migration-dest:${p.poolAddress}`,
-      );
+      const m = r.verified!;
+      const dest = `${m.destinationPool.slice(0, 4)}…${m.destinationPool.slice(-4)}`;
+      if (r.status === "verified") {
+        await this.terminal.warn(`Pool graduated (${m.kind.replace("_", " → ")}) to ${dest} — destination verified on-chain; post-migration activity is now tracked.`, `migration-dest:${p.poolAddress}`);
+      } else {
+        await this.terminal.warn(`Pool graduated (${m.kind.replace("_", " → ")}) to ${dest} — destination ${r.status === "unsupported" ? "type is not supported" : "NOT verified"} (${m.failed.join(", ") || m.notes.join("; ")}). Post-migration fees are not accounted.`, `migration-dest:${p.poolAddress}`);
+      }
+      this.pool = this.provider.info();
+      await this.savePool(this.pool);
+      if ((this.pool.destination?.pool ?? null) !== before) this.restartWebsocket();
     } catch (err) {
       this.log.warn({ pool: p.poolAddress, err: String(err) }, "migration resolution failed; will retry on next refresh");
     }
+  }
+
+  private restartWebsocket() {
+    if (!this.ws || !this.settings || !this.pool) return;
+    this.ws.stop();
+    this.ws = null;
+    const wsUrl = this.settings.wsUrl;
+    if (!wsUrl || this.deps.wsFactory === null) return;
+    const onLog = (sig: string) => {
+      this.metrics.wsNotifications++;
+      this.wsQueue.add(sig);
+    };
+    this.ws = this.deps.wsFactory ? this.deps.wsFactory(wsUrl, this.pool.watchAddresses, onLog) : new LogsSubscriber(wsUrl, this.pool.watchAddresses, (n) => !n.err && onLog(n.signature), this.log);
+    this.ws.start();
   }
 
   /**
