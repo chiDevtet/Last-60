@@ -106,8 +106,8 @@ function RoundBreakdown({ d, explorer, cluster }: { d: RoundDetailDTO; explorer:
   return (
     <div className="space-y-3">
       <dl className="grid grid-cols-2 gap-x-6 gap-y-1 pt-2 text-xs text-mist sm:grid-cols-4">
-        <div>Fees accrued <span className="block text-sm text-frost tabular">{sol(d.fees, 6)} SOL</span></div>
-        <div>Reward ({d.rewardBps / 100}%){BigInt(d.rolloverIn) > 0n ? " + rollover" : ""} <span className="block text-sm text-frost tabular">{sol(d.reward, 6)} SOL</span></div>
+        <div>Eligible creator fees <span className="block text-sm text-frost tabular">{sol(d.fees, 6)} SOL</span></div>
+        <div>Reward{BigInt(d.rolloverIn) > 0n ? " + rollover" : ""} <span className="block text-sm text-frost tabular">{sol(d.reward, 6)} SOL</span></div>
         <div>Retained <span className="block text-sm text-frost tabular">{sol(d.retained, 6)} SOL</span></div>
         <div>Snapshot slot <span className="block text-sm text-frost tabular">{d.snapshotSlot?.toLocaleString() ?? "—"}</span></div>
       </dl>

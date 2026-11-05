@@ -45,7 +45,7 @@ export function Dashboard({ initial, initialTerminal, tradeUrl }: { initial: Das
       {meta.poolStatus !== "bonding" && meta.poolStatus !== "unknown" && (
         <div className="border-b border-warn/20 bg-warn/10">
           <p className="mx-auto max-w-7xl px-4 py-2 text-center text-xs text-warn sm:px-6">
-            The launch pool has {meta.poolStatus === "migrated" ? "graduated" : "completed its curve"}. Fee attribution for the post-graduation pool requires its adapter to be enabled.
+            The launch pool has {meta.poolStatus === "migrated" ? "graduated" : "completed its curve"}. Post-graduation activity is tracked once the destination pool has been verified on-chain.
           </p>
         </div>
       )}
@@ -56,7 +56,7 @@ export function Dashboard({ initial, initialTerminal, tradeUrl }: { initial: Das
             <div className="mx-auto mb-10 max-w-2xl text-center">
               <h1 className="text-3xl font-semibold tracking-tight sm:text-5xl">The final minute pays.</h1>
               <p className="mx-auto mt-4 max-w-xl text-base text-mist sm:text-lg">
-                Every {round.durationSeconds / 60} minutes, {round.rewardBps / 100}% of the round&apos;s trading fees go to the last {round.buyerCount} unique buyers — paid on-chain at a moment inside the final 60 seconds.
+                Every {round.durationSeconds / 60} minutes, eligible creator fees are allocated to payouts for the last {round.buyerCount} unique buyers — paid on-chain at a moment inside the final 60 seconds.
               </p>
             </div>
             <Countdown round={round} pool={pool} now={now} latest={latest} />
@@ -86,7 +86,7 @@ export function Dashboard({ initial, initialTerminal, tradeUrl }: { initial: Das
 
         <section id="how" className="mx-auto mt-20 max-w-7xl px-4 sm:px-6">
           <SectionTitle eyebrow="Mechanics" title="How it works" />
-          <HowItWorks minBuy={round.minBuy} buyerCount={round.buyerCount} rewardBps={round.rewardBps} durationMin={round.durationSeconds / 60} />
+          <HowItWorks minBuy={round.minBuy} buyerCount={round.buyerCount} durationMin={round.durationSeconds / 60} />
           <div className="card mt-4 p-6">
             <Rules />
           </div>
