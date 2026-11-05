@@ -31,7 +31,11 @@
 6. A round's allocation, payouts and ledger entries commit in one MongoDB transaction; a round
    executes once (CAS on state + lease + fencing).
 7. Reconciliation halts new payouts on over-attribution.
-8. Default `PAYOUT_MODE=dry_run`; mainnet live requires a second explicit switch.
+8. Default `PAYOUT_MODE=dry_run`; mainnet live requires a second explicit switch, re-checked by the
+   signing process against its own environment before every signature (`liveSigningBlockReason`).
+9. Snapshot slots strictly increase; a lagging RPC slot is refused instead of re-opening a paid period.
+10. "Expired" requires the signature to be unknown to nodes at or past the finalized slot that proves
+    expiry (`getEpochInfo` + status context slot), so a lagging backend cannot trigger a re-sign.
 
 Tests: `test/rewards.test.ts` (fault-injected chain), `test/payouts-runtime.test.ts` (real Solana
 runtime via LiteSVM).

@@ -3,7 +3,7 @@
  * schedule encryption key. Keys are loaded once, verified against the configured public keys,
  * and never logged.
  */
-import { loadKeypair, RewardsWorker } from "@last60/engine";
+import { liveSigningBlockReason, loadKeypair, RewardsWorker } from "@last60/engine";
 import type { Keypair } from "@solana/web3.js";
 import { boot } from "./bootstrap";
 
@@ -23,9 +23,12 @@ if (cfg.secrets.feeClaimAuthorityPrivateKey || cfg.secrets.feeClaimAuthorityKeyp
 delete process.env.PAYOUT_WALLET_PRIVATE_KEY;
 delete process.env.FEE_CLAIM_AUTHORITY_PRIVATE_KEY;
 
-const mode = (await settings.get()).payoutMode;
+const effective = await settings.get();
+const mode = effective.payoutMode;
+const blocked = liveSigningBlockReason(cfg, effective);
 log.info({ payoutMode: mode, payer: payer?.publicKey.toBase58() ?? null, cluster: cfg.solana.cluster, feeCollection: cfg.feeCollection.mode }, "rewards worker starting");
-if (mode === "live" && cfg.solana.cluster === "mainnet-beta") log.warn("LIVE MAINNET PAYOUTS ENABLED — real funds will move");
+if (mode === "live" && blocked) log.warn({ reason: blocked }, "payout mode is live but this process will NOT sign: live payouts stay queued");
+else if (mode === "live" && cfg.solana.cluster === "mainnet-beta") log.warn("LIVE MAINNET PAYOUTS ENABLED — real funds will move");
 
 const worker = new RewardsWorker({ db, cfg, settings, payer, claimer, log });
 await worker.run(signal);

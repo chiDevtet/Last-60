@@ -13,7 +13,7 @@
  */
 import type { Keypair } from "@solana/web3.js";
 import type { AppConfig } from "../config/env";
-import type { SettingsStore } from "../config/runtime";
+import { liveSigningBlockReason, type SettingsStore } from "../config/runtime";
 import { RpcError, type ChainRpc } from "../chain/rpc";
 import { buildPayoutTransaction } from "../chain/payoutTx";
 import type { Models } from "../db/models";
@@ -94,8 +94,15 @@ export class PayoutExecutor {
   private async startAttempt(p: any, o: { paused: boolean; halted: string | null }): Promise<boolean> {
     if (p.mode === "dry_run") return this.simulate(p);
     if (o.paused || o.halted) return false;
-    if (!this.d.payer) throw new Error("live payout requested but no payout signing key is loaded");
     const settings = await this.d.settings.get();
+    // Re-check the live/mainnet switches against THIS process' environment right before signing.
+    const blocked = liveSigningBlockReason(this.d.cfg, settings);
+    if (blocked) {
+      await this.d.db.Payout.updateOne({ _id: p._id, state: "pending" }, { $set: { lastError: `not signed: ${blocked}`, nextAttemptAt: new Date(this.now() + 15_000) } });
+      await this.d.terminal.warn(`Live payouts are queued and not being signed: ${blocked}.`, `live-blocked:${Math.floor(this.now() / 600_000)}`, p.roundNumber);
+      return false;
+    }
+    if (!this.d.payer) throw new Error("live payout requested but no payout signing key is loaded");
     const payerPk = this.d.payer.publicKey.toBase58();
     if (settings.expectedPayoutPublicKey && settings.expectedPayoutPublicKey !== payerPk) {
       throw new Error(`payout key ${payerPk} does not match the configured payout public key ${settings.expectedPayoutPublicKey}; refusing to sign`);
@@ -184,7 +191,8 @@ export class PayoutExecutor {
   private async checkSubmitted(p: any): Promise<boolean> {
     const sig: string = p.current?.signature;
     if (!sig) throw new Error("submitted payout without a signature");
-    const [st] = await this.d.rpc.getSignatureStatuses([sig], true);
+    const first = await this.d.rpc.getSignatureStatusesWithContext([sig], true);
+    const st = first.value[0];
     const required = this.d.cfg.payout.commitment;
     if (st) {
       if (st.err) {
@@ -195,11 +203,21 @@ export class PayoutExecutor {
       if (!reached) return false;
       return this.confirm(p, sig, st.slot);
     }
-    // Unknown signature: has its blockhash expired at FINALIZED height?
-    const finalizedHeight = await this.d.rpc.getBlockHeight("finalized");
-    if (finalizedHeight > p.current.lastValidBlockHeight) {
-      const [again] = await this.d.rpc.getSignatureStatuses([sig], true); // close the race
-      if (!again) return this.retireAttempt(p._id, sig, "expired", "blockhash expired without the transaction landing");
+    // Unknown signature: has its blockhash expired at FINALIZED height? Slot and height come from
+    // one node in one call, so they are consistent with each other.
+    const fin = await this.d.rpc.getEpochInfo("finalized");
+    if (fin.blockHeight > p.current.lastValidBlockHeight) {
+      const again = await this.d.rpc.getSignatureStatusesWithContext([sig], true); // close the race
+      if (again.value[0]) return false;
+      // "Unknown" proves the transaction can never land only if BOTH answers came from nodes that
+      // had processed at least the finalized slot at which the blockhash is known to be expired.
+      // A lagging or freshly restarted backend (load-balanced RPCs, failover) may simply not have
+      // seen the landing slot yet; re-signing on its word would pay the recipient twice.
+      if (first.contextSlot >= fin.absoluteSlot && again.contextSlot >= fin.absoluteSlot) {
+        return this.retireAttempt(p._id, sig, "expired", "blockhash expired without the transaction landing");
+      }
+      this.log.warn({ payoutId: String(p._id), signature: sig, contextSlots: [first.contextSlot, again.contextSlot], finalizedSlot: fin.absoluteSlot }, "signature unknown to a lagging RPC node; expiry not proven, re-checking later");
+      await this.d.db.Payout.updateOne({ _id: p._id, "current.signature": sig }, { $set: { lastError: "expiry not proven: status answered by a node behind the finalized slot", nextAttemptAt: new Date(this.now() + 5_000) } });
       return false;
     }
     const last = p.current.lastBroadcastAt ? new Date(p.current.lastBroadcastAt).getTime() : 0;
@@ -306,6 +324,7 @@ export class PayoutExecutor {
  * cannot double pay.
  */
 export async function requeueFailedPayout(db: Models, payoutId: string, actor: string, now = Date.now()): Promise<boolean> {
+  if (!/^[0-9a-f]{24}$/i.test(payoutId)) return false; // not an ObjectId (avoid a CastError → HTTP 500)
   const p: any = await db.Payout.findById(payoutId).lean();
   if (!p || p.state !== "failed") return false;
   const res = await db.Payout.updateOne({ _id: p._id, state: "failed" }, { $set: { state: "pending", attemptCount: 0, nextAttemptAt: new Date(now), lastError: `requeued by ${actor}` } });

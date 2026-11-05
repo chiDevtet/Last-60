@@ -8,7 +8,7 @@
 import { ComputeBudgetProgram, Transaction, type Keypair, type PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 import type { AppConfig } from "../config/env";
-import type { SettingsStore } from "../config/runtime";
+import { liveSigningBlockReason, type SettingsStore } from "../config/runtime";
 import type { ChainRpc } from "../chain/rpc";
 import type { Models } from "../db/models";
 import { big, dec } from "../db/decimal";
@@ -40,7 +40,8 @@ export class FeeCollector {
 
   async maybeClaim(): Promise<string | null> {
     const s = await this.d.settings.get();
-    if (s.feeCollectionMode !== "auto_claim" || s.payoutMode !== "live" || s.pausePayouts) return null;
+    // Claims are mainnet transactions too: the same signer-side live/mainnet gate applies.
+    if (s.feeCollectionMode !== "auto_claim" || s.pausePayouts || liveSigningBlockReason(this.d.cfg, s)) return null;
     if (!this.d.claimer || !this.d.payoutWallet) {
       if (!this.warned) this.log.warn("auto_claim enabled but no claim signer / payout wallet loaded");
       this.warned = true;

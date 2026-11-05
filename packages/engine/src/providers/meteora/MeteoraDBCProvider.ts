@@ -80,6 +80,20 @@ export interface DbcConfigState {
   migrationOption: number;
 }
 
+/**
+ * Facts about a DBC config that change what LAST60 can distribute. Observed on mainnet: configs
+ * with creator_trading_fee_percentage = 0 (the creator earns NOTHING from bonding-curve trades,
+ * the partner/launchpad takes 100%) that nevertheless give the creator the LP position after
+ * graduation — so the configured role's entitlement can flip at migration.
+ */
+export function dbcConfigWarnings(role: FeeBeneficiaryRole, cfg: DbcConfigState): string[] {
+  const w: string[] = [];
+  if (role === "creator" && cfg.creatorTradingFeePercentage === 0) w.push("creator_trading_fee_percentage is 0 on this DBC config: the creator earns no bonding-curve trading fees, so rounds will have no eligible fees before graduation");
+  if (role === "partner" && cfg.creatorTradingFeePercentage === 100) w.push("creator_trading_fee_percentage is 100 on this DBC config: the partner earns no bonding-curve trading fees");
+  if (cfg.collectFeeMode === 1) w.push("collect_fee_mode is OutputToken: fees on buys accrue in the base token and are recorded but not distributed as the payout asset");
+  return w;
+}
+
 export class MeteoraDBCProvider implements LaunchProvider {
   readonly id = "meteora_dbc" as const;
   readonly programId = DBC_PROGRAM_ID;
@@ -154,6 +168,7 @@ export class MeteoraDBCProvider implements LaunchProvider {
       accounts: { config: pool.config, baseVault: pool.baseVault, quoteVault: pool.quoteVault, poolAuthority: DBC_POOL_AUTHORITY.toBase58(), feeClaimer: cfg.feeClaimer },
       watchAddresses: [this.opts.poolAddress],
       slot,
+      warnings: dbcConfigWarnings(this.opts.role, cfg),
     };
     return this.cached;
   }

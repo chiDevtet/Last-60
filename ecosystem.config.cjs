@@ -4,6 +4,10 @@
  * Keep secrets in per-process env files (chmod 600). Only `last60-rewards` may hold the payout
  * signing key and SCHEDULE_ENCRYPTION_KEY; the API and web processes never need them.
  *
+ * Env files are loaded by the runtime (`bun --env-file`, `node --env-file`): PM2 has no
+ * `env_file` option and silently ignores it. `--env-file` also stops Bun from auto-loading a
+ * root `.env`, which would otherwise hand every process (including the API) the same secrets.
+ *
  * Exit code 78 = invalid configuration: PM2 stops restarting (stop_exit_codes) instead of
  * hot-looping, so the error stays visible in `pm2 logs`.
  */
@@ -26,14 +30,14 @@ module.exports = {
       ...common,
       name: "last60-indexer",
       script: "apps/worker/src/indexer.ts",
-      env_file: ".env.indexer",
+      interpreter_args: "--env-file=.env.indexer",
       env: { WORKER_HEALTH_PORT: "4101" },
     },
     {
       ...common,
       name: "last60-rewards",
       script: "apps/worker/src/rewards.ts",
-      env_file: ".env.rewards",
+      interpreter_args: "--env-file=.env.rewards",
       env: { WORKER_HEALTH_PORT: "4102" },
       // A single active rewards leader is enforced by a lease; extra instances stand by safely.
       instances: 1,
@@ -42,7 +46,7 @@ module.exports = {
       ...common,
       name: "last60-api",
       script: "apps/api/src/index.ts",
-      env_file: ".env.api",
+      interpreter_args: "--env-file=.env.api",
     },
     {
       name: "last60-web",
@@ -50,7 +54,7 @@ module.exports = {
       script: "node_modules/next/dist/bin/next",
       args: "start -p 3000",
       interpreter: "node",
-      env_file: "../../.env.web",
+      node_args: "--env-file=../../.env.web",
       autorestart: true,
       time: true,
     },

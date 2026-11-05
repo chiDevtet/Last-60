@@ -116,8 +116,12 @@ export async function ingestRawTransaction(ctx: IngestContext, raw: any, opts: {
       },
       { upsert: true },
     );
-    // An auto-claim row may already exist as "submitted"; the chain has now confirmed it.
-    if (!r.upsertedCount) await ctx.db.FeeClaim.updateOne({ signature: c.signature, status: "submitted" }, { $set: { status: "confirmed", quoteAmount: dec(c.quoteAmount), baseAmount: dec(c.baseAmount), slot: c.slot } });
+    // An auto-claim row may already exist as "submitted" — or as "failed" when the broadcast
+    // returned an ambiguous error (timeout) or confirmation was not observed before expiry, yet
+    // the transaction landed. The chain is authoritative: an observed claim is confirmed. (Left
+    // "failed", its amount would be missing from reconciliation and trip a false over-attribution
+    // halt.)
+    if (!r.upsertedCount) await ctx.db.FeeClaim.updateOne({ signature: c.signature, status: { $ne: "confirmed" } }, { $set: { status: "confirmed", quoteAmount: dec(c.quoteAmount), baseAmount: dec(c.baseAmount), slot: c.slot, blockTime: c.blockTime ? new Date(c.blockTime * 1000) : null }, $unset: { error: 1 } });
     await ctx.db.LedgerEntry.updateOne(
       { key: `FEE_CLAIMED:${c.signature}` },
       { $setOnInsert: { key: `FEE_CLAIMED:${c.signature}`, type: "FEE_CLAIMED", amount: dec(c.quoteAmount), mint: info.quoteMint, signature: c.signature, memo: `claimed by ${c.claimer}` } },

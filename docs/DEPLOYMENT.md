@@ -36,6 +36,10 @@ Validate everything before starting: `bun run cli check-config` (per role).
 
 ## 3. Start
 
+Each process loads **only its own** env file through the runtime (`bun --env-file=.env.<role>`,
+`node --env-file` for the web app) — PM2 itself has no env-file option. Do not keep a root `.env`
+on production hosts: Bun auto-loads it into any process started without `--env-file`.
+
 ```bash
 pm2 start ecosystem.config.cjs
 pm2 save && pm2 startup
@@ -50,6 +54,7 @@ Exit code 78 means invalid configuration; PM2 will not restart-loop it.
 ```nginx
 location /api/v1/stream {
   proxy_pass http://127.0.0.1:4000;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
   proxy_http_version 1.1;
   proxy_set_header Connection "";
   proxy_buffering off;
@@ -58,7 +63,10 @@ location /api/v1/stream {
 }
 location / { proxy_pass http://127.0.0.1:4000; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
 ```
-Set `CORS_ORIGINS=https://last60.io` and `PUBLIC_SITE_URL=https://last60.io`.
+Set `CORS_ORIGINS=https://last60.io`, `PUBLIC_SITE_URL=https://last60.io` and
+`API_TRUST_PROXY_HOPS=1` (one nginx). The API takes the client address from the right-most
+X-Forwarded-For entry appended by your proxy; with `0` it ignores forwarding headers and uses the
+socket peer. Bind the API to `127.0.0.1` when it sits behind the proxy (`API_HOST`).
 
 ## 5. Go-live sequence (do not skip)
 
@@ -69,7 +77,10 @@ Set `CORS_ORIGINS=https://last60.io` and `PUBLIC_SITE_URL=https://last60.io`.
 3. **Devnet or small-value live test** of the payout wallet path if desired.
 4. **Mainnet live** — requires explicit authorization from the project owner:
    `PAYOUT_MODE=live` **and** `ALLOW_MAINNET_PAYOUTS=true` in `.env.rewards`, a funded dedicated
-   payout wallet, `PAYOUT_COMMITMENT=finalized`. Watch the first rounds closely.
+   payout wallet, `PAYOUT_COMMITMENT=finalized`. Watch the first rounds closely. The rewards
+   worker re-checks `ALLOW_MAINNET_PAYOUTS` in **its own** environment before every signature, so
+   a live override set from the admin console (or written to the database) cannot bypass it;
+   such payouts stay queued.
 5. Before the token graduates: deploy the post-migration adapter (`docs/PROVIDERS.md`).
 
 ## 6. Health & monitoring

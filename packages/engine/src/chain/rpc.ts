@@ -160,10 +160,16 @@ export class RpcClient {
     return this.call<number>("getBlockHeight", [{ commitment }]);
   }
 
-  getSignaturesForAddress(address: string, o: { before?: string; until?: string; limit?: number; commitment?: Commitment } = {}) {
+  /**
+   * `minContextSlot` makes the node refuse (error -32016, retried as transient) instead of
+   * answering from a state older than that slot — e.g. a load-balanced backend that has not yet
+   * indexed the snapshot slot.
+   */
+  getSignaturesForAddress(address: string, o: { before?: string; until?: string; limit?: number; commitment?: Commitment; minContextSlot?: number } = {}) {
     const cfg: Record<string, unknown> = { limit: o.limit ?? 1000, commitment: o.commitment ?? "confirmed" };
     if (o.before) cfg.before = o.before;
     if (o.until) cfg.until = o.until;
+    if (o.minContextSlot !== undefined) cfg.minContextSlot = o.minContextSlot;
     return this.call<SignatureInfo[]>("getSignaturesForAddress", [address, cfg]);
   }
 
@@ -237,6 +243,22 @@ export class RpcClient {
     return r.value;
   }
 
+  /**
+   * Statuses plus the slot the answering node evaluated them at. A `null` status only means
+   * "unknown to a node at `contextSlot`" — callers deciding that a transaction can never land must
+   * check that this slot is recent enough (see PayoutExecutor.checkSubmitted).
+   */
+  async getSignatureStatusesWithContext(signatures: string[], searchTransactionHistory = true): Promise<{ contextSlot: number; value: (SignatureStatus | null)[] }> {
+    const r = await this.call<any>("getSignatureStatuses", [signatures, { searchTransactionHistory }]);
+    return { contextSlot: Number(r.context?.slot ?? 0), value: r.value };
+  }
+
+  /** Slot and block height at `commitment`, from ONE node in ONE call (so they are mutually consistent). */
+  async getEpochInfo(commitment: Commitment = "finalized"): Promise<{ absoluteSlot: number; blockHeight: number }> {
+    const r = await this.call<any>("getEpochInfo", [{ commitment }]);
+    return { absoluteSlot: Number(r.absoluteSlot), blockHeight: Number(r.blockHeight) };
+  }
+
   /** Ordered signatures of a block (used to break intra-slot ordering ties exactly). */
   async getBlockSignatures(slot: number): Promise<string[] | null> {
     try {
@@ -264,6 +286,8 @@ export type ChainRpc = Pick<
   | "getMinimumBalanceForRentExemption"
   | "sendRawTransaction"
   | "getSignatureStatuses"
+  | "getSignatureStatusesWithContext"
+  | "getEpochInfo"
   | "getBlockSignatures"
 >;
 

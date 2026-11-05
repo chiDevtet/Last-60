@@ -48,7 +48,7 @@ INDEXER_BACKFILL=none
 ## Tests
 
 ```bash
-bun run test        # 90 tests: real MongoDB replica set, fault-injecting chain, real Solana runtime (LiteSVM),
+bun run test        # 109 tests: real MongoDB replica set, fault-injecting chain, real Solana runtime (LiteSVM),
                     # real mainnet transaction fixtures — no network, no real keys
 bun run typecheck
 ```
@@ -74,6 +74,7 @@ bun run verify:round <n> --fees                           # re-derive a round's 
 | [Operations](docs/OPERATIONS.md) | runbook |
 | [Brand](docs/BRAND.md) | name exploration, identity, assets |
 | [Verification](docs/VERIFICATION.md) | what was proven, evidence, and what is not done |
+| [Audit](docs/AUDIT.md) | production-readiness audit: confirmed issues, fixes, risks, blockers |
 
 ## Acceptance criteria — status
 

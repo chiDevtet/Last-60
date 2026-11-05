@@ -39,20 +39,47 @@ export interface FetchBounds {
 
 /**
  * Fetch signatures newer than `until`, newest-first paging, returned oldest-first.
- * Without `until`, paging is bounded by `bounds` (catch-up) or by `cap` (backfill).
+ *
+ * Completeness rule: when the read is anchored (`until` and/or `bounds`), the `cap` limits how
+ * many signatures are RETURNED, never which ones are skipped: paging continues back to the anchor
+ * and only the OLDEST `cap` signatures are kept (a sliding window), so a caller that advances a
+ * cursor over the result can never jump over a gap; `truncated` tells it more remain. Only an
+ * unanchored history backfill (no `until`, no `bounds`) stops at the newest `cap` signatures.
  */
-export async function fetchNewSignatures(rpc: ChainRpc, address: string, until: string | null, cap: number, bounds: FetchBounds = {}): Promise<SignatureInfo[]> {
-  const out: SignatureInfo[] = [];
+export async function fetchSignaturesSince(
+  rpc: ChainRpc,
+  address: string,
+  until: string | null,
+  cap: number,
+  bounds: FetchBounds = {},
+  opts: { minContextSlot?: number } = {},
+): Promise<{ sigs: SignatureInfo[]; truncated: boolean }> {
+  const anchored = until !== null || bounds.afterSlot != null || bounds.sinceTime != null;
+  let out: SignatureInfo[] = []; // newest → oldest
+  let truncated = false;
   let before: string | undefined;
   const inBounds = (s: SignatureInfo) => (bounds.afterSlot == null || s.slot > bounds.afterSlot) && (bounds.sinceTime == null || s.blockTime == null || s.blockTime >= bounds.sinceTime);
   for (;;) {
-    const page = await rpc.getSignaturesForAddress(address, { until: until ?? undefined, before, limit: 1000, commitment: "confirmed" });
+    const page = await rpc.getSignaturesForAddress(address, { until: until ?? undefined, before, limit: 1000, commitment: "confirmed", ...(opts.minContextSlot !== undefined ? { minContextSlot: opts.minContextSlot } : {}) });
     const kept = page.filter(inBounds);
     out.push(...kept);
-    if (page.length < 1000 || out.length >= cap || kept.length < page.length) break;
+    if (out.length > cap) {
+      truncated = true;
+      if (!anchored) {
+        out = out.slice(0, cap); // backfill: the newest `cap`
+        break;
+      }
+      out = out.slice(out.length - cap); // anchored: keep the oldest `cap` (closest to the anchor)
+    }
+    if (page.length < 1000 || kept.length < page.length) break;
     before = page[page.length - 1]!.signature;
   }
-  return out.reverse(); // oldest first
+  return { sigs: out.reverse(), truncated }; // oldest first
+}
+
+/** Back-compatible wrapper returning only the signatures (oldest first). */
+export async function fetchNewSignatures(rpc: ChainRpc, address: string, until: string | null, cap: number, bounds: FetchBounds = {}): Promise<SignatureInfo[]> {
+  return (await fetchSignaturesSince(rpc, address, until, cap, bounds)).sigs;
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
@@ -84,14 +111,16 @@ export interface SyncStats {
 export async function syncAddress(
   ctx: IngestContext & { rpc: ChainRpc },
   address: string,
-  o: { cursorKey?: string; untilSignature?: string | null; source: "indexer" | "catchup" | "backfill"; cap: number; concurrency: number; maxSlot?: number; bounds?: FetchBounds; maxPerPass?: number; signal?: AbortSignal },
-): Promise<SyncStats & { more: boolean }> {
+  o: { cursorKey?: string; untilSignature?: string | null; source: "indexer" | "catchup" | "backfill"; cap: number; concurrency: number; maxSlot?: number; bounds?: FetchBounds; maxPerPass?: number; signal?: AbortSignal; minContextSlot?: number },
+): Promise<SyncStats & { more: boolean; truncated: boolean }> {
   const cursor = o.cursorKey ? await readCursor(ctx.db, o.cursorKey) : null;
   const until = o.untilSignature !== undefined ? o.untilSignature : (cursor?.lastSignature ?? null);
-  const all = await fetchNewSignatures(ctx.rpc, address, until, o.cap, o.bounds);
-  // Bounded pass (oldest first); the cursor makes the next pass continue exactly here.
+  const { sigs: all, truncated } = await fetchSignaturesSince(ctx.rpc, address, until, o.cap, o.bounds, { minContextSlot: o.minContextSlot });
+  // Bounded pass (oldest first); the cursor makes the next pass continue exactly here. An
+  // anchored truncated fetch also means "more": the newest signatures were not returned yet.
+  const anchored = until !== null || o.bounds?.afterSlot != null || o.bounds?.sinceTime != null;
   const sigs = o.maxPerPass ? all.slice(0, o.maxPerPass) : all;
-  const stats: SyncStats & { more: boolean } = { fetched: all.length, ingested: 0, newSwaps: 0, newClaims: 0, lastSlot: cursor?.lastSlot ?? 0, more: sigs.length < all.length };
+  const stats: SyncStats & { more: boolean; truncated: boolean } = { fetched: all.length, ingested: 0, newSwaps: 0, newClaims: 0, lastSlot: cursor?.lastSlot ?? 0, more: sigs.length < all.length || (truncated && anchored), truncated };
   if (!sigs.length) return stats;
 
   // Fetch transactions concurrently, ingest strictly in chronological order. Signatures that are

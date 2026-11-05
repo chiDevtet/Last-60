@@ -15,7 +15,8 @@ import { RpcClient } from "../chain/rpc";
 import { LogsSubscriber } from "../chain/ws";
 import type { Models } from "../db/models";
 import { big } from "../db/decimal";
-import { createProvider, type LaunchProvider, type PoolInfo } from "../providers";
+import { createProvider, findMigration, migrationVerified, verifyMigration, type LaunchProvider, type PoolInfo } from "../providers";
+import { jsonSafe } from "../util/json";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
 import { rootLogger, type Logger } from "../util/logger";
@@ -88,7 +89,11 @@ export class Indexer {
     await this.savePool(this.pool);
     this.log.info({ provider: this.pool.provider, pool: this.pool.poolAddress, mint: this.pool.tokenMint, beneficiary: this.pool.beneficiary, status: this.pool.status, feeParams: this.pool.feeParams }, "provider loaded");
     await this.terminal.system(`Indexer attached to ${this.pool.provider} pool ${this.pool.poolAddress.slice(0, 4)}…${this.pool.poolAddress.slice(-4)}.`, `attach:${this.pool.provider}:${this.pool.poolAddress}:${s.version}`);
-    if (this.pool.status !== "bonding") await this.migrationWarning(this.pool);
+    for (const w of this.pool.warnings ?? []) await this.terminal.warn(`Pool configuration: ${w}.`, `pool-warning:${this.pool.poolAddress}:${s.version}:${w.slice(0, 40)}`);
+    if (this.pool.status !== "bonding") {
+      await this.migrationWarning(this.pool);
+      await this.recordMigration(this.pool);
+    }
     const wsUrl = s.wsUrl;
     if (s.indexerUseWebsocket && wsUrl && this.deps.wsFactory !== null) {
       const onLog = (sig: string) => {
@@ -121,6 +126,7 @@ export class Indexer {
           status: p.status,
           feeParams: p.feeParams,
           accounts: p.accounts,
+          warnings: p.warnings ?? [],
           refreshedAt: new Date(),
         },
         $setOnInsert: { discoveredAt: new Date() },
@@ -282,6 +288,34 @@ export class Indexer {
     this.pool = await this.provider.load();
     await this.savePool(this.pool);
     if (prev && prev !== this.pool.status) await this.migrationWarning(this.pool);
+    await this.recordMigration(this.pool);
+  }
+
+  private migrationRecorded = new Set<string>();
+  /**
+   * On graduation, find the migration transaction, verify the destination pool on-chain and persist
+   * it on the pool document (admin status + operators). Fees from the destination are still NOT
+   * attributed: that requires the post-graduation adapter (docs/PROVIDERS.md).
+   */
+  private async recordMigration(p: PoolInfo) {
+    if (p.status !== "migrated" || p.provider === "mock" || !this.rpc || this.migrationRecorded.has(p.poolAddress)) return;
+    try {
+      const m = await findMigration(this.rpc, p.provider, p.poolAddress);
+      if (!m) {
+        this.log.warn({ pool: p.poolAddress }, "pool is migrated but its migration transaction was not found in recent history");
+        return;
+      }
+      const v = await verifyMigration(this.rpc, m, { base: p.tokenMint, quote: p.quoteMint });
+      const verified = migrationVerified(v);
+      await this.deps.db.Pool.updateOne({ key: `${p.provider}:${p.poolAddress}` }, { $set: { migration: jsonSafe({ ...v, verified, resolvedAt: new Date() }) } });
+      this.migrationRecorded.add(p.poolAddress);
+      await this.terminal.warn(
+        `Pool graduated (${m.kind.replace("_", " → ")}) to ${m.destinationPool.slice(0, 4)}…${m.destinationPool.slice(-4)}${verified ? " — destination verified on-chain" : " — destination NOT fully verified"}. Fees from the new pool are not attributed yet.`,
+        `migration-dest:${p.poolAddress}`,
+      );
+    } catch (err) {
+      this.log.warn({ pool: p.poolAddress, err: String(err) }, "migration resolution failed; will retry on next refresh");
+    }
   }
 
   /**

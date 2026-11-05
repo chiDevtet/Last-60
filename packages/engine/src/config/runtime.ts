@@ -43,7 +43,12 @@ export const RuntimeOverridesSchema = z
 
 export type RuntimeOverrides = z.infer<typeof RuntimeOverridesSchema>;
 
-export const CRITICAL_KEYS: (keyof RuntimeOverrides)[] = ["launchProvider", "tokenMint", "poolAddress", "feeBeneficiaryRole", "rewardBps", "payoutAsset", "payoutMode", "expectedPayoutPublicKey"];
+/**
+ * Keys that redirect money or the data money decisions are based on. `rpcUrls`/`wsUrl` are
+ * critical: the rewards worker decides payout expiry, balances and fee attribution from what the
+ * RPC tells it, so a malicious endpoint could fabricate swaps or "expired" statuses.
+ */
+export const CRITICAL_KEYS: (keyof RuntimeOverrides)[] = ["launchProvider", "tokenMint", "poolAddress", "feeBeneficiaryRole", "rewardBps", "payoutAsset", "payoutMode", "expectedPayoutPublicKey", "rpcUrls", "wsUrl", "feeCollectionMode"];
 
 export interface EffectiveSettings {
   version: number;
@@ -109,6 +114,21 @@ export function validateEffective(cfg: AppConfig, s: EffectiveSettings): string[
   if (s.payoutAssetMint === WSOL_MINT && s.minPayoutLamports < 890_880n) p.push("minPayoutLamports must be >= 890880 (rent-exempt minimum)");
   if (s.minBuyQuote <= 0n) p.push("minBuyQuote must be positive");
   return p;
+}
+
+/**
+ * Why THIS process must not sign live (fund-moving) transactions right now, or null if it may.
+ *
+ * The runtime `payoutMode` override is validated by whichever process wrote it (normally the API,
+ * against the API's own environment) — or not at all if the settings document was written
+ * directly. The signing process therefore re-checks the mainnet switch against its OWN
+ * environment immediately before every signature, and honours the current effective mode, so
+ * that neither an admin override nor a database write can bypass ALLOW_MAINNET_PAYOUTS.
+ */
+export function liveSigningBlockReason(cfg: AppConfig, s: Pick<EffectiveSettings, "payoutMode">): string | null {
+  if (s.payoutMode !== "live") return "payout mode is dry_run; queued live payouts wait until live mode is re-enabled";
+  if (cfg.solana.cluster === "mainnet-beta" && !cfg.payout.allowMainnet) return "live payouts on mainnet-beta require ALLOW_MAINNET_PAYOUTS=true in the rewards worker's own environment";
+  return null;
 }
 
 export class SettingsStore {

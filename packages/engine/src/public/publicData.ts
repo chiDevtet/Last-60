@@ -46,6 +46,10 @@ export function phaseOf(r: any, now: number, windowStartsAt: number): RoundPhase
   }
 }
 
+function clampInt(v: number, def: number, max: number): number {
+  return Number.isInteger(v) && v >= 1 ? Math.min(v, max) : def;
+}
+
 export class PublicData {
   private readonly params: ScheduleParams;
   private cache = new Map<string, { at: number; v: unknown }>();
@@ -164,11 +168,12 @@ export class PublicData {
   }
 
   async recentBuys(limit = 30): Promise<BuyDTO[]> {
+    limit = clampInt(limit, 30, 100); // also bounds the number of cache keys
     return this.cached(`buys:${limit}`, 750, async () => {
       const s = await this.settings.get();
       const { pool } = await this.pool();
       if (!pool) return [];
-      const rows: any[] = await this.db.Swap.find({ pool, side: "buy", status: "active" }, "signature trader quoteAmount baseAmount slot blockTime commitment").sort({ slot: -1, orderInSlot: -1 }).limit(Math.min(limit, 100)).lean();
+      const rows: any[] = await this.db.Swap.find({ pool, side: "buy", status: "active" }, "signature trader quoteAmount baseAmount slot blockTime commitment").sort({ slot: -1, orderInSlot: -1 }).limit(limit).lean();
       return rows.map((r) => ({
         signature: r.signature,
         wallet: r.trader,
@@ -282,6 +287,7 @@ export class PublicData {
   }
 
   async chart(limit = 24): Promise<FeeChartPointDTO[]> {
+    limit = clampInt(limit, 24, 200);
     return this.cached(`chart:${limit}`, 5000, async () => {
       const rows: any[] = await this.db.Round.find({ state: { $in: ["paying", "awaiting_funds", "completed", "rolled_over", "attention"] } }, "roundNumber fees reward recipientCount").sort({ roundNumber: -1 }).limit(limit).lean();
       return rows.reverse().map((r) => ({ roundNumber: r.roundNumber, fees: big(r.fees).toString(), reward: big(r.reward).toString(), recipients: r.recipientCount ?? 0 }));

@@ -62,6 +62,9 @@ const poolSchema = new Schema(
     status: { type: String, enum: ["bonding", "migrating", "migrated", "unknown"], default: "unknown" },
     feeParams: Schema.Types.Mixed, // provider-specific, e.g. { creatorTradingFeePercentage, collectFeeMode }
     accounts: Schema.Types.Mixed, // provider-specific addresses (config, vaults, fee vaults)
+    warnings: { type: [String], default: [] },
+    /** Graduation destination resolved from the migration transaction and verified on-chain. */
+    migration: { type: Schema.Types.Mixed, default: null },
     discoveredAt: { type: Date, default: Date.now },
     refreshedAt: Date,
   },
@@ -175,6 +178,7 @@ const roundSchema = new Schema(
       payoutMode: String,
       provider: String,
       pool: String,
+      previousPool: { type: String, default: null }, // set when the pool/provider changed during the period
       tokenMint: String,
       skippedRoundPolicy: String,
       minPayoutLamports: D,
