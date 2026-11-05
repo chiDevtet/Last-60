@@ -3,6 +3,7 @@
  * a controllable clock and freshly generated (throwaway) keypairs. No real keys, no mainnet.
  */
 import { Keypair } from "@solana/web3.js";
+import bs58 from "bs58";
 import mongoose from "mongoose";
 import { loadConfig, type AppConfig } from "../src/config/env";
 import { SettingsStore } from "../src/config/runtime";
@@ -86,11 +87,11 @@ export interface Rig {
 
 export async function rig(opts: { env?: Record<string, string>; random?: (min: number, max: number) => number; balance?: bigint } = {}): Promise<Rig> {
   const db = await freshDb();
-  const cfg = testConfig({ PAYOUT_MODE: "live", ...(opts.env ?? {}) });
+  const payer = Keypair.generate(); // throwaway key generated per test — never a real key
+  const cfg = testConfig({ PAYOUT_MODE: "live", PAYOUT_WALLET_PRIVATE_KEY: bs58.encode(payer.secretKey), PAYOUT_WALLET_PUBLIC_KEY: payer.publicKey.toBase58(), ...(opts.env ?? {}) });
   const chain = new FakeChain();
   const clock = new FakeClock(T0 + 1_000);
   chain.now = () => clock.now();
-  const payer = Keypair.generate();
   chain.setBalance(payer.publicKey.toBase58(), opts.balance ?? 100n * SOL);
   const provider = new MockProvider();
   const settings = new SettingsStore(db, cfg, 0);

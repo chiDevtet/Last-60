@@ -26,7 +26,7 @@ export class Lease {
       const res = await this.db.WorkerLease.findOneAndUpdate(
         { _id: this.name, $or: [{ owner: this.owner }, { expiresAt: { $lt: new Date(now) } }] },
         { $set: { owner: this.owner, token: nextToken, expiresAt }, $setOnInsert: { acquiredAt: new Date(now) } },
-        { upsert: true, new: true },
+        { upsert: true, returnDocument: "after" },
       ).lean();
       this.token = (res as any)?.token ?? null;
       return (res as any)?.owner === this.owner;

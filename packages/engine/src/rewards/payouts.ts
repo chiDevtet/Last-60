@@ -119,7 +119,7 @@ export class PayoutExecutor {
     const claimed = await this.d.db.Payout.findOneAndUpdate(
       { _id: p._id, state: "pending" },
       { $set: { state: "signing", lock: { owner: this.d.cfg.instanceId, token, expiresAt: new Date(this.now() + SIGNING_LOCK_MS) } } },
-      { new: true },
+      { returnDocument: "after" },
     ).lean();
     if (!claimed) return false;
 
@@ -295,13 +295,22 @@ export class PayoutExecutor {
   }
 
   /** Operator action: requeue a failed payout. Safe because every prior attempt is provably dead. */
-  async requeueFailed(payoutId: string, actor: string): Promise<boolean> {
-    const p: any = await this.d.db.Payout.findById(payoutId).lean();
-    if (!p || p.state !== "failed") return false;
-    const res = await this.d.db.Payout.updateOne({ _id: p._id, state: "failed" }, { $set: { state: "pending", attemptCount: 0, nextAttemptAt: new Date(this.now()), lastError: `requeued by ${actor}` } });
-    if (!res.modifiedCount) return false;
-    await this.d.db.LedgerEntry.create({ key: `PAYOUT_REQUEUED:${payoutId}:${this.now()}`, type: "PAYOUT_REQUEUED", roundNumber: p.roundNumber, amount: p.amount, mint: p.mint, payoutId: p._id, memo: `requeued by ${actor}` });
-    await this.d.db.Round.updateOne({ roundNumber: p.roundNumber, state: "attention" }, { $set: { state: "paying" } });
-    return true;
+  requeueFailed(payoutId: string, actor: string): Promise<boolean> {
+    return requeueFailedPayout(this.d.db, payoutId, actor, this.now());
   }
+}
+
+/**
+ * Requeue a `failed` payout (DB-only, usable from the admin API and CLI). A payout only reaches
+ * `failed` after every attempt was proven dead (expired or failed at finalized), so retrying
+ * cannot double pay.
+ */
+export async function requeueFailedPayout(db: Models, payoutId: string, actor: string, now = Date.now()): Promise<boolean> {
+  const p: any = await db.Payout.findById(payoutId).lean();
+  if (!p || p.state !== "failed") return false;
+  const res = await db.Payout.updateOne({ _id: p._id, state: "failed" }, { $set: { state: "pending", attemptCount: 0, nextAttemptAt: new Date(now), lastError: `requeued by ${actor}` } });
+  if (!res.modifiedCount) return false;
+  await db.LedgerEntry.create({ key: `PAYOUT_REQUEUED:${payoutId}:${now}`, type: "PAYOUT_REQUEUED", roundNumber: p.roundNumber, amount: p.amount, mint: p.mint, payoutId: p._id, memo: `requeued by ${actor}` });
+  await db.Round.updateOne({ roundNumber: p.roundNumber, state: "attention" }, { $set: { state: "paying" } });
+  return true;
 }

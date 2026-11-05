@@ -34,7 +34,7 @@ async function runRound(r: Rig, opts: { finalize?: boolean } = {}) {
 describe("unique buyer selection", () => {
   test("spec sequence A, B, A, C, D, E: each wallet once, ranked by its latest qualifying buy", async () => {
     const r = await rig();
-    const [A, B, C, D, E, F] = Array.from({ length: 6 }, wallet);
+    const [A, B, C, D, E, F] = Array.from({ length: 6 }, wallet) as [string, string, string, string, string, string];
     const seq: [string, bigint][] = [[A!, 100_000_000n], [B!, 50_000_000n], [A!, 200_000_000n], [C!, 150_000_000n], [D!, 80_000_000n], [E!, 50_000_000n], [F!, 40_000_000n]];
     for (const [w, q] of seq) {
       r.trade({ trader: w, quote: q });
@@ -53,7 +53,7 @@ describe("unique buyer selection", () => {
 
   test("a wallet's repeat buy moves it to the front (A buys last → A, E, D, C, B)", async () => {
     const r = await rig();
-    const [A, B, C, D, E] = Array.from({ length: 5 }, wallet);
+    const [A, B, C, D, E] = Array.from({ length: 5 }, wallet) as [string, string, string, string, string];
     for (const [w, q] of [[A, 100_000_000n], [B, 50_000_000n], [C, 150_000_000n], [D, 80_000_000n], [E, 50_000_000n], [A, 200_000_000n]] as [string, bigint][]) {
       r.trade({ trader: w, quote: q });
       r.chain.advance(1);
@@ -84,7 +84,7 @@ describe("unique buyer selection", () => {
     for (const s of [...sigs].reverse()) await ingestRawTransaction({ db: r.db, provider: r.provider, minBuyQuote: 1n }, await r.chain.getTransactionRaw(s.signature), { source: "indexer", commitment: "confirmed" });
     const sel = await selectRecipients(r.db, r.chain, { pool: MOCK_POOL, afterSlot: null, periodStartAt: null, snapshotSlot: r.chain.slot, minBuyQuote: 1n, buyerCount: 2, excluded: new Set() });
     expect(sel.tieBreak).toBe("block_order");
-    expect(sel.recipients.map((x) => x.wallet)).toEqual([ws[3], ws[2]]); // last two in block order
+    expect(sel.recipients.map((x) => x.wallet)).toEqual([ws[3]!, ws[2]!]); // last two in block order
   });
 
   test("sells, failed transactions and excluded wallets never qualify", async () => {

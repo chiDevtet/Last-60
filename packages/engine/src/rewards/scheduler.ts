@@ -215,7 +215,7 @@ export class RoundScheduler {
     const locked: any = await this.d.db.Round.findOneAndUpdate(
       lockFilter,
       { $set: { state: "snapshotting", lock: { owner: this.owner, token, expiresAt: new Date(now + LOCK_MS) } }, $inc: { attempts: 1 } },
-      { new: true },
+      { returnDocument: "after" },
     ).lean();
     if (!locked) return; // another worker owns it, or it is already done
     const roundNumber: number = locked.roundNumber;

@@ -26,3 +26,4 @@ export * from "./util/time";
 export * from "./util/crypto";
 export * from "./util/backoff";
 export * from "./util/json";
+export * from "./public/publicData";

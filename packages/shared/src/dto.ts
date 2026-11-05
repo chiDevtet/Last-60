@@ -82,7 +82,8 @@ export interface RoundSummaryDTO {
   roundNumber: number;
   startsAt: string;
   endsAt: string;
-  executedAt: string | null;
+  /** When the round finished settling (after confirmations). The trigger instant is never published. */
+  settledAt: string | null;
   phase: RoundPhase;
   fees: string;
   reward: string;

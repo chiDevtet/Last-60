@@ -24,7 +24,7 @@ export class TerminalWriter {
   private async write(type: TerminalEventType, message: string, o: { roundNumber?: number | null; signature?: string | null; details?: Details | null; dedupeKey?: string } = {}) {
     try {
       if (o.dedupeKey && (await this.db.TerminalEvent.exists({ dedupeKey: o.dedupeKey }))) return;
-      const c: any = await this.db.Counter.findOneAndUpdate({ _id: "terminal" }, { $inc: { seq: 1 } }, { upsert: true, new: true }).lean();
+      const c: any = await this.db.Counter.findOneAndUpdate({ _id: "terminal" }, { $inc: { seq: 1 } }, { upsert: true, returnDocument: "after" }).lean();
       const now = new Date();
       await this.db.TerminalEvent.create({
         seq: c.seq,
