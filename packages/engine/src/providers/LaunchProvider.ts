@@ -37,6 +37,8 @@ export interface PoolInfo {
   watchAddresses: string[];
   /** Slot at which this info was read. */
   slot: number;
+  /** Configuration facts operators must see (e.g. the configured role earns 0% on this config). */
+  warnings?: string[];
 }
 
 export interface NormalizedSwap {

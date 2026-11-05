@@ -159,6 +159,7 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
       // Claims touch the fee vault, not the pool, so both must be watched.
       watchAddresses: [this.opts.poolAddress, creatorRole ? cVault : pVault],
       slot,
+      warnings: creatorRole && platform.creatorFeeRate === 0n ? ["this LaunchLab platform's creator_fee_rate is 0: the creator earns no bonding-curve fees"] : !creatorRole && platform.feeRate === 0n ? ["this LaunchLab platform's fee_rate is 0: the platform earns no bonding-curve fees"] : [],
     };
     return this.cached;
   }

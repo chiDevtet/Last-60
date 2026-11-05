@@ -9,6 +9,7 @@ export * from "./LaunchProvider";
 export { MeteoraDBCProvider, DBC_PROGRAM_ID } from "./meteora/MeteoraDBCProvider";
 export { RaydiumLaunchLabProvider, LAUNCHLAB_PROGRAM_ID } from "./raydium/RaydiumLaunchLabProvider";
 export { MockProvider } from "./mock/MockProvider";
+export * from "./migration";
 
 export interface ProviderTarget {
   id: AppConfig["provider"]["id"];
