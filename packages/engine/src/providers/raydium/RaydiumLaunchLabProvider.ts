@@ -11,8 +11,16 @@
  *     token balance deltas equal to the event amounts).
  *   - The creator vault is shared by every pool that creator launched with that quote mint, and the
  *     platform vault by every pool on the platform — per-event attribution is authoritative.
- *   - claim_creator_fee / claim_platform_fee_from_vault emit no event; amounts are read from the
- *     vault's token balance delta.
+ *   - claim_creator_fee / claim_platform_fee_from_vault emit no event; the claimed amount is the sum of
+ *     the token transfers OUT OF the fee vault executed by that claim instruction (instruction-scoped,
+ *     so a trade or a second claim in the same transaction is never mixed in).
+ *   - `creator_fee_rate` (PlatformConfig, millionths) is a FEE RATE on the trade value that is added
+ *     to the total fee rate — e.g. 5000 = 0.5% of the trade — not a percentage of the other fees.
+ *     The program charges total_fee = ceil(amount × Σrates / 1e6) and splits it pro rata to the
+ *     rates; TradeEvent.creator_fee is that exact split (Raydium SDK curve.ts splitFee).
+ *   - At migration the LP is distributed by `platform_scale` / `creator_scale` / `burn_scale`
+ *     (millionths); the platform's and creator's parts are locked in the Raydium LP-lock program and
+ *     their LP fees are paid to the holder of the corresponding fee-key NFT.
  */
 import { PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
 import {
@@ -25,7 +33,10 @@ import type { Idl } from "@coral-xyz/anchor";
 import { WSOL_MINT } from "@last60/shared";
 import idlJson from "./idl/raydium_launchpad.json";
 import { AnchorEventDecoder, enumVariant, instructionDiscriminator, toAddr, toBig } from "../../chain/anchorEvents";
-import { tokenAccountDelta, type NormalizedTx } from "../../chain/tx";
+import { subtreeTransfers, type NormalizedTx } from "../../chain/tx";
+import type { ExpectedAllocation } from "../../config/env";
+import { basisPayable, EXCLUSION, makeBasis, type AllocationBasis, type AllocationVerification, type NormalizedAttribution } from "../../accounting/attribution";
+import { verifyDeclared } from "../meteora/MeteoraDBCProvider";
 import type { ChainRpc } from "../../chain/rpc";
 import { readMint } from "../mint";
 import {
@@ -102,12 +113,35 @@ export interface LaunchLabPlatformConfig {
   platformFeeWallet: string;
   feeRate: bigint;
   creatorFeeRate: bigint;
+  /** Migrated LP distribution, millionths (absent on hand-built test configs). */
+  platformLockNftWallet?: string;
+  platformScale?: bigint;
+  creatorScale?: bigint;
+  burnScale?: bigint;
+  cpConfig?: string;
+  /** When set, CPMM pools created at migration record this wallet as pool_creator instead of the token creator. */
+  platformCpCreator?: string | null;
 }
 
-/** Byte offsets follow the Raydium SDK `PlatformConfig` layout. */
+/**
+ * Byte offsets follow the Raydium SDK `PlatformConfig` layout (verified on a mainnet account:
+ * fee_rate 7500, creator_fee_rate 5000, platform_scale 1 000 000, cp_config = the CPMM config used
+ * by that platform's migrations).
+ */
 export function decodeLaunchLabPlatformConfig(data: Buffer): LaunchLabPlatformConfig {
   if (!data.subarray(0, 8).equals(PLATFORM_CONFIG_DISC)) throw new ProviderValidationError("account is not a LaunchLab PlatformConfig");
-  return { platformFeeWallet: pk(data, 16), feeRate: u64(data, 104), creatorFeeRate: u64(data, 720) };
+  const cpCreator = data.length >= 832 ? pk(data, 800) : null;
+  return {
+    platformFeeWallet: pk(data, 16),
+    platformLockNftWallet: pk(data, 48),
+    platformScale: u64(data, 80),
+    creatorScale: u64(data, 88),
+    burnScale: u64(data, 96),
+    feeRate: u64(data, 104),
+    cpConfig: pk(data, 688),
+    creatorFeeRate: u64(data, 720),
+    platformCpCreator: cpCreator && cpCreator !== "11111111111111111111111111111111" ? cpCreator : null,
+  };
 }
 
 export class RaydiumLaunchLabProvider implements LaunchProvider {
@@ -115,10 +149,14 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
   readonly programId = LAUNCHLAB_PROGRAM_ID;
   private readonly events = new AnchorEventDecoder(LAUNCHLAB_PROGRAM_ID, idl);
   private cached: PoolInfo | null = null;
+  private platform: LaunchLabPlatformConfig | null = null;
+  private poolState: LaunchLabPoolState | null = null;
+  /** Result of checking the declared creator LP scale (applies to migrated LP fees). */
+  lpCheck: { verification: AllocationVerification; problems: string[] } = { verification: "not_declared", problems: [] };
 
   constructor(
     private readonly rpc: ChainRpc | null,
-    private readonly opts: { poolAddress: string; tokenMint: string; role: FeeBeneficiaryRole; payoutMint?: string },
+    private readonly opts: { poolAddress: string; tokenMint: string; role: FeeBeneficiaryRole; payoutMint?: string; expected?: ExpectedAllocation },
   ) {
     if (opts.role === "partner") throw new ProviderValidationError('Raydium LaunchLab has no "partner" fee role (use creator or platform)');
   }
@@ -129,6 +167,28 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
     const cVault = creatorFeeVault(new PublicKey(pool.creator), quote).toBase58();
     const pVault = platformFeeVault(new PublicKey(pool.platformConfig), quote).toBase58();
     const creatorRole = this.opts.role === "creator";
+    this.platform = platform;
+    this.poolState = pool;
+    const beneficiary = creatorRole ? pool.creator : platform.platformFeeWallet;
+    const check = creatorRole ? verifyDeclared("creator_fee_rate", Number(platform.creatorFeeRate), this.opts.expected?.launchlabCreatorFeeRate) : { verification: "not_declared" as const, problems: [] };
+    const lpCheck = creatorRole ? verifyDeclared("creator_scale", platform.creatorScale === undefined ? null : Number(platform.creatorScale), this.opts.expected?.launchlabCreatorLpScale) : { verification: "not_declared" as const, problems: [] };
+    this.lpCheck = lpCheck;
+    const allocation: AllocationBasis = makeBasis({
+      provider: this.id,
+      pool: this.opts.poolAddress,
+      phase: "bonding_curve",
+      role: this.opts.role,
+      beneficiary,
+      params: creatorRole ? { creatorFeeRate: platform.creatorFeeRate.toString(), feeRateDenominator: "1000000", platformConfig: pool.platformConfig } : { platformFeeRate: platform.feeRate.toString(), feeRateDenominator: "1000000", platformConfig: pool.platformConfig },
+      source: `PlatformConfig ${pool.platformConfig}; per-trade TradeEvent.${creatorRole ? "creator_fee" : "platform_fee"}`,
+      verification: check.verification,
+      problems: check.problems,
+    });
+    const warnings: string[] = creatorRole && platform.creatorFeeRate === 0n ? ["this LaunchLab platform's creator_fee_rate is 0: the creator earns no bonding-curve fees"] : !creatorRole && platform.feeRate === 0n ? ["this LaunchLab platform's fee_rate is 0: the platform earns no bonding-curve fees"] : [];
+    for (const p of check.problems) warnings.push(`ALLOCATION MISMATCH: ${p}; bonding-curve fees are recorded but NOT eligible for payout`);
+    for (const p of lpCheck.problems) warnings.push(`ALLOCATION MISMATCH: ${p}; migrated LP fees will NOT be eligible for payout`);
+    if (creatorRole && check.verification === "not_declared") warnings.push("creator fee rate not declared (EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE); the on-chain value is used as read");
+    if (creatorRole) warnings.push("the creator fee vault is shared by every pool of this creator and quote mint: other pools' deposits are tracked and excluded, never attributed to this pool");
     this.cached = {
       provider: this.id,
       programId: this.programId,
@@ -140,12 +200,15 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
       ...mints,
       creator: pool.creator,
       feeBeneficiaryRole: this.opts.role,
-      beneficiary: creatorRole ? pool.creator : platform.platformFeeWallet,
+      beneficiary,
       status,
       feeParams: {
         platformFeeRate: platform.feeRate.toString(),
         creatorFeeRate: platform.creatorFeeRate.toString(),
         feeRateDenominator: "1000000",
+        ...(platform.creatorScale !== undefined ? { platformScale: platform.platformScale!.toString(), creatorScale: platform.creatorScale.toString(), burnScale: platform.burnScale!.toString(), scaleDenominator: "1000000" } : {}),
+        allocationVerification: allocation.verification,
+        migratedLpAllocationVerification: lpCheck.verification,
       },
       accounts: {
         globalConfig: pool.globalConfig,
@@ -159,9 +222,14 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
       // Claims touch the fee vault, not the pool, so both must be watched.
       watchAddresses: [this.opts.poolAddress, creatorRole ? cVault : pVault],
       slot,
-      warnings: creatorRole && platform.creatorFeeRate === 0n ? ["this LaunchLab platform's creator_fee_rate is 0: the creator earns no bonding-curve fees"] : !creatorRole && platform.feeRate === 0n ? ["this LaunchLab platform's fee_rate is 0: the platform earns no bonding-curve fees"] : [],
+      warnings,
+      allocation,
     };
     return this.cached;
+  }
+
+  platformConfigState(): LaunchLabPlatformConfig | null {
+    return this.platform;
   }
 
   async load(): Promise<PoolInfo> {
@@ -192,19 +260,54 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
 
   parseTransaction(tx: NormalizedTx): ParsedTransaction {
     const info = this.info();
-    const out: ParsedTransaction = { swaps: [], claims: [], anomalies: [] };
+    const out: ParsedTransaction = { swaps: [], claims: [], anomalies: [], attributions: [] };
     if (tx.err) return out;
     const events = this.events.decodeAll(tx);
     const tradeEventParents = new Set<number>();
+    const basis = info.allocation!;
+    const payable = basisPayable(basis);
+    const vault = info.accounts.feeVault!;
+    const creatorRole = info.feeBeneficiaryRole === "creator";
 
     for (const ev of events) {
       if (ev.name !== "TradeEvent") continue;
       const parent = ev.parent;
+      const evPool = toAddr(ev.data.pool_state ?? (ev.data as any).poolState);
+      if (evPool !== info.poolAddress) {
+        // Another pool's trade can deposit into the SAME creator/platform fee vault (shared PDA).
+        // Record the deposit so reconciliation can be exact, and exclude it from this pool.
+        if (parent) {
+          const inflow = subtreeTransfers(tx, parent).filter((t) => t.destination === vault).reduce((a, t) => a + t.amount, 0n);
+          if (inflow > 0n) {
+            out.attributions!.push({
+              key: `vault-inflow:${tx.signature}:${ev.ordinal}`,
+              kind: "shared_vault_inflow",
+              phase: "bonding_curve",
+              provider: this.id,
+              sourcePool: info.poolAddress,
+              destinationPool: null,
+              beneficiary: info.beneficiary,
+              feeMint: info.quoteMint,
+              grossAmount: inflow,
+              creatorAmount: 0n,
+              excludedAmount: inflow,
+              excludedReason: EXCLUSION.otherPoolSharedVault,
+              signature: tx.signature,
+              slot: tx.slot,
+              blockTime: tx.blockTime,
+              evidence: { vault, otherPool: evPool, instruction: parent.ordinal, event: "TradeEvent" },
+              status: "observed",
+              payoutEligible: false,
+              basisId: null,
+            });
+          }
+        }
+        continue;
+      }
       if (!parent) {
         out.anomalies.push("TradeEvent without a resolvable trade instruction");
         continue;
       }
-      if (toAddr(ev.data.pool_state ?? (ev.data as any).poolState) !== info.poolAddress) continue;
       tradeEventParents.add(parent.ordinal);
       const ixName = TRADE_IX.get(parent.data.subarray(0, 8).toString("hex"));
       if (!ixName) {
@@ -225,6 +328,15 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
       const amountIn = toBig(d.amount_in ?? d.amountIn);
       const amountOut = toBig(d.amount_out ?? d.amountOut);
       const { trader, source } = resolveTrader(tx, parent.accounts[0], info.tokenMint, side);
+      const totalFee = protocolFee + platformFee + creatorFee + shareFee;
+      const eligibleFee = creatorRole ? creatorFee : platformFee;
+      // Cross-check the event against the transfer into the beneficiary's vault, when the program
+      // moved it in this instruction (post fee-vault upgrade). A disagreement is never "resolved"
+      // by picking one: the trade is flagged and its fee is not payable.
+      const vaultIn = subtreeTransfers(tx, parent).filter((t) => t.destination === vault).reduce((a, t) => a + t.amount, 0n);
+      const consistent = vaultIn === 0n || vaultIn === eligibleFee;
+      if (!consistent) out.anomalies.push(`LaunchLab trade ${tx.signature.slice(0, 8)}…: ${creatorRole ? "creator" : "platform"}_fee ${eligibleFee} ≠ vault inflow ${vaultIn}`);
+      const ok = payable && consistent;
       out.swaps.push({
         signature: tx.signature,
         eventIndex: ev.ordinal,
@@ -233,30 +345,46 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
         traderSource: source,
         quoteAmount: side === "buy" ? amountIn : amountOut,
         baseAmount: side === "buy" ? amountOut : amountIn,
-        totalFee: protocolFee + platformFee + creatorFee + shareFee,
+        totalFee,
         totalFeeMint: info.quoteMint,
-        eligibleFee: info.feeBeneficiaryRole === "creator" ? creatorFee : platformFee,
+        eligibleFee,
         eligibleFeeMint: info.quoteMint,
         slot: tx.slot,
         blockTime: tx.blockTime,
+        feePhase: "bonding_curve",
+        excludedFee: totalFee - eligibleFee,
+        excludedReason: ok ? EXCLUSION.notBeneficiaryShare : !payable ? `${EXCLUSION.allocationMismatch}: ${basis.problems.join("; ")}` : "event_vault_transfer_mismatch",
+        feeStatus: ok ? "observed" : "unresolved",
+        payoutEligible: ok,
+        basisId: basis.id,
+        evidence: { event: "TradeEvent", instruction: parent.ordinal, field: creatorRole ? "creator_fee" : "platform_fee", vaultInflow: vaultIn.toString(), vault },
       } satisfies NormalizedSwap);
     }
 
-    // Trade instructions on our pool that produced no TradeEvent are anomalies.
     for (const ix of tx.instructions) {
       if (ix.programId !== LAUNCHLAB_PROGRAM_ID) continue;
       const disc = ix.data.subarray(0, 8);
       if (TRADE_IX.has(disc.toString("hex")) && ix.accounts[4] === info.poolAddress && !tradeEventParents.has(ix.ordinal)) {
         out.anomalies.push("LaunchLab trade instruction on pool without a TradeEvent");
       }
-      const vault = info.accounts.feeVault!;
-      if (info.feeBeneficiaryRole === "creator" && disc.equals(CLAIM_CREATOR_IX) && ix.accounts[2] === vault) {
-        const claimed = -tokenAccountDelta(tx, vault);
-        if (claimed > 0n) out.claims.push({ signature: tx.signature, claimer: ix.accounts[0]!, quoteAmount: claimed, baseAmount: 0n, slot: tx.slot, blockTime: tx.blockTime });
-      }
-      if (info.feeBeneficiaryRole === "platform" && disc.equals(CLAIM_PLATFORM_VAULT_IX) && ix.accounts[3] === vault) {
-        const claimed = -tokenAccountDelta(tx, vault);
-        if (claimed > 0n) out.claims.push({ signature: tx.signature, claimer: ix.accounts[0]!, quoteAmount: claimed, baseAmount: 0n, slot: tx.slot, blockTime: tx.blockTime });
+      // Claims: the amount is what THIS claim instruction moved out of the vault — not the vault's
+      // net change over the whole transaction (which a trade or another claim could distort).
+      const isCreatorClaim = creatorRole && disc.equals(CLAIM_CREATOR_IX) && ix.accounts[2] === vault;
+      const isPlatformClaim = !creatorRole && disc.equals(CLAIM_PLATFORM_VAULT_IX) && ix.accounts[3] === vault;
+      if (isCreatorClaim || isPlatformClaim) {
+        const outflows = subtreeTransfers(tx, ix).filter((t) => t.source === vault);
+        const claimed = outflows.reduce((a, t) => a + t.amount, 0n);
+        if (claimed > 0n) {
+          out.claims.push({
+            signature: tx.signature,
+            claimer: ix.accounts[0]!,
+            quoteAmount: claimed,
+            baseAmount: 0n,
+            slot: tx.slot,
+            blockTime: tx.blockTime,
+            evidence: { instruction: ix.ordinal, vault, transfers: outflows.map((t) => `${t.ordinal}:${t.destination}:${t.amount}`).join(",") },
+          });
+        }
       }
     }
     return out;

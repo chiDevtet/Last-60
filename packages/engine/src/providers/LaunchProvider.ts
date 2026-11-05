@@ -9,6 +9,7 @@
  */
 import type { PublicKey, TransactionInstruction } from "@solana/web3.js";
 import type { NormalizedTx } from "../chain/tx";
+import type { AllocationBasis, FeeEvidenceStatus, FeePhase, NormalizedAttribution } from "../accounting/attribution";
 
 export type ProviderId = "meteora_dbc" | "raydium_launchlab" | "mock";
 export type FeeBeneficiaryRole = "creator" | "partner" | "platform";
@@ -39,6 +40,20 @@ export interface PoolInfo {
   slot: number;
   /** Configuration facts operators must see (e.g. the configured role earns 0% on this config). */
   warnings?: string[];
+  /**
+   * Basis of the beneficiary's bonding-curve allocation: the on-chain parameters it was derived from
+   * and the result of checking them against the operator-declared expectation.
+   */
+  allocation?: AllocationBasis;
+  /**
+   * Pools whose activity belongs to this launch's reward periods: the bonding pool and, once a
+   * migration has been VERIFIED, the destination pool. Defaults to [poolAddress].
+   */
+  accountingPools?: string[];
+  /** Verified graduation destination, when attached. */
+  destination?: { kind: string; program: string; pool: string; migrationSlot: number; migrationSignature: string; supported: boolean; allocation?: AllocationBasis } | null;
+  /** Per watch address: never index below this slot (destination pools start at the migration slot). */
+  watchFromSlot?: Record<string, number>;
 }
 
 export interface NormalizedSwap {
@@ -60,6 +75,21 @@ export interface NormalizedSwap {
   eligibleFeeMint: string;
   slot: number;
   blockTime: number | null;
+  /** Pool the trade happened on (defaults to the provider's pool; differs for destination pools). */
+  pool?: string;
+  feePhase?: FeePhase;
+  /** totalFee − eligibleFee (protocol / partner / platform / LP shares), with the reason. */
+  excludedFee?: bigint;
+  excludedReason?: string | null;
+  feeStatus?: FeeEvidenceStatus;
+  /** False when the allocation is unproven or contradicts the declared configuration. */
+  payoutEligible?: boolean;
+  /** Basis snapshot id the eligible fee was computed on. */
+  basisId?: string | null;
+  /** Event / instruction that established the allocation. */
+  evidence?: Record<string, string | number | boolean | null>;
+  /** Creator fee accrued but finalised later (e.g. CPMM share rate at collection): informational only. */
+  estimatedCreatorFee?: bigint | null;
 }
 
 export interface NormalizedFeeClaim {
@@ -69,6 +99,12 @@ export interface NormalizedFeeClaim {
   baseAmount: bigint;
   slot: number;
   blockTime: number | null;
+  /** Pool the claim belongs to (defaults to the provider's pool). */
+  pool?: string;
+  /** Distinguishes several claims in one transaction (instruction ordinal); default 0. */
+  index?: number;
+  /** How the amount was established (event, instruction-scoped transfers...). */
+  evidence?: Record<string, string | number | boolean | null>;
 }
 
 export interface ParsedTransaction {
@@ -76,6 +112,8 @@ export interface ParsedTransaction {
   claims: NormalizedFeeClaim[];
   /** Things that touched the pool but could not be interpreted (alerted, never counted). */
   anomalies: string[];
+  /** Non-swap fee records (collections, shared-vault inflows of other pools, exclusions). */
+  attributions?: NormalizedAttribution[];
 }
 
 export interface FeeSourceState {
@@ -111,6 +149,18 @@ export interface LaunchProvider {
    * (unwrapping WSOL when the payout asset is native SOL).
    */
   buildClaimInstructions(claimer: PublicKey, destination: PublicKey): Promise<ClaimPlan>;
+  /**
+   * Checkpoint-based attributions due at a snapshot (e.g. DAMM v2 LP position fee growth). Reads
+   * on-chain state with `minContextSlot = snapshotSlot` and returns records whose accounting slot is
+   * `snapshotSlot`. Optional; providers without checkpointed entitlements omit it.
+   */
+  checkpoint?(snapshotSlot: number, previous: (key: string) => Promise<CheckpointState | null>): Promise<NormalizedAttribution[]>;
+}
+
+/** Cumulative entitlement counter remembered between checkpoints (per position and mint). */
+export interface CheckpointState {
+  cumulative: bigint;
+  slot: number;
 }
 
 export class ProviderValidationError extends Error {

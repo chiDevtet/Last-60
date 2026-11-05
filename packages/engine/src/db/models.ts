@@ -2,7 +2,8 @@
  * MongoDB schema. Every collection that participates in money movement has a uniqueness
  * constraint that makes double-processing structurally impossible:
  *   swaps            (signature, eventIndex)
- *   fee_claims       (signature)
+ *   fee_claims       (signature, index)
+ *   fee_attributions (key)  — non-swap fee facts (LP checkpoints, collections, exclusions)
  *   rounds           (roundNumber), (roundIndex)
  *   payouts          (roundNumber, recipient), confirmedSignature
  *   ledger_entries   (key)  — idempotency key per economic fact
@@ -86,14 +87,40 @@ const swapSchema = new Schema(
     quoteAmount: { type: D, required: true },
     baseAmount: { type: D, required: true },
     totalFee: { type: D, required: true },
+    /** Creator-allocated (beneficiary) share of `totalFee`, computed with the program's own formula. */
     eligibleFee: { type: D, required: true },
     eligibleFeeMint: { type: String, required: true },
+    // ── attribution provenance (see accounting/attribution.ts) ──
+    feePhase: { type: String, enum: ["bonding_curve", "post_migration_trading", "migrated_lp"], default: "bonding_curve" },
+    /** totalFee − eligibleFee: shares that belong to someone else (protocol, partner, platform, LPs). */
+    excludedFee: { type: D, default: null },
+    excludedReason: { type: String, default: null },
+    feeStatus: { type: String, enum: ["estimated", "observed", "collected", "reconciled", "confirmed", "unresolved"], default: "observed" },
+    /** False: recorded but never distributed (unproven or mismatching allocation). Legacy rows lack it (= eligible). */
+    payoutEligible: { type: Boolean, default: true },
+    /** Allocation basis that applied when this fee was generated (immutable once written). */
+    basisId: { type: String, default: null },
+    basis: { type: Schema.Types.Mixed, default: null },
+    beneficiary: { type: String, default: null },
+    /** Bonding pool of the launch (equals `pool` for bonding-curve trades). */
+    sourcePool: { type: String, default: null },
+    evidence: { type: Schema.Types.Mixed, default: null },
+    /** Informational: creator fee accrued but finalised at collection (e.g. CPMM share rate). Never summed. */
+    estimatedCreatorFee: { type: D, default: null },
     slot: { type: Number, required: true },
-    /** Monotone ordering key inside a slot: transaction position (when known) * 1000 + event index. */
+    /**
+     * Ordering key inside a slot: the EVENT INDEX inside its transaction. It is NOT the transaction's
+     * position in the block and gives no ordering guarantee between different transactions of the
+     * same slot; selection breaks cross-transaction ties within a slot with the block's own order
+     * (getBlock), and `txIndex` holds the block position when it has been resolved.
+     */
     orderInSlot: { type: Number, required: true, default: 0 },
+    txIndex: { type: Number, default: null },
     blockTime: { type: Date, default: null },
     commitment: { type: String, enum: ["confirmed", "finalized"], required: true },
     status: { type: String, enum: ["active", "dropped"], default: "active" },
+    /** First time a finality pass saw the signature unknown to a node past the finalized slot. */
+    dropCandidateAt: { type: Date, default: null },
     roundNumber: { type: Number, default: null },
     source: { type: String, enum: ["indexer", "catchup", "backfill"], required: true },
     ingestedAt: { type: Date, default: Date.now },
@@ -105,11 +132,15 @@ swapSchema.index({ pool: 1, side: 1, status: 1, slot: -1, orderInSlot: -1 });
 swapSchema.index({ pool: 1, status: 1, slot: 1 });
 swapSchema.index({ trader: 1, slot: -1 });
 swapSchema.index({ commitment: 1, status: 1, slot: 1 });
+swapSchema.index({ pool: 1, basisId: 1 });
 
 // ─── fee claims ─────────────────────────────────────────────────────────────────
 const feeClaimSchema = new Schema(
   {
-    signature: { type: String, required: true, unique: true },
+    signature: { type: String, required: true },
+    /** Instruction ordinal of the claim inside its transaction (several claims per tx are possible). */
+    index: { type: Number, default: 0 },
+    evidence: { type: Schema.Types.Mixed, default: null },
     provider: String,
     pool: String,
     role: String,
@@ -127,7 +158,47 @@ const feeClaimSchema = new Schema(
   },
   { collection: "fee_claims", versionKey: false },
 );
+feeClaimSchema.index({ signature: 1, index: 1 }, { unique: true });
 feeClaimSchema.index({ pool: 1, slot: 1 });
+
+// ─── fee attributions (non-swap fee facts) ─────────────────────────────────────
+export const FEE_PHASES = ["bonding_curve", "post_migration_trading", "migrated_lp"] as const;
+export const FEE_STATUSES = ["estimated", "observed", "collected", "reconciled", "confirmed", "unresolved"] as const;
+const feeAttributionSchema = new Schema(
+  {
+    key: { type: String, required: true, unique: true },
+    kind: { type: String, required: true },
+    chain: { type: String, default: "solana" },
+    provider: { type: String, required: true },
+    phase: { type: String, enum: FEE_PHASES, required: true },
+    sourcePool: { type: String, required: true },
+    destinationPool: { type: String, default: null },
+    /** Pool this record is accounted under (destination pool for post-migration records). */
+    pool: { type: String, required: true },
+    beneficiary: { type: String, required: true },
+    feeMint: { type: String, required: true },
+    grossAmount: { type: D, default: null },
+    creatorAmount: { type: D, required: true },
+    excludedAmount: { type: D, required: true },
+    excludedReason: { type: String, default: null },
+    signature: { type: String, default: null },
+    slot: { type: Number, required: true },
+    observedSlot: { type: Number, default: null },
+    blockTime: { type: Date, default: null },
+    evidence: { type: Schema.Types.Mixed, default: null },
+    status: { type: String, enum: FEE_STATUSES, required: true },
+    payoutEligible: { type: Boolean, required: true },
+    basisId: { type: String, default: null },
+    /** Cumulative counter value for checkpoint records (position fee growth), as a decimal string. */
+    cumulative: { type: String, default: null },
+    checkpointKey: { type: String, default: null },
+    roundNumber: { type: Number, default: null },
+    createdAt: { type: Date, default: Date.now },
+  },
+  { collection: "fee_attributions", versionKey: false },
+);
+feeAttributionSchema.index({ pool: 1, slot: 1 });
+feeAttributionSchema.index({ checkpointKey: 1, slot: -1 });
 
 // ─── unique buyer activity ──────────────────────────────────────────────────────
 const buyerActivitySchema = new Schema(
@@ -179,6 +250,7 @@ const roundSchema = new Schema(
       provider: String,
       pool: String,
       previousPool: { type: String, default: null }, // set when the pool/provider changed during the period
+      pools: { type: [String], default: undefined }, // every pool whose activity the period covered
       tokenMint: String,
       skippedRoundPolicy: String,
       minPayoutLamports: D,
@@ -186,6 +258,10 @@ const roundSchema = new Schema(
     },
     fees: { type: D, default: null },
     nonPayoutAssetFees: [{ _id: false, mint: String, amount: D }],
+    /** Fees in the period that were recorded but are not payout-eligible (unresolved / mismatching basis). */
+    ineligibleFees: [{ _id: false, mint: String, amount: D, reason: String }],
+    /** Per-phase breakdown of the distributed fees (bonding curve / post-migration / migrated LP). */
+    feeBreakdown: { type: Schema.Types.Mixed, default: null },
     reward: { type: D, default: null },
     retained: { type: D, default: null },
     rolloverIn: { type: D, default: null },
@@ -255,6 +331,12 @@ const payoutSchema = new Schema(
     confirmedSignature: { type: String, default: null },
     confirmedSlot: { type: Number, default: null },
     confirmedAt: { type: Date, default: null },
+    /**
+     * True once the PAYOUT_CONFIRMED / PAYOUT_FAILED ledger entry and buyer statistics were written
+     * in the same MongoDB transaction as the state change. Rows without it are repaired by the
+     * reconciler (idempotent).
+     */
+    ledgerApplied: { type: Boolean, default: false },
     lock: { type: lockSchema, default: null },
     nextAttemptAt: { type: Date, default: () => new Date(0) },
     lastError: { type: String, default: null },
@@ -266,6 +348,7 @@ payoutSchema.index({ state: 1, nextAttemptAt: 1 });
 payoutSchema.index({ "current.signature": 1 }, { sparse: true });
 payoutSchema.index({ confirmedSignature: 1 }, { unique: true, partialFilterExpression: { confirmedSignature: { $type: "string" } } });
 payoutSchema.index({ recipient: 1, roundNumber: -1 });
+payoutSchema.index({ state: 1, ledgerApplied: 1 });
 
 // ─── ledger ─────────────────────────────────────────────────────────────────────
 export const LEDGER_TYPES = [
@@ -282,6 +365,7 @@ export const LEDGER_TYPES = [
   "PAYOUT_FAILED",
   "PAYOUT_REQUEUED",
   "FEE_CLAIMED",
+  "FEE_EXCLUDED", // fees recorded in a round's period but not allocated / not provable (never paid)
 ] as const;
 export type LedgerType = (typeof LEDGER_TYPES)[number];
 
@@ -371,6 +455,7 @@ export const schemas = {
   Pool: poolSchema,
   Swap: swapSchema,
   FeeClaim: feeClaimSchema,
+  FeeAttribution: feeAttributionSchema,
   BuyerActivity: buyerActivitySchema,
   Round: roundSchema,
   Payout: payoutSchema,

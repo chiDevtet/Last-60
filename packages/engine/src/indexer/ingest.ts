@@ -8,6 +8,7 @@ import type { Models } from "../db/models";
 import { dec } from "../db/decimal";
 import { normalizeTransaction } from "../chain/tx";
 import type { LaunchProvider } from "../providers/LaunchProvider";
+import type { NormalizedAttribution } from "../accounting/attribution";
 import type { TerminalWriter } from "../terminal/terminal";
 import { rootLogger, type Logger } from "../util/logger";
 
@@ -24,7 +25,62 @@ export interface IngestResult {
   swaps: number;
   newSwaps: number;
   newClaims: number;
+  newAttributions?: number;
   anomalies: string[];
+}
+
+/** Snapshot of the allocation basis stored with each fee record (bounded, no secrets). */
+function basisSnapshot(info: ReturnType<LaunchProvider["info"]>, s: { feePhase?: string; basisId?: string | null }) {
+  const b = s.feePhase && s.feePhase !== "bonding_curve" ? info.destination?.allocation : info.allocation;
+  if (!b) return { role: info.feeBeneficiaryRole, beneficiary: info.beneficiary, params: info.feeParams };
+  return { id: b.id, phase: b.phase, role: b.role, beneficiary: b.beneficiary, params: b.params, source: b.source, verification: b.verification };
+}
+
+/**
+ * Idempotently persist non-swap fee records (keyed). Existing records are never rewritten: the
+ * first observation wins, so re-processing cannot double count or reinterpret history.
+ */
+export async function persistAttributions(db: Models, records: NormalizedAttribution[], extra: Record<string, unknown> = {}): Promise<number> {
+  if (!records.length) return 0;
+  const res = await db.FeeAttribution.bulkWrite(
+    records.map((a) => ({
+      updateOne: {
+        filter: { key: a.key },
+        update: {
+          $setOnInsert: {
+            key: a.key,
+            kind: a.kind,
+            provider: a.provider,
+            phase: a.phase,
+            sourcePool: a.sourcePool,
+            destinationPool: a.destinationPool,
+            pool: a.destinationPool ?? a.sourcePool,
+            beneficiary: a.beneficiary,
+            feeMint: a.feeMint,
+            grossAmount: a.grossAmount === null ? null : dec(a.grossAmount),
+            creatorAmount: dec(a.creatorAmount),
+            excludedAmount: dec(a.excludedAmount),
+            excludedReason: a.excludedReason,
+            signature: a.signature,
+            slot: a.slot,
+            observedSlot: a.observedSlot ?? null,
+            blockTime: a.blockTime ? new Date(a.blockTime * 1000) : null,
+            evidence: a.evidence,
+            status: a.status,
+            payoutEligible: a.payoutEligible,
+            basisId: a.basisId,
+            cumulative: (a.evidence?.cumulative as string | undefined) ?? null,
+            checkpointKey: (a.evidence?.checkpointKey as string | undefined) ?? null,
+            createdAt: new Date(),
+            ...extra,
+          },
+        },
+        upsert: true,
+      },
+    })),
+    { ordered: false },
+  );
+  return res.upsertedCount ?? 0;
 }
 
 export async function ingestRawTransaction(ctx: IngestContext, raw: any, opts: { source: "indexer" | "catchup" | "backfill"; commitment: "confirmed" | "finalized" }): Promise<IngestResult> {
@@ -47,7 +103,8 @@ export async function ingestRawTransaction(ctx: IngestContext, raw: any, opts: {
             signature: s.signature,
             eventIndex: s.eventIndex,
             provider: info.provider,
-            pool: info.poolAddress,
+            pool: s.pool ?? info.poolAddress,
+            sourcePool: info.poolAddress,
             tokenMint: info.tokenMint,
             quoteMint: info.quoteMint,
             side: s.side,
@@ -58,8 +115,20 @@ export async function ingestRawTransaction(ctx: IngestContext, raw: any, opts: {
             totalFee: dec(s.totalFee),
             eligibleFee: dec(s.eligibleFee),
             eligibleFeeMint: s.eligibleFeeMint,
+            // Attribution provenance. Written once ($setOnInsert): a later configuration change can
+            // never reinterpret a historical record.
+            feePhase: s.feePhase ?? "bonding_curve",
+            excludedFee: dec(s.excludedFee ?? s.totalFee - s.eligibleFee),
+            excludedReason: s.excludedReason ?? null,
+            feeStatus: s.feeStatus ?? "observed",
+            payoutEligible: s.payoutEligible ?? true,
+            basisId: s.basisId ?? info.allocation?.id ?? null,
+            basis: basisSnapshot(info, s),
+            beneficiary: info.beneficiary,
+            evidence: s.evidence ?? null,
+            estimatedCreatorFee: s.estimatedCreatorFee != null ? dec(s.estimatedCreatorFee) : null,
             slot: s.slot,
-            orderInSlot: s.eventIndex,
+            orderInSlot: s.eventIndex, // event index inside the transaction (NOT the block position)
             blockTime,
             commitment: opts.commitment,
             status: "active",
@@ -95,14 +164,19 @@ export async function ingestRawTransaction(ctx: IngestContext, raw: any, opts: {
     }
   }
 
-  for (const c of parsed.claims) {
+  for (let i = 0; i < parsed.claims.length; i++) {
+    const c = parsed.claims[i]!;
+    // Claims are keyed by (signature, position among the transaction's claims): one transaction can
+    // carry several claims (e.g. two LP positions), and a single-claim transaction keeps index 0.
     const r = await ctx.db.FeeClaim.updateOne(
-      { signature: c.signature },
+      { signature: c.signature, index: i },
       {
         $setOnInsert: {
           signature: c.signature,
+          index: i,
+          evidence: c.evidence ?? null,
           provider: info.provider,
-          pool: info.poolAddress,
+          pool: c.pool ?? info.poolAddress,
           role: info.feeBeneficiaryRole,
           claimer: c.claimer,
           quoteMint: info.quoteMint,
@@ -121,13 +195,14 @@ export async function ingestRawTransaction(ctx: IngestContext, raw: any, opts: {
     // the transaction landed. The chain is authoritative: an observed claim is confirmed. (Left
     // "failed", its amount would be missing from reconciliation and trip a false over-attribution
     // halt.)
-    if (!r.upsertedCount) await ctx.db.FeeClaim.updateOne({ signature: c.signature, status: { $ne: "confirmed" } }, { $set: { status: "confirmed", quoteAmount: dec(c.quoteAmount), baseAmount: dec(c.baseAmount), slot: c.slot, blockTime: c.blockTime ? new Date(c.blockTime * 1000) : null }, $unset: { error: 1 } });
-    await ctx.db.LedgerEntry.updateOne(
-      { key: `FEE_CLAIMED:${c.signature}` },
-      { $setOnInsert: { key: `FEE_CLAIMED:${c.signature}`, type: "FEE_CLAIMED", amount: dec(c.quoteAmount), mint: info.quoteMint, signature: c.signature, memo: `claimed by ${c.claimer}` } },
-      { upsert: true },
-    );
+    if (!r.upsertedCount) await ctx.db.FeeClaim.updateOne({ signature: c.signature, index: i, status: { $ne: "confirmed" } }, { $set: { status: "confirmed", quoteAmount: dec(c.quoteAmount), baseAmount: dec(c.baseAmount), slot: c.slot, blockTime: c.blockTime ? new Date(c.blockTime * 1000) : null }, $unset: { error: 1 } });
+    const lk = i === 0 ? `FEE_CLAIMED:${c.signature}` : `FEE_CLAIMED:${c.signature}:${i}`;
+    await ctx.db.LedgerEntry.updateOne({ key: lk }, { $setOnInsert: { key: lk, type: "FEE_CLAIMED", amount: dec(c.quoteAmount), mint: info.quoteMint, signature: c.signature, memo: `claimed by ${c.claimer}${c.pool && c.pool !== info.poolAddress ? ` (pool ${c.pool})` : ""}` } }, { upsert: true });
     if (r.upsertedCount) result.newClaims++;
+  }
+
+  if (parsed.attributions?.length) {
+    result.newAttributions = await persistAttributions(ctx.db, parsed.attributions);
   }
 
   if (parsed.anomalies.length) {

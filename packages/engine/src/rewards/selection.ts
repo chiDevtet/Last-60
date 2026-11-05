@@ -95,16 +95,79 @@ export async function selectRecipients(db: Models, rpc: ChainRpc | null, p: Sele
   };
 }
 
-/** Σ eligible fees in the period, split into the payout asset and everything else. */
-export async function periodFees(db: Models, p: Pick<SelectionParams, "pool" | "afterSlot" | "periodStartAt" | "snapshotSlot">, payoutMint: string) {
-  const rows: any[] = await db.Swap.aggregate([{ $match: periodMatch(p) }, { $group: { _id: "$eligibleFeeMint", total: { $sum: "$eligibleFee" }, n: { $sum: 1 } } }]);
+/** Match for `fee_attributions` records of a period (checkpoints may have no block time). */
+export function attributionPeriodMatch(p: Pick<SelectionParams, "pool" | "afterSlot" | "periodStartAt" | "snapshotSlot">): Record<string, unknown> {
+  const slot: Record<string, number> = { $lte: p.snapshotSlot };
+  if (p.afterSlot !== null) slot.$gt = p.afterSlot;
+  const m: Record<string, unknown> = { pool: Array.isArray(p.pool) ? { $in: p.pool } : p.pool, slot };
+  if (p.afterSlot === null && p.periodStartAt) m.$or = [{ blockTime: { $gte: p.periodStartAt } }, { blockTime: null }];
+  return m;
+}
+
+export interface PeriodFees {
+  /** Payout-eligible creator-allocated fees in the payout asset. */
+  payout: bigint;
+  /** Payout-eligible creator-allocated fees in other assets (recorded, never converted). */
+  other: { mint: string; amount: bigint }[];
+  /** Creator-allocated amounts that are NOT payout-eligible (unproven / mismatching basis), by mint and reason. */
+  ineligible: { mint: string; amount: bigint; reason: string }[];
+  /** Payout-asset eligible fees per phase. */
+  byPhase: Record<string, string>;
+  swaps: number;
+  attributions: number;
+}
+
+/**
+ * Σ creator-allocated fees in the period. Only records that are payout-eligible count towards the
+ * distributable amount; gross pool fees are never used (only `eligibleFee` / `creatorAmount`).
+ * Legacy swap rows written before attribution fields existed have no `payoutEligible` and count as
+ * eligible (they were attributed with the same program formula).
+ */
+export async function periodFees(db: Models, p: Pick<SelectionParams, "pool" | "afterSlot" | "periodStartAt" | "snapshotSlot">, payoutMint: string): Promise<PeriodFees> {
+  const [swapRows, attrRows]: [any[], any[]] = await Promise.all([
+    db.Swap.aggregate([
+      { $match: periodMatch(p) },
+      { $group: { _id: { mint: "$eligibleFeeMint", eligible: { $ne: ["$payoutEligible", false] }, phase: { $ifNull: ["$feePhase", "bonding_curve"] }, reason: { $cond: [{ $eq: ["$payoutEligible", false] }, "$excludedReason", null] } }, total: { $sum: "$eligibleFee" }, n: { $sum: 1 } } },
+    ]),
+    db.FeeAttribution.aggregate([
+      { $match: attributionPeriodMatch(p) },
+      { $group: { _id: { mint: "$feeMint", eligible: "$payoutEligible", phase: "$phase", reason: { $cond: ["$payoutEligible", null, "$excludedReason"] } }, total: { $sum: "$creatorAmount" }, n: { $sum: 1 } } },
+    ]),
+  ]);
   let payout = 0n;
-  const other: { mint: string; amount: bigint }[] = [];
+  const other = new Map<string, bigint>();
+  const ineligible = new Map<string, { mint: string; amount: bigint; reason: string }>();
+  const byPhase: Record<string, bigint> = {};
   let swaps = 0;
-  for (const r of rows) {
+  let attributions = 0;
+  const add = (r: any) => {
+    const amount = big(r.total);
+    if (amount <= 0n) return;
+    const { mint, eligible, phase, reason } = r._id;
+    if (!eligible) {
+      const k = `${mint}|${reason ?? "unresolved"}`;
+      const cur = ineligible.get(k) ?? { mint, amount: 0n, reason: reason ?? "unresolved" };
+      cur.amount += amount;
+      ineligible.set(k, cur);
+    } else if (mint === payoutMint) {
+      payout += amount;
+      byPhase[phase] = (byPhase[phase] ?? 0n) + amount;
+    } else other.set(mint, (other.get(mint) ?? 0n) + amount);
+  };
+  for (const r of swapRows) {
     swaps += r.n;
-    if (r._id === payoutMint) payout += big(r.total);
-    else if (big(r.total) > 0n) other.push({ mint: r._id, amount: big(r.total) });
+    add(r);
   }
-  return { payout, other, swaps };
+  for (const r of attrRows) {
+    attributions += r.n;
+    add(r);
+  }
+  return {
+    payout,
+    other: [...other].map(([mint, amount]) => ({ mint, amount })),
+    ineligible: [...ineligible.values()],
+    byPhase: Object.fromEntries(Object.entries(byPhase).map(([k, v]) => [k, v.toString()])),
+    swaps,
+    attributions,
+  };
 }
