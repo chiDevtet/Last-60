@@ -7,7 +7,7 @@ import type { AppConfig } from "../config/env";
 import type { EffectiveSettings, SettingsStore } from "../config/runtime";
 import { RpcClient, type ChainRpc } from "../chain/rpc";
 import type { Models } from "../db/models";
-import { attachStoredMigration, createProvider, type LaunchProvider } from "../providers";
+import { attachStoredMigration, createProvider, providerTargetFor, type LaunchProvider } from "../providers";
 import { basesOf, roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
@@ -85,7 +85,7 @@ export class RewardsWorker {
       return this.provider;
     }
     if (this.rpc instanceof RpcClient) this.rpc.setUrls(s.rpcUrls);
-    const p = createProvider({ id: s.launchProvider, poolAddress: s.poolAddress, tokenMint: s.tokenMint, role: s.feeBeneficiaryRole, payoutMint: s.payoutAssetMint, expected: this.d.cfg.provider.expected }, this.rpc);
+    const p = createProvider(providerTargetFor(s, this.d.cfg), this.rpc);
     await p.load();
     await attachStoredMigration(this.d.db, p);
     const info = p.info();

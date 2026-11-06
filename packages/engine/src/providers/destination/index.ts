@@ -5,6 +5,7 @@
  */
 import type { ChainRpc } from "../../chain/rpc";
 import { makeBasis, type AllocationBasis, type AllocationVerification } from "../../accounting/attribution";
+import { classifyLaunchLabLocks, launchLabLpVerification } from "../../accounting/launchlabPlatform";
 import type { PoolInfo } from "../LaunchProvider";
 import { migrationVerified, type VerifiedMigration } from "../migration";
 import { CpmmDestination, type CpmmPoolFacts } from "./cpmm";
@@ -31,7 +32,15 @@ export interface DestinationSpec {
  * enter accounting). `lpCheck` is the result of comparing the declared creator LP allocation with
  * the source config (DBC LP percentages / LaunchLab creator_scale).
  */
-export function destinationSpec(info: PoolInfo, v: VerifiedMigration, lpCheck: { verification: AllocationVerification; problems: string[] }, sourceFacts: { creatorScale?: string | null } = {}): DestinationSpec | null {
+export interface LaunchLabSourceFacts {
+  /** PlatformConfig creator_scale / platform_scale (millionths of migrated LP), as decimal strings. */
+  creatorScale?: string | null;
+  platformScale?: string | null;
+  /** PlatformConfig platform_nft_wallet: the owner of the platform Fee Key. */
+  platformNftWallet?: string | null;
+}
+
+export function destinationSpec(info: PoolInfo, v: VerifiedMigration, lpCheck: { verification: AllocationVerification; problems: string[] }, sourceFacts: LaunchLabSourceFacts = {}): DestinationSpec | null {
   if (!migrationVerified(v) || info.provider === "mock") return null;
   const ctx: DestinationContext = {
     sourceProvider: info.provider,
@@ -63,7 +72,6 @@ export function destinationSpec(info: PoolInfo, v: VerifiedMigration, lpCheck: {
     return { kind: v.kind, pool: v.destinationPool, program: v.destinationProgram, ctx, allocation, dammV2: { tokenAMint: v.tokenAMint!, tokenBMint: v.tokenBMint!, positions: v.positionStates.map((p) => ({ position: p.position, nftMint: p.nftMint, nftAccount: p.nftAccount })) } };
   }
   if (v.kind === "launchlab_cpmm") {
-    const beneficiaryLocks = v.locks.filter((l) => l.nftOwnerAtMigration === info.beneficiary).map((l) => ({ lockPda: l.lockPda, nftMint: l.nftMint }));
     const creatorFeeIsBeneficiary = v.cpmmPoolCreator === info.beneficiary && v.cpmmEnableCreatorFee === true;
     const allocation = makeBasis({
       ...common,
@@ -74,34 +82,28 @@ export function destinationSpec(info: PoolInfo, v: VerifiedMigration, lpCheck: {
       // the LaunchLab creator allocation. It is "verified" only when (a) the pool facts prove the
       // beneficiary is the CPMM pool_creator with the creator fee enabled AND (b) the bonding-curve
       // allocation itself was verified against the declaration. Otherwise it is never distributable.
+      // It is independent of the locked-LP basis below (a different program, rate and claim path).
       verification: !creatorFeeIsBeneficiary ? "unverifiable" : (info.allocation?.verification ?? "not_declared"),
       problems: !creatorFeeIsBeneficiary ? [`CPMM pool_creator ${v.cpmmPoolCreator ?? "?"} is not the beneficiary ${info.beneficiary} or the creator fee is disabled`] : [...(info.allocation?.problems ?? [])],
     });
-    // The lock set must agree with the platform's creator_scale: a positive scale without a lock
-    // minted to the creator (or the reverse) is not provable → unverifiable, never paid.
-    const scale = sourceFacts.creatorScale ? BigInt(sourceFacts.creatorScale) : null;
-    const lpProblems = [...lpCheck.problems];
-    let lpVerification = lpCheck.verification;
-    // Since the 2026-08-17 LaunchLab upgrade, migrations fold creator_scale into ONE platform-owned
-    // Fee Key (Raydium docs: products/launchlab/creator-fees) — a positive creator_scale no longer
-    // implies a creator lock. The lock records of the migration transaction are the evidence.
-    if (scale !== null && info.feeBeneficiaryRole === "creator" && (scale > 0n) !== beneficiaryLocks.length > 0) {
-      lpVerification = lpVerification === "verified" ? "mismatch" : "unverifiable";
-      lpProblems.push(
-        scale > 0n
-          ? `creator_scale is ${scale} but no LP lock (Fee Key) was minted to the creator by migration tx ${v.signature} — consistent with the 2026-08-17 LaunchLab upgrade, which assigns creator_scale to the platform's Fee Key; the creator has no migrated-LP entitlement here`
-          : `creator_scale is 0 but ${beneficiaryLocks.length} LP lock(s) were minted to the creator at migration`,
-      );
-    }
+    // Locked-LP entitlement: decided by the lock records of THIS migration transaction, never by
+    // creator_scale. Since the 2026-08-17 LaunchLab upgrade the program mints ONE platform Fee Key
+    // (platform_scale + creator_scale) to platform_nft_wallet; a creator Fee Key exists only for a
+    // pre-upgrade migration whose locks prove it (see classifyLaunchLabLocks).
+    const big = (x: string | null | undefined) => (x === null || x === undefined || !/^\d+$/.test(x) ? null : BigInt(x));
+    const creatorRole = info.feeBeneficiaryRole === "creator";
+    const cls = classifyLaunchLabLocks({ locks: v.locks, beneficiary: info.beneficiary, platformNftWallet: sourceFacts.platformNftWallet, platformScale: big(sourceFacts.platformScale), creatorScale: big(sourceFacts.creatorScale), migrationSlot: v.slot });
+    const lp = creatorRole ? launchLabLpVerification(cls, lpCheck) : { verification: "not_declared" as AllocationVerification, problems: [] as string[] };
+    const beneficiaryLocks = creatorRole ? cls.creatorLocks : v.locks.filter((l) => l.nftOwnerAtMigration === info.beneficiary).map((l) => ({ lockPda: l.lockPda, nftMint: l.nftMint }));
     const lpAllocation = makeBasis({
       ...common,
       phase: "migrated_lp",
       params: { creatorScale: sourceFacts.creatorScale ?? "unknown", locks: v.locks.map((l) => `${l.lockPda}:${l.nftOwnerAtMigration}:${l.lpAmount}`).join(","), beneficiaryLocks: beneficiaryLocks.map((l) => l.lockPda).join(",") },
-      source: `LP-lock accounts created by migration tx ${v.signature}; PlatformConfig creator_scale`,
-      verification: lpVerification,
-      problems: lpProblems,
+      source: `LP-lock accounts created by migration tx ${v.signature}; PlatformConfig platform_nft_wallet / platform_scale / creator_scale`,
+      verification: lp.verification,
+      problems: lp.problems,
     });
-    const cpmm: CpmmPoolFacts = { token0Mint: v.tokenAMint!, token1Mint: v.tokenBMint!, token0Vault: v.cpmmVaults!.token0, token1Vault: v.cpmmVaults!.token1, poolCreator: v.cpmmPoolCreator!, enableCreatorFee: v.cpmmEnableCreatorFee === true, beneficiaryLocks };
+    const cpmm: CpmmPoolFacts = { token0Mint: v.tokenAMint!, token1Mint: v.tokenBMint!, token0Vault: v.cpmmVaults!.token0, token1Vault: v.cpmmVaults!.token1, poolCreator: v.cpmmPoolCreator!, enableCreatorFee: v.cpmmEnableCreatorFee === true, beneficiaryLocks, ...(creatorRole ? { platformLocks: cls.platformLocks } : {}) };
     return { kind: v.kind, pool: v.destinationPool, program: v.destinationProgram, ctx, allocation, lpAllocation, cpmm };
   }
   return null;

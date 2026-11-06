@@ -110,6 +110,7 @@ export const EXCLUSION = {
   unverifiedMigration: "unverified_migration",
   noCreatorEntitlement: "no_creator_entitlement",
   cpmmCreatorNotBeneficiary: "cpmm_pool_creator_is_not_beneficiary",
+  platformOwnedLockedLp: "platform_owned_locked_lp", // LaunchLab platform Fee Key (incl. creator_scale since 2026-08-17)
 } as const;
 
 /**

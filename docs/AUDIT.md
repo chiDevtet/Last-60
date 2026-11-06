@@ -112,6 +112,22 @@ PlatformConfigs must have `creator_scale = 0`, and every migration executed afte
 500 000" therefore cannot produce a creator LP entitlement for current migrations; the code takes the
 entitlement only from the migration's actual lock records.
 
+### Round 4 — Forgepad LaunchLab PlatformConfig verification (each with regression tests)
+
+Forgepad's real PlatformConfig `5zZFa8Ki…` was decoded on mainnet (FEE_ACCOUNTING §2a). Findings:
+
+| # | Finding | Fix |
+|---|---|---|
+| F1 | The LaunchLab bonding basis verified on `creator_fee_rate` alone; any platform with the same rate (e.g. `EB2LqTh8…`, also 5 000) would verify as Forgepad | Requires `EXPECTED_LAUNCHLAB_PLATFORM_CONFIG` **and** the rate (`verifyLaunchLabCreatorBasis`) |
+| F2 | Forgepad's fee wallet = NFT wallet. If that wallet launches a token, the platform's single post-upgrade Fee Key is minted to the "creator", and `destinationSpec` would have counted it as a creator lock — with a matching `creator_scale` declaration it was **payable** | Locks minted to `platform_nft_wallet` are always platform-owned (`platform_owned_locked_lp`); creator locks must match the pre-upgrade layout and a pre-upgrade slot (`classifyLaunchLabLocks`) |
+| F3 | `creator_scale` row in the allocation report showed "distributable" when declared; `--forgepad` described 500 000 as "creator share of migrated LP" | `creator_scale` is a config fact, never distributable; creator Fee Key and CPMM creator fee rows are "pending launch evidence" until a verified migration exists |
+| F4 | A positive `creator_scale` with no creator lock was reported as `mismatch` (an allocation problem) | `unverifiable` / "no entitlement": correct post-upgrade behaviour, nothing to pay |
+| F5 | PlatformConfig decoder ignored half the layout and did no layout check; the bundled IDL 0.2.0 predates the 2026-08-31 layout (`curve_params` vec vs `restrict_*` / `curve_rule_manager`) | Full decode + `validateLaunchLabPlatformConfig` (owner, discriminator, exact 944 bytes, zero tail, scale sum, rate caps) |
+| F6 | The CLI `reconcile` built its provider without the operator declarations and without the persisted destination, i.e. a different basis set than the workers | `providerTargetFor` shared by indexer, rewards worker and CLI; CLI attaches the stored migration |
+
+The existing DBC targets (75 % creator) already matched the owner's 25 / 75 statement; LaunchLab
+targets are now the decoded on-chain values, never derived from the DBC split.
+
 ## 4. Live-money execution paths — review notes
 
 * **Native SOL / SPL transfers** — one recipient per transaction, canonical on-curve recipients only,

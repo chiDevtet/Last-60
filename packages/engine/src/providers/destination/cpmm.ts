@@ -40,6 +40,8 @@ export interface CpmmPoolFacts {
   enableCreatorFee: boolean;
   /** Locks minted to the beneficiary at migration (fee-key NFTs). */
   beneficiaryLocks: { lockPda: string; nftMint: string }[];
+  /** Locks whose Fee Key was minted to the platform NFT wallet (platform-owned locked LP; absent on older specs). */
+  platformLocks?: { lockPda: string; nftMint: string }[];
 }
 
 export class CpmmDestination implements DestinationAdapter {
@@ -198,15 +200,17 @@ export class CpmmDestination implements DestinationAdapter {
     const out: NormalizedAttribution[] = [];
     const lockPda = ix.accounts[3]!;
     const signer = ix.accounts[1]!;
-    const isBeneficiaryLock = this.facts.beneficiaryLocks.some((l) => l.lockPda === lockPda);
+    // A platform-owned Fee Key is never the creator's, even when the creator wallet holds it.
+    const isPlatformLock = (this.facts.platformLocks ?? []).some((l) => l.lockPda === lockPda);
+    const isBeneficiaryLock = !isPlatformLock && this.facts.beneficiaryLocks.some((l) => l.lockPda === lockPda);
     for (const t of subtreeTransfers(tx, ix)) {
       const mint = this.vaultMint(t.source);
       if (!mint || t.amount === 0n) continue;
       const recipient = tokenAccountInfo(tx, t.destination)?.owner ?? null;
       const ok = isBeneficiaryLock && signer === this.ctx.beneficiary && recipient === this.ctx.beneficiary;
       const payable = basisPayable(this.lpAllocation);
-      const reason = !isBeneficiaryLock ? "lock_not_minted_to_beneficiary_at_migration" : !ok ? EXCLUSION.positionNotHeldByBeneficiary : payable ? null : `${EXCLUSION.allocationMismatch}: ${this.lpAllocation.problems.join("; ")}`;
-      out.push(this.record(tx, ix, "locked_lp_fee_collection", "migrated_lp", mint, t.amount, ok && payable, reason, this.lpAllocation, { instruction: ix.ordinal, transfer: t.ordinal, lockPda, feeKeyHolder: signer, recipient }));
+      const reason = isPlatformLock ? EXCLUSION.platformOwnedLockedLp : !isBeneficiaryLock ? "lock_not_minted_to_beneficiary_at_migration" : !ok ? EXCLUSION.positionNotHeldByBeneficiary : payable ? null : `${EXCLUSION.allocationMismatch}: ${this.lpAllocation.problems.join("; ")}`;
+      out.push(this.record(tx, ix, "locked_lp_fee_collection", "migrated_lp", mint, t.amount, ok && payable, reason, this.lpAllocation, { instruction: ix.ordinal, transfer: t.ordinal, lockPda, feeKeyHolder: signer, recipient, lockOwner: isPlatformLock ? "platform" : isBeneficiaryLock ? "beneficiary" : "other" }));
     }
     return out;
   }

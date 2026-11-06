@@ -15,7 +15,7 @@ import { RpcClient } from "../chain/rpc";
 import { LogsSubscriber } from "../chain/ws";
 import type { Models } from "../db/models";
 import { big } from "../db/decimal";
-import { attachStoredMigration, createProvider, resolveAndAttachMigration, type LaunchProvider, type PoolInfo } from "../providers";
+import { attachStoredMigration, createProvider, providerTargetFor, resolveAndAttachMigration, type LaunchProvider, type PoolInfo } from "../providers";
 import { basesOf, roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
@@ -84,7 +84,7 @@ export class Indexer {
     this.ws?.stop();
     this.ws = null;
     this.rpc = this.deps.rpc ?? new RpcClient({ urls: s.rpcUrls, timeoutMs: this.deps.cfg.solana.timeoutMs, maxRps: this.deps.cfg.solana.maxRps, maxTxVersion: this.deps.cfg.solana.maxTxVersion, logger: this.log });
-    const provider = createProvider({ id: s.launchProvider, poolAddress: s.poolAddress, tokenMint: s.tokenMint, role: s.feeBeneficiaryRole, payoutMint: s.payoutAssetMint, expected: this.deps.cfg.provider.expected }, this.rpc);
+    const provider = createProvider(providerTargetFor(s, this.deps.cfg), this.rpc);
     await provider.load();
     await attachStoredMigration(this.deps.db, provider);
     // U1: never index a launch under a different role / beneficiary / provider than its existing

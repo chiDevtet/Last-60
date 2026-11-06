@@ -154,31 +154,124 @@ export interface LaunchLabPlatformConfig {
   cpConfig?: string;
   /** When set, CPMM pools created at migration record this wallet as pool_creator instead of the token creator. */
   platformCpCreator?: string | null;
+  /** Remaining fields of the 944-byte layout (present when decoded from a real account). */
+  epoch?: bigint;
+  name?: string;
+  web?: string;
+  img?: string;
+  transferFeeExtensionAuth?: string;
+  platformVestingWallet?: string;
+  platformVestingScale?: bigint;
+  restrictGlobalConfig?: number;
+  restrictCurveParam?: number;
+  curveRuleManager?: string | null;
 }
 
+/** Fixed PlatformConfig account size (unchanged by the 2026-08-17 and 2026-08-31 layout updates). */
+export const PLATFORM_CONFIG_SIZE = 944;
+/** PlatformConfig.creator_fee_rate ceiling (raydium-docs-v1 products/launchlab/platform-config: MAX_CREATOR_FEE_RATE). */
+export const LAUNCHLAB_MAX_CREATOR_FEE_RATE = 5_000n;
+/** PlatformConfig.fee_rate ceiling since the 2026-08-26 upgrade (previously 10 000). */
+export const LAUNCHLAB_MAX_PLATFORM_FEE_RATE = 50_000n;
+/** platform_scale + creator_scale + burn_scale must equal this. */
+export const LAUNCHLAB_SCALE_DENOMINATOR = 1_000_000n;
+const DEFAULT_PUBKEY = "11111111111111111111111111111111";
+
+const cstr = (b: Buffer, o: number, n: number) => {
+  const raw = b.subarray(o, o + n);
+  const end = raw.indexOf(0);
+  return raw.subarray(0, end === -1 ? n : end).toString("utf8");
+};
+
 /**
- * Byte offsets follow the Raydium SDK `PlatformConfig` layout. Verified on two mainnet accounts:
- *   EB2LqTh8… (fixtures/mainnet/migration-launchlab-cpmm.json): fee_rate 7500, creator_fee_rate 5000
- *     (0.5% of trade value — the program maximum), platform_scale 1 000 000, creator_scale 0;
- *   4Bu96XjU… (fixtures/mainnet/launchlab-accounts.json): fee_rate 7500, creator_fee_rate 500
- *     (0.05%), platform_scale 0, creator_scale 100 000, burn_scale 900 000;
- * cp_config = the CPMM config used by that platform's migrations. Rates differ per platform — they
- * are always read from the pool's own PlatformConfig, never assumed.
+ * Byte offsets follow the Raydium SDK `PlatformConfig` layout (0.2.82-alpha) and the deployed
+ * program's 944-byte account (raydium-docs-v1 products/launchlab/platform-config):
+ *   0 disc · 8 epoch · 16 platform_fee_wallet · 48 platform_nft_wallet · 80 platform_scale ·
+ *   88 creator_scale · 96 burn_scale · 104 fee_rate · 112 name[64] · 176 web[256] · 432 img[256] ·
+ *   688 cpswap_config · 720 creator_fee_rate · 728 transfer_fee_extension_auth ·
+ *   760 platform_vesting_wallet · 792 platform_vesting_scale · 800 platform_cp_creator ·
+ *   832 restrict_global_config (u8) · 833 restrict_curve_param (u8) · 834 curve_rule_manager ·
+ *   866..944 padding.
+ * The bundled IDL (v0.2.0) predates 2026-08-31 and still describes bytes 832..944 as
+ * 108 bytes of padding + a `curve_params` vec length; for an account whose bytes 832..944 are all
+ * zero the two readings agree (see `validateLaunchLabPlatformConfig`).
+ * Verified on mainnet accounts:
+ *   5zZFa8Ki… Forgepad (test/fixtures/mainnet/forgepad-platform-config.json): fee_rate 10000,
+ *     creator_fee_rate 5000, platform_scale 500 000, creator_scale 500 000, burn_scale 0;
+ *   EB2LqTh8… (fixtures/mainnet/migration-launchlab-cpmm.json): fee_rate 7500, creator_fee_rate 5000,
+ *     platform_scale 1 000 000, creator_scale 0;
+ *   4Bu96XjU… (fixtures/mainnet/launchlab-accounts.json): fee_rate 7500, creator_fee_rate 500,
+ *     platform_scale 0, creator_scale 100 000, burn_scale 900 000.
+ * Rates differ per platform — they are always read from the pool's own PlatformConfig, never assumed.
  */
 export function decodeLaunchLabPlatformConfig(data: Buffer): LaunchLabPlatformConfig {
   if (!data.subarray(0, 8).equals(PLATFORM_CONFIG_DISC)) throw new ProviderValidationError("account is not a LaunchLab PlatformConfig");
-  const cpCreator = data.length >= 832 ? pk(data, 800) : null;
+  if (data.length < 832) throw new ProviderValidationError(`PlatformConfig data too short (${data.length} bytes)`);
+  const cpCreator = pk(data, 800);
+  const full = data.length >= 866;
+  const manager = full ? pk(data, 834) : null;
   return {
+    epoch: u64(data, 8),
     platformFeeWallet: pk(data, 16),
     platformLockNftWallet: pk(data, 48),
     platformScale: u64(data, 80),
     creatorScale: u64(data, 88),
     burnScale: u64(data, 96),
     feeRate: u64(data, 104),
+    name: cstr(data, 112, 64),
+    web: cstr(data, 176, 256),
+    img: cstr(data, 432, 256),
     cpConfig: pk(data, 688),
     creatorFeeRate: u64(data, 720),
-    platformCpCreator: cpCreator && cpCreator !== "11111111111111111111111111111111" ? cpCreator : null,
+    transferFeeExtensionAuth: pk(data, 728),
+    platformVestingWallet: pk(data, 760),
+    platformVestingScale: u64(data, 792),
+    platformCpCreator: cpCreator !== DEFAULT_PUBKEY ? cpCreator : null,
+    ...(full ? { restrictGlobalConfig: data[832]!, restrictCurveParam: data[833]!, curveRuleManager: manager !== DEFAULT_PUBKEY ? manager : null } : {}),
   };
+}
+
+/**
+ * Strict, read-only validation of a raw PlatformConfig account for accounting purposes. Returns the
+ * decoded config and every reason it cannot be relied on (empty = decoded unambiguously):
+ * owner, discriminator, exact size, scale sum, rate caps, flag ranges, and that the bytes the
+ * deployed layout treats as padding are zero (otherwise the account carries fields this code does
+ * not know — an unsupported layout, never guessed).
+ */
+export function validateLaunchLabPlatformConfig(account: { owner: string; data: Buffer } | null): { config: LaunchLabPlatformConfig | null; problems: string[]; code: "ok" | "missing" | "wrong_owner" | "unsupported_layout" | "invalid_values" } {
+  if (!account) return { config: null, problems: ["account does not exist on this cluster"], code: "missing" };
+  if (account.owner !== LAUNCHLAB_PROGRAM_ID) return { config: null, problems: [`account is owned by ${account.owner}, not Raydium LaunchLab ${LAUNCHLAB_PROGRAM_ID}`], code: "wrong_owner" };
+  const d = account.data;
+  if (!d.subarray(0, 8).equals(PLATFORM_CONFIG_DISC)) return { config: null, problems: [`discriminator ${[...d.subarray(0, 8)].join(",")} is not PlatformConfig`], code: "unsupported_layout" };
+  if (d.length !== PLATFORM_CONFIG_SIZE) return { config: null, problems: [`account is ${d.length} bytes; the supported PlatformConfig layout is exactly ${PLATFORM_CONFIG_SIZE}`], code: "unsupported_layout" };
+  const layout: string[] = [];
+  if (d.subarray(866, PLATFORM_CONFIG_SIZE).some((b) => b !== 0)) layout.push("bytes 866..944 (padding in the deployed layout; the legacy IDL's curve_params vec length at 940..944) are not zero — the account carries data this decoder does not understand");
+  if (layout.length) return { config: null, problems: layout, code: "unsupported_layout" };
+  const c = decodeLaunchLabPlatformConfig(d);
+  const values: string[] = [];
+  const sum = c.platformScale! + c.creatorScale! + c.burnScale!;
+  if (sum !== LAUNCHLAB_SCALE_DENOMINATOR) values.push(`platform_scale + creator_scale + burn_scale = ${sum}, the program requires ${LAUNCHLAB_SCALE_DENOMINATOR}`);
+  if (c.creatorFeeRate > LAUNCHLAB_MAX_CREATOR_FEE_RATE) values.push(`creator_fee_rate ${c.creatorFeeRate} exceeds MAX_CREATOR_FEE_RATE ${LAUNCHLAB_MAX_CREATOR_FEE_RATE}`);
+  if (c.feeRate > LAUNCHLAB_MAX_PLATFORM_FEE_RATE) values.push(`fee_rate ${c.feeRate} exceeds the platform fee cap ${LAUNCHLAB_MAX_PLATFORM_FEE_RATE}`);
+  if (c.platformVestingScale! > LAUNCHLAB_SCALE_DENOMINATOR) values.push(`platform_vesting_scale ${c.platformVestingScale} exceeds ${LAUNCHLAB_SCALE_DENOMINATOR}`);
+  if (c.restrictGlobalConfig! > 1 || c.restrictCurveParam! > 1) values.push(`restrict flags must be 0 or 1 (restrict_global_config ${c.restrictGlobalConfig}, restrict_curve_param ${c.restrictCurveParam})`);
+  return { config: c, problems: values, code: values.length ? "invalid_values" : "ok" };
+}
+
+/**
+ * Verification of the LaunchLab creator bonding-curve basis against the operator declaration:
+ * the pool's PlatformConfig address AND its creator_fee_rate must both be declared and equal.
+ * Either one missing → not_declared (never distributable); either one different → mismatch.
+ */
+export function verifyLaunchLabCreatorBasis(poolPlatformConfig: string, creatorFeeRate: bigint, expected: Pick<ExpectedAllocation, "launchlabPlatformConfig" | "launchlabCreatorFeeRate"> | undefined): { verification: AllocationVerification; problems: string[] } {
+  const problems: string[] = [];
+  const declaredPc = expected?.launchlabPlatformConfig ?? null;
+  const rate = verifyDeclared("creator_fee_rate", Number(creatorFeeRate), expected?.launchlabCreatorFeeRate);
+  if (declaredPc !== null && declaredPc !== poolPlatformConfig) problems.push(`pool is bound to PlatformConfig ${poolPlatformConfig} but ${declaredPc} was declared`);
+  problems.push(...rate.problems);
+  if (problems.length) return { verification: "mismatch", problems };
+  if (declaredPc === null || rate.verification === "not_declared") return { verification: "not_declared", problems: [] };
+  return { verification: rate.verification, problems: [] };
 }
 
 export class RaydiumLaunchLabProvider implements LaunchProvider {
@@ -207,7 +300,10 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
     this.platform = platform;
     this.poolState = pool;
     const beneficiary = creatorRole ? pool.creator : platform.platformFeeWallet;
-    const check = creatorRole ? verifyDeclared("creator_fee_rate", Number(platform.creatorFeeRate), this.opts.expected?.launchlabCreatorFeeRate) : { verification: "not_declared" as const, problems: [] };
+    // The creator's bonding-curve allocation is verified only when BOTH the platform identity (which
+    // PlatformConfig the pool is bound to) and its creator_fee_rate match the declaration. A rate
+    // alone is not an identity: other platforms use the same rate (e.g. EB2LqTh8… also has 5000).
+    const check = creatorRole ? verifyLaunchLabCreatorBasis(pool.platformConfig, platform.creatorFeeRate, this.opts.expected) : { verification: "not_declared" as const, problems: [] };
     const lpCheck = creatorRole ? verifyDeclared("creator_scale", platform.creatorScale === undefined ? null : Number(platform.creatorScale), this.opts.expected?.launchlabCreatorLpScale) : { verification: "not_declared" as const, problems: [] };
     this.lpCheck = lpCheck;
     const allocation: AllocationBasis = makeBasis({
@@ -224,9 +320,9 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
     const warnings: string[] = creatorRole && platform.creatorFeeRate === 0n ? ["this LaunchLab platform's creator_fee_rate is 0: the creator earns no bonding-curve fees"] : !creatorRole && platform.feeRate === 0n ? ["this LaunchLab platform's fee_rate is 0: the platform earns no bonding-curve fees"] : [];
     for (const p of check.problems) warnings.push(`ALLOCATION MISMATCH: ${p}; bonding-curve fees are recorded but NOT eligible for payout`);
     for (const p of lpCheck.problems) warnings.push(`ALLOCATION MISMATCH: ${p}; migrated LP fees will NOT be eligible for payout`);
-    if (creatorRole && check.verification === "not_declared") warnings.push("NOT DECLARED: creator fee rate (EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE) — fees are recorded with the on-chain value but are NOT distributed until it is declared and verified");
-    if (creatorRole && lpCheck.verification === "not_declared") warnings.push("NOT DECLARED: creator LP scale (EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE) — migrated LP fees will be recorded but NOT distributed until declared and verified");
-    if (creatorRole && (platform.creatorScale ?? 0n) > 0n) warnings.push(`creator_scale is ${platform.creatorScale} on this PlatformConfig, but since the 2026-08-17 LaunchLab upgrade migrations assign creator_scale to the platform's Fee Key: the creator receives a migrated-LP Fee Key only if the migration transaction actually mints one`);
+    if (creatorRole && check.verification === "not_declared") warnings.push("NOT DECLARED: LaunchLab platform config and creator fee rate (EXPECTED_LAUNCHLAB_PLATFORM_CONFIG and EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE) — fees are recorded with the on-chain value but are NOT distributed until both are declared and verified");
+    if (creatorRole && (platform.creatorScale ?? 0n) > 0n) warnings.push(`creator_scale is ${platform.creatorScale} on this PlatformConfig. It is a migrated-LP scale, not a creator fee: since the 2026-08-17 LaunchLab upgrade migrations add it to the platform's ONE Fee Key (minted to platform_nft_wallet). A creator LP entitlement exists only if the migration transaction itself minted a creator Fee Key`);
+    if (creatorRole && platform.platformLockNftWallet && platform.platformLockNftWallet === pool.creator) warnings.push("the pool creator IS the platform NFT wallet: any locked-LP Fee Key minted to this wallet is platform-owned and is never attributed to the creator");
     if (!creatorRole) warnings.push('the "platform" role has no declarable allocation: its fees are recorded but never distributed');
     if (creatorRole) warnings.push("the creator fee vault is shared by every pool of this creator and quote mint: other pools' deposits are tracked and excluded, never attributed to this pool");
     this.cached = {

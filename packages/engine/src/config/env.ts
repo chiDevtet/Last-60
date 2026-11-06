@@ -124,6 +124,7 @@ const RawEnv = z.object({
   EXPECTED_DBC_CREATOR_LP_PERCENTAGE: z.string().optional(),
   EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE: z.string().optional(),
   EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE: z.string().optional(),
+  EXPECTED_LAUNCHLAB_PLATFORM_CONFIG: z.string().optional(),
 
   BUYER_COUNT: int(5, 1, 50),
   MIN_BUY_SOL: z.string().default("0.05"),
@@ -199,13 +200,18 @@ const RawEnv = z.object({
  *   dbcCreatorTradingFeePercentage — DBC `creator_trading_fee_percentage` (0-100, share of the LP trading fee while bonding)
  *   dbcCreatorLpPercentage         — DBC creator liquidity + permanently locked + vesting LP percentages (0-100)
  *   launchlabCreatorFeeRate        — LaunchLab `creator_fee_rate`, a FEE RATE on trade value in millionths (5000 = 0.5% of the trade)
- *   launchlabCreatorLpScale        — LaunchLab `creator_scale`, the creator's share of migrated LP in millionths (500000 = 50%)
+ *   launchlabPlatformConfig        — LaunchLab PlatformConfig address the pool must be bound to (Forgepad: 5zZFa8Ki…)
+ *   launchlabCreatorLpScale        — LaunchLab PlatformConfig `creator_scale` VALUE in millionths of migrated LP. A config
+ *                                    fact only: it is NOT a creator entitlement (since the 2026-08-17 upgrade it is
+ *                                    added to the platform's Fee Key); creator LP entitlement needs a creator Fee Key
+ *                                    minted by the migration transaction
  */
 export interface ExpectedAllocation {
   dbcCreatorTradingFeePercentage: number | null;
   dbcCreatorLpPercentage: number | null;
   launchlabCreatorFeeRate: number | null;
   launchlabCreatorLpScale: number | null;
+  launchlabPlatformConfig?: string | null;
 }
 
 export interface AppConfig {
@@ -463,11 +469,21 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     }
     return Number(v);
   };
+  const expectedPubkey = (name: string, v: string | undefined): string | null => {
+    if (v === undefined || v.trim() === "") return null;
+    try {
+      return new PublicKey(v.trim()).toBase58();
+    } catch {
+      problems.push(`${name}: must be a base58 public key`);
+      return null;
+    }
+  };
   const expected: ExpectedAllocation = {
     dbcCreatorTradingFeePercentage: expectedInt("EXPECTED_DBC_CREATOR_TRADING_FEE_PERCENTAGE", raw.EXPECTED_DBC_CREATOR_TRADING_FEE_PERCENTAGE, 100),
     dbcCreatorLpPercentage: expectedInt("EXPECTED_DBC_CREATOR_LP_PERCENTAGE", raw.EXPECTED_DBC_CREATOR_LP_PERCENTAGE, 100),
     launchlabCreatorFeeRate: expectedInt("EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE", raw.EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE, 1_000_000),
     launchlabCreatorLpScale: expectedInt("EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE", raw.EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE, 1_000_000),
+    launchlabPlatformConfig: expectedPubkey("EXPECTED_LAUNCHLAB_PLATFORM_CONFIG", raw.EXPECTED_LAUNCHLAB_PLATFORM_CONFIG),
   };
   if (role === "api" && raw.NODE_ENV === "production") {
     // Never fall back to request headers for the sign-in domain, and never reflect arbitrary origins.

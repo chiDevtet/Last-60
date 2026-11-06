@@ -26,6 +26,15 @@ export interface ProviderTarget {
 }
 
 /**
+ * The provider target for the effective settings — used by the indexer, the rewards worker and the
+ * CLI so that every process loads the same pool, role, payout mint AND the same operator
+ * declarations, and therefore resolves the same allocation bases and verification.
+ */
+export function providerTargetFor(s: { launchProvider: ProviderTarget["id"]; poolAddress: string | null; tokenMint: string | null; feeBeneficiaryRole: ProviderTarget["role"]; payoutAssetMint: string }, cfg: Pick<AppConfig, "provider">): ProviderTarget {
+  return { id: s.launchProvider, poolAddress: s.poolAddress, tokenMint: s.tokenMint, role: s.feeBeneficiaryRole, payoutMint: s.payoutAssetMint, expected: cfg.provider.expected };
+}
+
+/**
  * The ONLY place that knows which concrete adapter backs LAUNCH_PROVIDER. Bonding-curve providers
  * are wrapped so that a verified graduation destination can be attached later.
  */

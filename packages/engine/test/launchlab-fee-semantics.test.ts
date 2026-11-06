@@ -109,7 +109,7 @@ describe("LaunchLab creator_fee_rate: a rate on TRADE VALUE (millionths), not a 
     const { tx, d, acc } = mainnetTrade();
     const accounts = new Map(Object.entries<any>(acc.accounts).map(([a, v]) => [a, { owner: v.owner, data: Buffer.from(v.data, "base64"), lamports: 1, executable: false }]));
     const rpc: any = { getAccountInfo: async (a: string) => ({ slot: 1, value: accounts.get(a) ?? null }) };
-    const p = new RaydiumLaunchLabProvider(rpc, { poolAddress: acc.pool, tokenMint: acc.baseMint, role: "creator", expected: { ...NONE, launchlabCreatorFeeRate: 500 } });
+    const p = new RaydiumLaunchLabProvider(rpc, { poolAddress: acc.pool, tokenMint: acc.baseMint, role: "creator", expected: { ...NONE, launchlabCreatorFeeRate: 500, launchlabPlatformConfig: acc.platformConfig } });
     const info = await p.load();
     expect(info.allocation!.verification).toBe("verified");
     const s = p.parseTransaction(tx).swaps[0]!;
@@ -128,10 +128,13 @@ describe("Forgepad allocation report (operator-readable)", () => {
     return buildAllocationReport(info, { ...NONE, ...expected }, p.lpCheck);
   }
 
-  test("Forgepad's intended LaunchLab targets checked against a real platform config are a MISMATCH (never assumed)", async () => {
+  test("Forgepad's LaunchLab declarations checked against ANOTHER platform's real pool are a MISMATCH (never assumed)", async () => {
     const intended = Object.fromEntries(FORGEPAD_INTENDED.raydium_launchlab.map((t) => [t.key, t.value]));
-    expect(intended).toEqual({ launchlabCreatorFeeRate: 5000, launchlabCreatorLpScale: 500000 });
-    const r = await loaded(intended);
+    expect(intended).toEqual({ launchlabPlatformConfig: "5zZFa8KitVsp3qGDvCQeDZgn5YEKxAASA5EQTjVzobcX", launchlabCreatorFeeRate: 5000, launchlabCreatorLpScale: 500000 });
+    const r = await loaded(intended as any);
+    const pc = r.rows.find((x) => x.parameter.startsWith("PlatformConfig"))!;
+    expect(pc.onChain).toBe("4Bu96XjU84XjPDSpveTVf6LYGCkfW5FK7SNkREWcEfV4");
+    expect(pc.verification).toBe("mismatch");
     const rate = r.rows.find((x) => x.parameter.startsWith("creator_fee_rate"))!;
     expect(rate.onChain).toBe("500");
     expect(rate.declared).toBe(5000);
@@ -149,16 +152,28 @@ describe("Forgepad allocation report (operator-readable)", () => {
 
   test("absent declarations are reported as not_declared — never as verified, never distributable", async () => {
     const r = await loaded({});
-    expect(r.rows.every((x) => x.verification === "not_declared" && !x.distributable)).toBe(true);
+    const decided = r.rows.filter((x) => !x.pendingLaunchEvidence);
+    expect(decided.every((x) => x.verification === "not_declared" && !x.distributable)).toBe(true);
+    expect(r.rows.every((x) => !x.distributable)).toBe(true);
     expect(r.outcome).toBe("not_declared");
     expect(r.missing.some((m) => m.includes("EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE"))).toBe(true);
+    expect(r.missing.some((m) => m.includes("EXPECTED_LAUNCHLAB_PLATFORM_CONFIG"))).toBe(true);
     expect(r.bases.every((b) => !b.distributable)).toBe(true);
   });
 
-  test("declarations equal to the chain verify; the on-chain value stays the accounting value", async () => {
-    const r = await loaded({ launchlabCreatorFeeRate: 500, launchlabCreatorLpScale: 100000 });
-    expect(r.rows.map((x) => x.verification)).toEqual(["verified", "verified"]);
+  test("declarations equal to the chain verify; creator_scale stays NON-distributable; migration-only entitlements stay pending", async () => {
+    const acc = fixture("launchlab-accounts.json");
+    const r = await loaded({ launchlabPlatformConfig: acc.platformConfig, launchlabCreatorFeeRate: 500, launchlabCreatorLpScale: 100000 });
+    const decided = r.rows.filter((x) => !x.pendingLaunchEvidence);
+    expect(decided.map((x) => [x.parameter.split(" ")[0], x.verification, x.distributable])).toEqual([
+      ["PlatformConfig", "verified", true],
+      ["creator_fee_rate", "verified", true],
+      ["creator_scale", "verified", false], // a config fact, never a creator entitlement
+    ]);
+    expect(r.rows.filter((x) => x.pendingLaunchEvidence).map((x) => x.parameter)).toEqual(["creator-owned locked-LP Fee Key", "CPMM creator fee (post-graduation)"]);
+    expect(r.pending).toHaveLength(2);
     expect(r.outcome).toBe("verified");
-    expect(r.rows[0]!.matchesIntended).toBe(false); // verified against the declaration, still ≠ Forgepad's 5000 target
+    expect(r.rows[1]!.matchesIntended).toBe(false); // verified against the declaration, still ≠ Forgepad's 5000
+    expect(renderAllocationReport(r)).toContain("PENDING LAUNCH EVIDENCE");
   });
 });

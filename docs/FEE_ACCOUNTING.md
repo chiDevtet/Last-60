@@ -105,12 +105,60 @@ gives `MAX_CREATOR_FEE_RATE = 5000` (50 bps). The LaunchLab program source is no
 deployed layouts used are the published IDL and SDK, cross-checked on mainnet accounts. Accounting
 never recomputes the fee: it uses `TradeEvent.creator_fee`, cross-checked with the vault transfer.
 
-`creator_scale` (millionths of migrated LP) **no longer implies a creator LP Fee Key**: since the
-2026-08-17 LaunchLab upgrade, new / updated PlatformConfigs must have `creator_scale = 0`, and
-migrations executed after the upgrade fold `platform_scale + creator_scale` into ONE platform-owned
-Fee Key (including launches created before the upgrade). The creator's migrated-LP entitlement is
-therefore taken only from the lock records of the actual migration transaction; a positive
-`creator_scale` without a creator lock is `unverifiable` (or `mismatch` if it was declared), never paid.
+`creator_scale` (millionths of migrated LP) **is not a creator entitlement**: since the 2026-08-17
+LaunchLab upgrade, `create_platform_config` and the `MigrateNftInfo` update require
+`creator_scale = 0`, and migrations executed after the upgrade fold `platform_scale + creator_scale`
+into ONE Fee Key minted to `platform_nft_wallet` (including launches created before the upgrade;
+older configs such as Forgepad's still store a positive value). The creator's migrated-LP entitlement
+is taken only from the lock records of the actual migration transaction
+(`classifyLaunchLabLocks`): it is **proven** only for the pre-upgrade layout — the creator is not the
+platform NFT wallet, exactly one lock minted to the creator, the expected number of platform locks,
+lock amounts in the `platform_scale : creator_scale` ratio, and a migration slot before the observed
+upgrade boundary. Anything else is `unverifiable` and never paid. Locks minted to `platform_nft_wallet`
+are platform-owned (`excludedReason = platform_owned_locked_lp`) even when the creator is that wallet.
+Mainnet evidence (platform `4Bu96XjU…`, `creator_scale` 100 000; 423 migrations): the creator Fee Key
+was minted to the creator up to slot 439 305 681 (2026-08-14) and to the platform NFT wallet from slot
+440 109 663 (2026-08-18) on (`test/fixtures/mainnet/forgepad-platform-config.json`).
+
+### 2a. Forgepad's LaunchLab PlatformConfig (decoded on mainnet)
+
+Account `5zZFa8KitVsp3qGDvCQeDZgn5YEKxAASA5EQTjVzobcX`, supplied by the Forgepad owner. Read with
+`getAccountInfo` (finalized) at slot 466 137 980; owner `LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj`
+(Raydium LaunchLab; ProgramData `D2QX47Tv…`, last deployed slot 446 221 802 = 2026-09-11); 944 bytes,
+discriminator `PlatformConfig`; bytes 832–944 all zero. Decoded identically by the repo decoder, the
+bundled Anchor IDL (raydium_launchpad 0.2.0) and the Raydium SDK 0.2.82-alpha `PlatformConfig` layout
+(`test/forgepad-launchlab.test.ts`). Reproduce: `bun run verify:platform-config`.
+
+| Field | Value | Units / meaning |
+|---|---|---|
+| `epoch` | 969 | Solana epoch of the last update (≈ 2026-05; before the 2026-08-17 `creator_scale = 0` rule) |
+| `platform_fee_wallet` | `8KXqQwtrgtKxNfTWYsN34XNKXVQQR78JZfgbLorNL2n1` | claims the bonding-curve platform fee |
+| `platform_nft_wallet` | `8KXqQwtr…` (same) | receives the platform locked-LP Fee Key |
+| `platform_scale` / `creator_scale` / `burn_scale` | 500 000 / 500 000 / 0 | millionths of migrated LP; post-upgrade: 100 % locked under ONE platform Fee Key, nothing burned |
+| `fee_rate` | 10 000 | millionths of trade value: **1 %** bonding-curve platform fee |
+| `creator_fee_rate` | 5 000 | millionths of trade value: **0.5 %** bonding-curve creator fee (the program maximum) — not a share of the platform fee |
+| `name` / `web` / `img` | Forge / https://forgepad.fun / https://i.postimg.cc/76TzYyFW/Forge-X-Logo.png | branding |
+| `cpswap_config` | `C7Cx2pMLtjybS3mDKSfsBj4zQ3PRZGkKt7RCYTTbCSx2` | CPMM AmmConfig (index 3): `trade_fee_rate` 40 000, `protocol_fee_rate` 120 000, `fund_fee_rate` 40 000, **`creator_fee_rate` 500** (0.05 % of swap value), `creator_fee_share_rate` 50 000 (5 % of the accrued creator fee kept by the protocol at collection) |
+| `transfer_fee_extension_auth` | `8KXqQwtr…` | Token-2022 transfer-fee authorities |
+| `platform_vesting_wallet` / `platform_vesting_scale` | `8KXqQwtr…` / 0 | no platform token vesting |
+| `platform_cp_creator` | default | the **launch creator** becomes the CPMM `pool_creator` (receives CPMM creator fees) |
+| `restrict_global_config` / `restrict_curve_param` / `curve_rule_manager` | 0 / 0 / default | no allowlist / curve rules (no fee effect) |
+
+Accounting interpretation (`interpretPlatformConfig`):
+
+| Stream | Beneficiary | Status | LAST60 |
+|---|---|---|---|
+| Bonding-curve platform fee (1 % of trade) | `8KXqQwtr…` | confirmed by this config | never paid (platform revenue) |
+| Bonding-curve creator fee (0.5 % of trade) | the pool's `creator` | rate confirmed; the creator wallet needs the pool | distributable when `EXPECTED_LAUNCHLAB_PLATFORM_CONFIG` **and** `EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE` match the pool |
+| Post-graduation CPMM creator fee (0.05 % of swap, minus 5 % protocol share at collection) | CPMM `pool_creator` = launch creator | needs the migration tx | distributable only with a verified migration (pool_creator = creator, creator fee enabled) and a verified bonding basis |
+| Platform-owned locked LP (100 % of migrated LP) | `8KXqQwtr…` | confirmed | never paid |
+| Creator-owned locked LP | — | none under the current program | only with a creator Fee Key proven by the migration tx; never from `creator_scale` |
+
+Forgepad's DBC allocation (25 % platform / 75 % creator, pre-bond and post-migration) is **not**
+applied to LaunchLab: there creator : platform bonding fees are 5 000 : 10 000 = 1 : 2 of trade value.
+Not yet verified for any specific Forgepad launch: the pool's creator wallet, the protocol rate of the
+GlobalConfig it selected, its migration transaction (CPMM pool_creator, `enable_creator_fee`,
+`creator_fee_on`, lock records) — check them with `bun run verify:allocation` once a pool exists.
 
 **The creator fee vault is shared** by every pool of a creator with the same quote mint. Deposits
 from the creator's *other* pools are indexed (the vault is watched) and recorded as
@@ -133,8 +181,14 @@ declare the allocation they expect (Forgepad sets its own configuration; LAST60 
 
 ```
 EXPECTED_DBC_CREATOR_TRADING_FEE_PERCENTAGE   EXPECTED_DBC_CREATOR_LP_PERCENTAGE
-EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE           EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE
+EXPECTED_LAUNCHLAB_PLATFORM_CONFIG            EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE
+EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE
 ```
+
+The LaunchLab bonding basis is `verified` only when the pool's PlatformConfig **and** its
+`creator_fee_rate` both match (a rate alone is not an identity: `EB2LqTh8…` also uses 5 000). Either
+missing → `not_declared`. `EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE` declares the `creator_scale` *value*
+only; it never makes locked-LP fees distributable.
 
 | Result | Effect |
 |---|---|
@@ -151,8 +205,16 @@ bonding allocation was verified; otherwise `not_declared` / `unverifiable`. Role
 pool `getSignaturesForAddress` / `getTransaction`) prints, per allocation: the declared value, the
 on-chain value, Forgepad's intended target, the beneficiary, the fee mint(s) and the outcome; exit
 code 0 verified · 2 mismatch / unverifiable · 3 not declared. `--forgepad` fills undeclared values
-with Forgepad's intended targets (DBC 75 % / 75 %; LaunchLab `creator_fee_rate` 5 000,
-`creator_scale` 500 000) — targets to check, never assumed for any pool. `--json` for machines.
+with Forgepad's values (DBC 75 % / 75 % creator — the owner's 25 / 75 split; LaunchLab: PlatformConfig
+`5zZFa8Ki…`, `creator_fee_rate` 5 000, `creator_scale` 500 000 as decoded on-chain) — values to check,
+never assumed for any pool. LaunchLab rows that need a migration (creator Fee Key, CPMM creator fee)
+are shown as *pending launch evidence* and excluded from the outcome until a verified migration
+exists; after one, "no creator Fee Key" is reported as *no entitlement*. `--json` for machines.
+
+`bun run verify:platform-config [ADDRESS] [--pool POOL] [--json]` (read-only, `getAccountInfo` only)
+decodes and validates a PlatformConfig (default: Forgepad's) and its CPMM AmmConfig, explains every
+field and fee stream, and exits 0 validated · 2 missing · 3 wrong owner · 4 unsupported layout /
+ambiguous decode / out-of-range values · 5 invalid cpswap_config · 6 pool not bound to it.
 
 The beneficiary wallet comes from chain state (`pool.creator`, DBC `fee_claimer`, LaunchLab platform
 fee wallet). For migrated LP, the basis also lists which positions / locks belong to the beneficiary.
@@ -245,7 +307,9 @@ collection, LP-lock fee collection) is manual; LAST60 observes and accounts it.
 
 * DBC full-history reconciliations (`docs/VERIFICATION.md` §2) — exact on two real pools.
 * `test/launchlab-fee-semantics.test.ts` — LaunchLab formula vs SDK and a real TradeEvent; the
-  Forgepad allocation report. `test/basis-guards.test.ts` (pure) and `test/basis-history.test.ts`,
+  Forgepad allocation report. `test/forgepad-launchlab.test.ts` — Forgepad's real PlatformConfig
+  (three decoders, validation, rate semantics, creator_scale never payable, real pre/post-upgrade
+  lock evidence, CPMM independence, immutable snapshots, same basis in indexer / worker / CLI). `test/basis-guards.test.ts` (pure) and `test/basis-history.test.ts`,
   `test/migration-attach.test.ts` (MongoDB) — snapshot guards, immutability, distributability,
   reattachment.
 * Real-transaction tests: `test/attribution.test.ts` (allocation, exclusions, rate-vs-share, U4),
