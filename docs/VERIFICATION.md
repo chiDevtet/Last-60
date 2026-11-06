@@ -19,6 +19,7 @@ Counts are from actual executions, not estimates:
 | Run | Result |
 |---|---|
 | CI (GitHub Actions, ubuntu-22.04, MongoDB 8.0.4 replica set) on PR #4 — see the PR's checks | **217 pass / 0 fail across 18 files** (47.5 s; run [42145258284](https://github.com/chiDevtet/Last-60/actions/runs/42145258284), commit `db72bdb`); typecheck and build:web passed in the same run. The first run had 216 pass / 1 fail — an assertion bug in a new test, fixed |
+| Local run on the PR #7 branch (real MongoDB 8.0.4 replica set, Bun 1.4.4) | **325 pass / 0 fail across 23 files** (87 s); PR #6 baseline on `main` @ 39271b0: 299 pass / 0 fail across 22 files. New: `approved-model.test.ts` (26 tests) |
 | Local sandbox without a downloadable `mongod` (DB-free suites only) | 125 pass; the 10 MongoDB-backed files cannot start there |
 | Before this round (`main` at `c48fde3`), same local sandbox | 95 pass (DB-free suites only) |
 

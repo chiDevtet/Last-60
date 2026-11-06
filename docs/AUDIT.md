@@ -138,6 +138,23 @@ targets are now the decoded on-chain values, never derived from the DBC split.
 | G4 | Applying `REWARD_PERCENTAGE` to both creator fees and contributions would double count (and reinterpret the setting) | Legacy fees capped at the activation slot; `REWARD_PERCENTAGE` never applied to contributions; pre-activation bonding accruals absorbed before a contribution is creditable |
 | G5 | Forgepad inspection: no 25 / 75 bonding split exists; the deployed Raydium worker claims bonding **platform** fees every 5 min (not LP fees) and writes them to `total_postmigration_*`; the LP harvester is undeployed, hourly, quote-leg only, swaps USD1, no correlation memo | Documented (REWARD_FUNDING.md §10–11); nothing from those flows is fundable until Forgepad sends same-transaction or memo-correlated contributions to the configured destinations |
 
+### Round 6 — PR #6 audited against the approved economic model (PR #7, each with regression tests)
+
+| # | Finding in PR #6 | Fix (PR #7) |
+|---|---|---|
+| H1 | The Forge LP 50 % was modelled as a **Forge-funded** contribution with no creator attribution; the approved model says it is the **creator's allocation** of Forge's LP claims, dedicated to Last-60 (not developer revenue) | `StreamInfo.allocationOwner` / `custodian` (`forge_platform_lp_last60_contribution`: allocation owner creator, custodian Forge); every credit records `creator` and `allocationOwner`; a credit without creator attribution is never payable |
+| H2 | The 75 % / 50 % shares were configurable (`BONDING_CREATOR_FEE_LAST60_PERCENTAGE`, `FORGE_PLATFORM_LP_LAST60_PERCENTAGE`) | Fixed: any other value is a config error; `forge_phase_aware_v2` refuses other bps |
+| H3 | `exclusive_window` links (positional, no evidence naming the claim) were payable; Forge's platform wallet also pays out other streams (bonding platform fees), so a memo-less transfer could be credited to the wrong claim | Recorded for reconciliation, never payable; consumption also filters to `same_transaction` / `memo` |
+| H4 | Round consumption checked finality of the TRANSFER only; a separate claim transaction that was forked out could still fund a round | Both the transfer and the original claim must be finalized and successful |
+| H5 | Two reconciliation passes running concurrently could each credit a claim's full remaining allocation (over-credit) | Per-claim consumption cap (`capCreditsPerCollection`) + reconciler invariant + `over_credited` discrepancy |
+| H6 | Credits did not record the claim signature, collected amount, expected allocation, source / destination wallets, creator or policy version | Added (immutable) to `reward_funding` |
+| H7 | `forge_phase_aware_v1` did not require `FORGE_PLATFORM_LP_BENEFICIARY` | Required under v2; v1 is retired (config error), its credits are never consumable and are never rewritten |
+
+Confirmed correct in PR #6 (kept): the seven separated streams; floor rounding with the residual to the
+retaining party; CPMM creator fees never candidates; recipient = claim beneficiary for correlation;
+unique key per inflow; conditional single consumption; legacy fees capped at the activation slot and
+pre-activation bonding accruals absorbed; immutable events and snapshots.
+
 ## 4. Live-money execution paths — review notes
 
 * **Native SOL / SPL transfers** — one recipient per transaction, canonical on-curve recipients only,

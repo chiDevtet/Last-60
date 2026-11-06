@@ -57,7 +57,7 @@ async function providerOf(o: { verified?: boolean; creator?: string; dropPlatfor
   p.attach({ ...sp, ctx: { ...sp.ctx, beneficiary: o.creator ?? CREATOR } });
   return p;
 }
-const runtime = (o: Partial<RevenueRuntime> = {}): RevenueRuntime => ({ cluster: "mainnet-beta", policy: makeFundingPolicy({ version: "forge_phase_aware_v1", activationSlot: ACT, ...FORGE_POLICY_DEFAULTS }), fundingDestinations: [DEST], forgePlatformLpBeneficiary: FORGE, correlationMode: "strict", ...o });
+const runtime = (o: Partial<RevenueRuntime> = {}): RevenueRuntime => ({ cluster: "mainnet-beta", policy: makeFundingPolicy({ version: "forge_phase_aware_v2", activationSlot: ACT, ...FORGE_POLICY_DEFAULTS }), fundingDestinations: [DEST], forgePlatformLpBeneficiary: FORGE, correlationMode: "strict", ...o });
 
 // ── synthetic Forge / creator transactions ──────────────────────────────────────────────────
 const CLAIM_CREATOR = instructionDiscriminator("claim_creator_fee");
@@ -89,7 +89,7 @@ describe("Forge platform LP claims → 50 % Last-60 contribution", () => {
     expect(res).toEqual({ newEvents: 2, newCredits: 1 });
     const col: any = await db.RevenueEvent.findOne({ stream: "forge_platform_lp_fee_collection" }).lean();
     expect(col).toMatchObject({ kind: "collection", launchPhase: "post_migration", instructionIndex: 0, innerInstructionIndex: 0, ordinal: 1, beneficiary: FORGE, status: "collected", feeMint: WSOL_MINT, cluster: "mainnet-beta" });
-    expect(col.snapshot).toMatchObject({ v: 1, verification: "verified", stream: "forge_platform_lp_fee_collection", policy: { version: "forge_phase_aware_v1", forgeLpLast60Bps: 5_000 } });
+    expect(col.snapshot).toMatchObject({ v: 1, verification: "verified", stream: "forge_platform_lp_fee_collection", policy: { version: "forge_phase_aware_v2", forgeLpLast60Bps: 5_000 } });
     const credit: any = await db.RewardFunding.findOne({}).lean();
     expect(credit).toMatchObject({ stream: "forge_platform_lp_last60_contribution", correlationMethod: "same_transaction", payoutEligible: true, status: "reconciled", fundingMint: WSOL_MINT, collectionKey: col.key });
     expect(big(credit.creditableAmount)).toBe(500_000n);
@@ -198,7 +198,8 @@ describe("Forge platform LP claims → 50 % Last-60 contribution", () => {
     expect(report.postMigration.forgePlatformLp[WSOL_MINT]).toMatchObject({ collections: 2, grossClaimed: "4000000", last60FundingCreditable: "2000000", forgeRetainedExpected: "2000000", forgeRetainedObserved: null });
     expect(report.postMigration.forgePlatformLp[spec.cpmm!.token1Mint]).toMatchObject({ collections: 1, grossClaimed: "77", last60ExpectedContribution: "38" });
     expect(report.buyerRewards.eligibleBalanceByMint).toEqual({ [WSOL_MINT]: "2000000" });
-    expect(renderRevenueReport(report)).toContain("Forge platform LP fees claimed (gross)");
+    expect(renderRevenueReport(report)).toContain("Forge platform Fee Key LP fees claimed (gross)");
+    expect(renderRevenueReport(report)).toContain("creator allocation → Last-60");
   });
 
   test("Forge beneficiary undeclared or ≠ platform_nft_wallet, or lock facts missing: claim unresolved, contribution never payable", async () => {
@@ -216,14 +217,18 @@ describe("Forge platform LP claims → 50 % Last-60 contribution", () => {
     }
   });
 
-  test("exclusive_window (opt-in) links a separate, memo-less distribution only to the single open latest claim", async () => {
+  test("exclusive_window (opt-in) links a separate, memo-less distribution only to the single open latest claim — recorded, never payable", async () => {
     const db = await freshDb();
     const p = await providerOf();
     const r = runtime({ correlationMode: "exclusive_window" });
     const c1 = lpClaimIx();
     await ingest(db, p, buildTx({ slot: ACT + 5, ixs: [c1.ix], tokens: c1.tokens }), r);
     await ingest(db, p, buildTx({ slot: ACT + 6, ixs: [systemTransfer(FORGE, DEST, 500_000n)] }), r);
-    expect((await db.RewardFunding.findOne({}).lean() as any).correlationMethod).toBe("exclusive_window");
+    const w: any = await db.RewardFunding.findOne({}).lean();
+    expect(w.correlationMethod).toBe("exclusive_window");
+    // Linked for reconciliation, but a positional link never names its claim: never payable (v2).
+    expect(w.payoutEligible).toBe(false);
+    expect(w.ineligibleReason).toContain("correlation_exclusive_window_not_payable");
     // Two open claims, then one memo-less transfer: ambiguous → stays unlinked.
     const c2 = lpClaimIx();
     const c3 = lpClaimIx();
@@ -368,7 +373,7 @@ describe("round funding (phase-aware policy)", () => {
   const W = 240_000;
   const EXEC = T0 + W + 30_000;
   test("verified, finalized credits fund the round once; REWARD_PERCENTAGE is not applied; unresolved / other-mint / unfinalized credits are not consumed", async () => {
-    const r = await rig({ env: { REWARD_FUNDING_POLICY: "forge_phase_aware_v1", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "0", LAST60_FUNDING_DESTINATIONS: DEST } });
+    const r = await rig({ env: { REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "0", LAST60_FUNDING_DESTINATIONS: DEST, FORGE_PLATFORM_LP_BENEFICIARY: FORGE } });
     await r.worker.scheduler.tick(r.clock.now());
     const buyers = Array.from({ length: 6 }, wallet);
     const sigs: string[] = [];
@@ -377,8 +382,11 @@ describe("round funding (phase-aware policy)", () => {
       r.chain.advance(2);
     }
     const policy = r.cfg.revenue.policy;
-    const credit = (o: { key: string; signature: string; amount: bigint; eligible?: boolean; mint?: string; slot?: number }) =>
-      r.db.RewardFunding.create({ key: o.key, stream: "forge_platform_lp_last60_contribution", collectionKey: `c:${o.key}`, correlationMethod: "same_transaction", provider: "mock", tokenMint: "m", sourcePool: "p", pool: "p", signature: o.signature, ordinal: 1, slot: o.slot ?? 5, collectionSlot: o.slot ?? 5, fundingMint: o.mint ?? WSOL_MINT, observedAmount: dec(o.amount), creditableAmount: dec(o.eligible === false ? 0n : o.amount), excessAmount: dec(0n), status: o.eligible === false ? "unresolved" : "reconciled", payoutEligible: o.eligible !== false, policy: { ...policy, v: 1 }, snapshot: { v: 1 } });
+    const credit = async (o: { key: string; signature: string; amount: bigint; eligible?: boolean; mint?: string; slot?: number }) => {
+      // Claim and distribution in the same transaction: both signatures are the credited one.
+      await r.db.RevenueReconciliation.create({ key: `c:${o.key}`, stream: "forge_platform_lp_fee_collection", status: "reconciled", expectedLast60: dec(o.amount) });
+      return r.db.RewardFunding.create({ key: o.key, stream: "forge_platform_lp_last60_contribution", collectionKey: `c:${o.key}`, collectionSignature: o.signature, correlationMethod: "same_transaction", provider: "mock", tokenMint: "m", sourcePool: "p", pool: "p", signature: o.signature, ordinal: 1, slot: o.slot ?? 5, collectionSlot: o.slot ?? 5, fundingMint: o.mint ?? WSOL_MINT, observedAmount: dec(o.amount), creditableAmount: dec(o.eligible === false ? 0n : o.amount), excessAmount: dec(0n), status: o.eligible === false ? "unresolved" : "reconciled", payoutEligible: o.eligible !== false, policy: { ...policy, v: 1 }, snapshot: { v: 1 } });
+    };
     await credit({ key: "a", signature: sigs[0]!, amount: 300_000_000n });
     await credit({ key: "b", signature: sigs[1]!, amount: 200_000_000n });
     await credit({ key: "bad", signature: sigs[2]!, amount: 999_000_000n, eligible: false });
@@ -395,7 +403,7 @@ describe("round funding (phase-aware policy)", () => {
     expect(big(round.fees)).toBe(0n); // creator-allocated fees after activation are not distributed
     expect(big(round.funding)).toBe(500_000_000n);
     expect(big(round.reward)).toBe(500_000_000n); // 100 % of verified contributions; REWARD_PERCENTAGE (75 %) not applied
-    expect(round.fundingPolicy).toMatchObject({ version: "forge_phase_aware_v1", inForce: "forge_phase_aware_v1", legacyFeeSlotCap: 0 });
+    expect(round.fundingPolicy).toMatchObject({ version: "forge_phase_aware_v2", inForce: "forge_phase_aware_v2", legacyFeeSlotCap: 0 });
     expect(round.fundingBreakdown).toMatchObject({ credits: 2, pendingFinality: 1, byStream: { forge_platform_lp_last60_contribution: "500000000" } });
     expect(BigInt(round.fundingBreakdown.creatorFeesRecordedNotDistributed)).toBeGreaterThan(0n);
     const consumed: any[] = await r.db.RewardFunding.find({ roundNumber: 1 }).lean();
@@ -418,7 +426,7 @@ describe("round funding (phase-aware policy)", () => {
       r.chain.advance(2);
     }
     const s = r.trade({ trader: wallet(), quote: SOL / 10n });
-    await r.db.RewardFunding.create({ key: "x", stream: "forge_platform_lp_last60_contribution", collectionKey: "c", correlationMethod: "memo", provider: "mock", tokenMint: "m", sourcePool: "p", pool: "p", signature: s, ordinal: 1, slot: 5, collectionSlot: 5, fundingMint: WSOL_MINT, observedAmount: dec(9n * SOL), creditableAmount: dec(9n * SOL), excessAmount: dec(0n), status: "reconciled", payoutEligible: true, policy: { v: 1, version: "forge_phase_aware_v1" }, snapshot: { v: 1 } });
+    await r.db.RewardFunding.create({ key: "x", stream: "forge_platform_lp_last60_contribution", collectionKey: "c", correlationMethod: "memo", provider: "mock", tokenMint: "m", sourcePool: "p", pool: "p", signature: s, ordinal: 1, slot: 5, collectionSlot: 5, fundingMint: WSOL_MINT, observedAmount: dec(9n * SOL), creditableAmount: dec(9n * SOL), excessAmount: dec(0n), status: "reconciled", payoutEligible: true, policy: { v: 1, version: "forge_phase_aware_v2" }, snapshot: { v: 1 } });
     r.chain.advance(40);
     await r.worker.scheduler.tick(r.clock.now());
     r.clock.set(T0 + W);

@@ -6,7 +6,7 @@ import { PublicKey } from "@solana/web3.js";
 import { z } from "zod";
 import { parseUnits, WSOL_MINT } from "@last60/shared";
 import { jsonSafe } from "../util/json";
-import { makeFundingPolicy, type FundingCorrelationMode, type FundingPolicy } from "../accounting/revenueStreams";
+import { APPROVED_SHARES, makeFundingPolicy, type FundingCorrelationMode, type FundingPolicy } from "../accounting/revenueStreams";
 
 export type ProcessRole = "indexer" | "rewards" | "api" | "cli" | "test";
 
@@ -129,19 +129,20 @@ const RawEnv = z.object({
   /** CPMM AmmConfig.creator_fee_rate the migrated pool must use (millionths of swap value; Forgepad 500 = 0.05 %). */
   EXPECTED_CPMM_CREATOR_FEE_RATE: z.string().optional(),
 
-  // Phase-aware reward funding (PR #6; docs/REWARD_FUNDING.md). Default: the legacy policy, unchanged.
-  REWARD_FUNDING_POLICY: z.enum(["legacy_creator_fee_v1", "forge_phase_aware_v1"]).default("legacy_creator_fee_v1"),
-  /** Phase-aware policy governs slots strictly after this slot (required with forge_phase_aware_v1). */
+  // Phase-aware reward funding (docs/REWARD_FUNDING.md). Default: the legacy policy, unchanged.
+  // forge_phase_aware_v1 (PR #6) is retired and rejected; forge_phase_aware_v2 is the approved model.
+  REWARD_FUNDING_POLICY: z.enum(["legacy_creator_fee_v1", "forge_phase_aware_v1", "forge_phase_aware_v2"]).default("legacy_creator_fee_v1"),
+  /** Phase-aware policy governs slots strictly after this slot (required with forge_phase_aware_v2). */
   REWARD_FUNDING_POLICY_ACTIVATION_SLOT: z.string().optional(),
   /** Wallets that receive Last-60 funding (native SOL to the wallet, SPL to token accounts it owns). */
   LAST60_FUNDING_DESTINATIONS: csv(pubkey),
   /** Expected owner of Forge's platform LP Fee Key (must equal the PlatformConfig platform_nft_wallet). */
   FORGE_PLATFORM_LP_BENEFICIARY: optionalPubkey,
-  /** Share of each COLLECTED bonding-curve creator fee that funds Last-60 (creator keeps the rest). */
+  /** Approved model, fixed: 75 % of each COLLECTED bonding-curve creator fee funds Last-60 (any other value is rejected). */
   BONDING_CREATOR_FEE_LAST60_PERCENTAGE: z.string().default("75"),
-  /** Share of each COLLECTED Forge platform LP fee claim that funds Last-60 (Forge keeps the rest). */
+  /** Approved model, fixed: the creator's 50 % allocation of each CLAIMED Forge platform LP fee funds Last-60 (any other value is rejected). */
   FORGE_PLATFORM_LP_LAST60_PERCENTAGE: z.string().default("50"),
-  /** strict: same-transaction or memo correlation only. exclusive_window: also the unambiguous latest claim. */
+  /** strict: same-transaction or memo correlation only. exclusive_window: also the unambiguous latest claim (recorded, never payable). */
   FUNDING_CORRELATION_MODE: z.enum(["strict", "exclusive_window"]).default("strict"),
 
   BUYER_COUNT: int(5, 1, 50),
@@ -529,12 +530,17 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     if (!/^\d+$/.test(raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT.trim())) problems.push("REWARD_FUNDING_POLICY_ACTIVATION_SLOT: must be a non-negative integer slot");
     else activationSlot = Number(raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT.trim());
   }
-  const phaseAware = raw.REWARD_FUNDING_POLICY === "forge_phase_aware_v1";
-  if (phaseAware && activationSlot === null) problems.push("REWARD_FUNDING_POLICY_ACTIVATION_SLOT: is required with REWARD_FUNDING_POLICY=forge_phase_aware_v1 (rounds snapshotting after it are funded by verified contributions only)");
-  if (phaseAware && raw.LAST60_FUNDING_DESTINATIONS.length === 0) problems.push("LAST60_FUNDING_DESTINATIONS: at least one destination wallet is required with REWARD_FUNDING_POLICY=forge_phase_aware_v1");
+  if (raw.REWARD_FUNDING_POLICY === "forge_phase_aware_v1") problems.push("REWARD_FUNDING_POLICY: forge_phase_aware_v1 is retired (it treated the creator's 50 % LP allocation as Forge-funded, allowed other percentages and payable exclusive_window links); use forge_phase_aware_v2 — see docs/REWARD_FUNDING.md");
+  const phaseAware = raw.REWARD_FUNDING_POLICY === "forge_phase_aware_v2";
+  if (phaseAware && activationSlot === null) problems.push("REWARD_FUNDING_POLICY_ACTIVATION_SLOT: is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 (rounds snapshotting after it are funded by verified contributions only)");
+  if (phaseAware && raw.LAST60_FUNDING_DESTINATIONS.length === 0) problems.push("LAST60_FUNDING_DESTINATIONS: at least one destination wallet is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2");
+  if (phaseAware && !raw.FORGE_PLATFORM_LP_BENEFICIARY) problems.push("FORGE_PLATFORM_LP_BENEFICIARY: is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 (the creator's 50 % LP allocation is only verifiable against Forge's platform Fee Key owner)");
   if (raw.FORGE_PLATFORM_LP_BENEFICIARY && raw.LAST60_FUNDING_DESTINATIONS.includes(raw.FORGE_PLATFORM_LP_BENEFICIARY)) problems.push("LAST60_FUNDING_DESTINATIONS: must not include FORGE_PLATFORM_LP_BENEFICIARY (a self-transfer is not a contribution)");
   const bondingBps = raw.BONDING_CREATOR_FEE_LAST60_PERCENTAGE.trim() === "0" ? 0 : share("BONDING_CREATOR_FEE_LAST60_PERCENTAGE", raw.BONDING_CREATOR_FEE_LAST60_PERCENTAGE);
   const lpBps = raw.FORGE_PLATFORM_LP_LAST60_PERCENTAGE.trim() === "0" ? 0 : share("FORGE_PLATFORM_LP_LAST60_PERCENTAGE", raw.FORGE_PLATFORM_LP_LAST60_PERCENTAGE);
+  // The approved economic model is fixed; the variables exist only to make the values explicit.
+  if (bondingBps !== APPROVED_SHARES.bondingCreatorFeeLast60Bps) problems.push(`BONDING_CREATOR_FEE_LAST60_PERCENTAGE: the approved model is 75 (of each collected bonding-curve creator fee); got ${raw.BONDING_CREATOR_FEE_LAST60_PERCENTAGE}`);
+  if (lpBps !== APPROVED_SHARES.forgeLpLast60Bps) problems.push(`FORGE_PLATFORM_LP_LAST60_PERCENTAGE: the approved model is 50 (the creator's allocation of each claimed Forge LP fee); got ${raw.FORGE_PLATFORM_LP_LAST60_PERCENTAGE}`);
   let policy: FundingPolicy | null = null;
   try {
     policy = makeFundingPolicy({ version: raw.REWARD_FUNDING_POLICY, activationSlot: phaseAware ? activationSlot : null, bondingCreatorFeeLast60Bps: bondingBps, forgeLpLast60Bps: lpBps });

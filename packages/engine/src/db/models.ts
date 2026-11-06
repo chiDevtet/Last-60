@@ -313,6 +313,24 @@ const rewardFundingSchema = new Schema(
     blockTime: { type: Date, default: null },
     /** Accounting asset funded (WSOL mint for native SOL / WSOL). */
     fundingMint: { type: String, required: true },
+    // Funding contribution record (written once). Optional so credits written by PR #6 stay valid;
+    // those were never consumable (retired forge_phase_aware_v1 / legacy policy).
+    launchPhase: { type: String, default: null },
+    /** Original fee claim (collection) transaction. */
+    collectionSignature: { type: String, default: null },
+    /** Amount actually collected by the claim (fee mint base units). */
+    collectedAmount: { type: D, default: null },
+    /** Expected Last-60 allocation of the claim under the policy (after any pre-activation absorption). */
+    expectedAllocation: { type: D, default: null },
+    /** Wallet the contribution left (must be the claim's recipient). */
+    sourceWallet: { type: String, default: null },
+    /** Configured Last-60 funding destination that received it. */
+    destinationWallet: { type: String, default: null },
+    /** Launch creator the allocation is attributed to. */
+    creator: { type: String, default: null },
+    /** Whose allocation this is under the approved model ("creator" for both Last-60 contributions). */
+    allocationOwner: { type: String, default: null },
+    policyVersion: { type: String, default: null },
     observedAmount: { type: D, required: true },
     /** Portion supported by the policy (≤ remaining expected contribution of the claim). */
     creditableAmount: { type: D, required: true },
@@ -332,7 +350,7 @@ const rewardFundingSchema = new Schema(
 rewardFundingSchema.index({ collectionKey: 1, slot: 1 });
 rewardFundingSchema.index({ roundNumber: 1, fundingMint: 1 });
 rewardFundingSchema.index({ payoutEligible: 1, roundNumber: 1, fundingMint: 1, slot: 1 });
-guardImmutable(rewardFundingSchema, ["key", "stream", "collectionKey", "correlationMethod", "provider", "tokenMint", "sourcePool", "pool", "signature", "ordinal", "slot", "collectionSlot", "fundingMint", "observedAmount", "creditableAmount", "excessAmount", "status", "payoutEligible", "ineligibleReason", "policy", "snapshot"]);
+guardImmutable(rewardFundingSchema, ["key", "stream", "collectionKey", "correlationMethod", "provider", "tokenMint", "sourcePool", "pool", "signature", "ordinal", "slot", "collectionSlot", "fundingMint", "launchPhase", "collectionSignature", "collectedAmount", "expectedAllocation", "sourceWallet", "destinationWallet", "creator", "allocationOwner", "policyVersion", "observedAmount", "creditableAmount", "excessAmount", "status", "payoutEligible", "ineligibleReason", "policy", "snapshot"]);
 
 /**
  * Per-collection reconciliation (durable claim record). DERIVED: recomputed idempotently from the

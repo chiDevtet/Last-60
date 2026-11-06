@@ -23,8 +23,12 @@ import { EXCLUSION } from "../accounting/attribution";
 import {
   assetOf,
   correlateTransfer,
+  CURRENT_PHASE_AWARE_VERSION,
   expectedSplit,
+  isPhaseAwareVersion,
+  PAYABLE_CORRELATION_METHODS,
   phaseAwareInForce,
+  STREAM_INFO,
   policySnapshot,
   reconcileCollection,
   SPLIT_OF,
@@ -230,7 +234,7 @@ const SPLIT_STREAMS: CollectionStream[] = ["bonding_curve_creator_fee", "forge_p
  */
 export async function preActivationAbsorption(db: Models, launch: { sourcePool: string; quoteMint: string }, policy: Pick<FundingPolicy, "activationSlot" | "version">): Promise<Map<string, bigint>> {
   const out = new Map<string, bigint>();
-  if (policy.version !== "forge_phase_aware_v1" || policy.activationSlot === null) return out;
+  if (!isPhaseAwareVersion(policy.version) || policy.activationSlot === null) return out;
   const act = policy.activationSlot;
   const [fees]: any[] = await db.Swap.aggregate([{ $match: { pool: launch.sourcePool, status: "active", feePhase: "bonding_curve", eligibleFeeMint: launch.quoteMint, slot: { $lte: act } } }, { $group: { _id: null, t: { $sum: "$eligibleFee" } } }]);
   const [claims]: any[] = await db.FeeClaim.aggregate([{ $match: { pool: launch.sourcePool, status: "confirmed", slot: { $lte: act } } }, { $group: { _id: null, t: { $sum: "$quoteAmount" } } }]);
@@ -297,18 +301,26 @@ export async function reconcileFunding(db: Models, launch: { sourcePool: string;
     const already = totals.get(col.key)?.creditable ?? 0n;
     const expected = fact.expectedLast60 ?? 0n;
     const remaining = expected > already ? expected - already : 0n;
-    const phaseAware = r.policy.version === "forge_phase_aware_v1" && r.policy.activationSlot !== null;
+    const phaseAware = r.policy.version === CURRENT_PHASE_AWARE_VERSION && r.policy.activationSlot !== null;
     const afterActivation = phaseAware && col.slot > r.policy.activationSlot! && t.slot > r.policy.activationSlot!;
+    const split = SPLIT_OF[col.stream as CollectionStream]!;
+    // Creator attribution: both Last-60 contributions are creator allocations (75 % of the creator's
+    // bonding fee; the creator's 50 % allocation of Forge's LP claims) and must name the launch creator.
+    const creator: string | null = col.snapshot?.beneficiaries?.creator ?? null;
     const reasons: string[] = [];
     if (!fact.verified) reasons.push(`collection_not_verified: ${(col.snapshot?.problems ?? []).join("; ") || col.status}`);
-    if (!phaseAware) reasons.push(`policy_${r.policy.version}_does_not_fund_from_contributions`);
+    if (!phaseAware) reasons.push(r.policy.version === "forge_phase_aware_v1" ? "policy_forge_phase_aware_v1_retired" : `policy_${r.policy.version}_does_not_fund_from_contributions`);
     else if (!afterActivation) reasons.push(`before_policy_activation_slot_${r.policy.activationSlot}`);
+    if (!PAYABLE_CORRELATION_METHODS.includes(link.method)) reasons.push(`correlation_${link.method}_not_payable: the transfer does not name its claim (same transaction or last60:v1 memo required)`);
+    if (!creator) reasons.push("missing_creator_attribution");
+    // The contribution must leave the wallet that actually received the claim (creator for bonding fees,
+    // Forge's Fee Key holder for LP fees); correlation already enforces it — re-checked here explicitly.
+    if (t.sourceOwner !== col.beneficiary) reasons.push(`source_${t.sourceOwner}_is_not_the_claim_recipient_${col.beneficiary}`);
     if (t.status !== "observed") reasons.push(`inflow_${t.status}: ${t.excludedReason ?? ""}`);
     const amount = big(t.netAmount);
     const supported = fact.verified ? (amount < remaining ? amount : remaining) : 0n;
     const payable = reasons.length === 0 && supported > 0n;
     if (reasons.length === 0 && supported === 0n) reasons.push("exceeds_policy_amount: the claim's expected contribution is already fully funded");
-    const split = SPLIT_OF[col.stream as CollectionStream]!;
     const snapshot: RevenueSnapshot = { ...col.snapshot, stream: split.contribution, feeMint: t.feeMint };
     const res = await db.RewardFunding.updateOne(
       { key: t.key },
@@ -328,6 +340,17 @@ export async function reconcileFunding(db: Models, launch: { sourcePool: string;
           collectionSlot: col.slot,
           blockTime: t.blockTime ?? null,
           fundingMint: t.asset,
+          // Funding contribution record (docs/REWARD_FUNDING.md §5): the claim, its expected allocation
+          // and the observed payment are kept side by side and never merged.
+          launchPhase: col.launchPhase,
+          collectionSignature: col.signature,
+          collectedAmount: dec(big(col.netAmount)),
+          expectedAllocation: dec(expected),
+          sourceWallet: t.sourceOwner,
+          destinationWallet: t.destinationOwner,
+          creator,
+          allocationOwner: STREAM_INFO[split.contribution].allocationOwner,
+          policyVersion: r.policy.version,
           observedAmount: dec(amount),
           creditableAmount: dec(payable ? supported : 0n),
           excessAmount: dec(fact.verified ? amount - supported : 0n),
@@ -397,7 +420,7 @@ export async function refreshReconciliation(db: Models, collectionKey: string, a
         impliedRetained: dec(rec.impliedRetained),
         status: rec.status,
         verified: fact.verified,
-        discrepancies: [...rec.discrepancies, ...(pre > 0n ? [`pre_activation_accrual_excluded: ${pre} (already distributed under the legacy policy)`] : [])],
+        discrepancies: [...rec.discrepancies, ...(pre > 0n ? [`pre_activation_accrual_excluded: ${pre} (already distributed under the legacy policy)`] : []), ...(creditable > rec.expectedLast60 ? [`over_credited: ${creditable} credited > ${rec.expectedLast60} expected (concurrent reconciliation); the round consumption guard never consumes more than expected`] : [])],
         problems: c.snapshot?.problems ?? [],
         distributions: credits.map((x) => ({ transfer: x.key, signature: x.signature, ordinal: x.ordinal, slot: x.slot, method: x.correlationMethod, observed: big(x.observedAmount).toString(), creditable: big(x.creditableAmount).toString(), payoutEligible: x.payoutEligible, reason: x.ineligibleReason ?? null, roundNumber: x.roundNumber ?? null })),
         policy: c.snapshot?.policy ?? null,
@@ -411,5 +434,5 @@ export async function refreshReconciliation(db: Models, collectionKey: string, a
 /** Credits a round under the phase-aware policy may consume (not yet consumed, payable, in the payout asset). */
 export function consumableFundingMatch(policy: FundingPolicy, snapshotSlot: number, payoutMint: string): Record<string, unknown> | null {
   if (!phaseAwareInForce(policy, snapshotSlot)) return null;
-  return { payoutEligible: true, roundNumber: null, fundingMint: assetOf(payoutMint), "policy.version": "forge_phase_aware_v1", slot: { $gt: policy.activationSlot, $lte: snapshotSlot }, collectionSlot: { $gt: policy.activationSlot } };
+  return { payoutEligible: true, roundNumber: null, fundingMint: assetOf(payoutMint), "policy.version": CURRENT_PHASE_AWARE_VERSION, correlationMethod: { $in: [...PAYABLE_CORRELATION_METHODS] }, slot: { $gt: policy.activationSlot, $lte: snapshotSlot }, collectionSlot: { $gt: policy.activationSlot } };
 }
