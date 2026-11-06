@@ -163,7 +163,7 @@ leaders safe.
    `eligibleFee` + attribution `creatorAmount`) in the payout asset. Other assets are recorded, not
    converted; ineligible amounts are recorded as `FEE_EXCLUDED`.
 5b. Reward funding policy (`docs/REWARD_FUNDING.md`): under `legacy_creator_fee_v1` (default) the
-   step above is the only funding source. Under `forge_phase_aware_v1`, for a snapshot after the
+   step above is the only funding source. Under `forge_phase_aware_v2`, for a snapshot after the
    activation slot, eligible creator fees count only up to that slot and the round additionally
    consumes verified, reconciled Last-60 contribution credits (payout asset, finalized transfers,
    not yet consumed) — inside the step-7 transaction, conditionally, so each credit funds one round.

@@ -24,7 +24,7 @@ import { randomToken, seal, secureRandomInt, unseal } from "../util/crypto";
 import type { Clock } from "../util/time";
 import { rootLogger, type Logger } from "../util/logger";
 import { consumableFundingMatch, revenueRuntimeOf, revenueWatchAddresses } from "../revenue/ingest";
-import { phaseAwareInForce, policySnapshot } from "../accounting/revenueStreams";
+import { capCreditsPerCollection, phaseAwareInForce, policySnapshot } from "../accounting/revenueStreams";
 import { cursorId, readCursor, syncAddress } from "../indexer/signatureSync";
 import { allocate } from "./allocation";
 import { boundsOf, drawExecuteAt, roundIndexAt, type ScheduleParams } from "./roundMath";
@@ -303,7 +303,7 @@ export class RoundScheduler {
       if (legacyCap !== null) {
         legacyFees = period.afterSlot !== null && period.afterSlot >= legacyCap ? 0n : (await periodFees(this.d.db, { ...period, snapshotSlot: Math.min(snapshotSlot, legacyCap) }, settings.payoutAssetMint, { verifiedBasisIds })).payout;
       }
-      const funding = phaseAware ? await this.consumableFunding(policy!, snapshotSlot, settings.payoutAssetMint) : { credits: [], total: 0n, byStream: {}, pendingFinality: 0 };
+      const funding = phaseAware ? await this.consumableFunding(policy!, snapshotSlot, settings.payoutAssetMint) : { credits: [], total: 0n, byStream: {}, pendingFinality: 0, heldByAllocationGuard: 0 };
       const rolloverIn = prev ? big(prev.rolloverOut) : 0n;
       const a = allocate({ fees: legacyFees, funding: funding.total, rolloverIn, rewardBps: settings.rewardBps, recipients: selection.recipients.map((r) => r.wallet), minPayout: settings.minPayoutLamports, skippedRoundPolicy: settings.skippedRoundPolicy });
       const dryRun = settings.payoutMode !== "live";
@@ -339,9 +339,9 @@ export class RoundScheduler {
               nonPayoutAssetFees: fees.other.map((o) => ({ mint: o.mint, amount: dec(o.amount) })),
               ineligibleFees: fees.ineligible.map((o) => ({ mint: o.mint, amount: dec(o.amount), reason: o.reason.slice(0, 300) })),
               feeBreakdown: { byPhase: fees.byPhase, swaps: fees.swaps, attributions: fees.attributions, verifiedBasisIds, bases: bases.map((b) => ({ id: b.id, phase: b.phase, pool: b.pool, role: b.role, beneficiary: b.beneficiary, verification: b.verification })) },
-              fundingPolicy: policy ? { ...policySnapshot(policy), inForce: phaseAware ? "forge_phase_aware_v1" : "legacy_creator_fee_v1", legacyFeeSlotCap: legacyCap } : null,
+              fundingPolicy: policy ? { ...policySnapshot(policy), inForce: phaseAware ? policy!.version : "legacy_creator_fee_v1", legacyFeeSlotCap: legacyCap } : null,
               funding: dec(funding.total),
-              fundingBreakdown: { byStream: Object.fromEntries(Object.entries(funding.byStream).map(([k, v]) => [k, (v as bigint).toString()])), credits: funding.credits.length, pendingFinality: funding.pendingFinality, creatorFeesRecordedNotDistributed: (fees.payout - legacyFees).toString() },
+              fundingBreakdown: { byStream: Object.fromEntries(Object.entries(funding.byStream).map(([k, v]) => [k, (v as bigint).toString()])), credits: funding.credits.length, pendingFinality: funding.pendingFinality, heldByAllocationGuard: funding.heldByAllocationGuard, creatorFeesRecordedNotDistributed: (fees.payout - legacyFees).toString() },
               reward: dec(a.pool),
               retained: dec(a.retained + a.retainedPool),
               rolloverIn: dec(a.rolloverIn),
@@ -419,14 +419,18 @@ export class RoundScheduler {
 
   /**
    * Verified, reconciled Last-60 contribution credits this round may consume: payable, not yet
-   * consumed, in the payout asset, after the activation slot, at or before the snapshot — and whose
-   * transaction is FINALIZED (a confirmed-but-forked transfer can never fund a payout; such credits
-   * wait for a later round).
+   * consumed, in the payout asset, after the activation slot, at or before the snapshot, correlated
+   * by same transaction or memo — and whose transfer AND original claim transactions are both
+   * FINALIZED and successful (a confirmed-but-forked transfer or claim can never fund a payout; such
+   * credits wait for a later round, and a claim that never finalizes never funds). Finally the
+   * per-claim cap guarantees that the total ever consumed for one claim never exceeds its expected
+   * Last-60 allocation, whatever was written by concurrent reconciliation passes.
    */
   private async consumableFunding(policy: NonNullable<AppConfig["revenue"]>["policy"], snapshotSlot: number, payoutMint: string) {
     const match = consumableFundingMatch(policy, snapshotSlot, payoutMint);
     const candidates: any[] = match ? await this.d.db.RewardFunding.find(match).sort({ slot: 1, ordinal: 1 }).lean() : [];
-    const sigs = [...new Set(candidates.map((c) => c.signature))];
+    const claimSig = (c: any) => c.collectionSignature ?? String(c.collectionKey).split(":")[1];
+    const sigs = [...new Set(candidates.flatMap((c) => [c.signature, claimSig(c)]).filter(Boolean))];
     const finalized = new Set<string>();
     for (let i = 0; i < sigs.length; i += 200) {
       const chunk = sigs.slice(i, i + 200);
@@ -435,7 +439,18 @@ export class RoundScheduler {
         if (st[j] && !st[j]!.err && st[j]!.confirmationStatus === "finalized") finalized.add(sig);
       });
     }
-    const credits = candidates.filter((c) => finalized.has(c.signature));
+    const final = candidates.filter((c) => finalized.has(c.signature) && finalized.has(claimSig(c)));
+    // Per-claim cap over every credit of the claims involved (already-consumed ones count first).
+    const cols = [...new Set(final.map((c) => c.collectionKey))];
+    const recs: any[] = cols.length ? await this.d.db.RevenueReconciliation.find({ key: { $in: cols } }, { key: 1, expectedLast60: 1 }).lean() : [];
+    const siblings: any[] = cols.length ? await this.d.db.RewardFunding.find({ collectionKey: { $in: cols }, payoutEligible: true }, { key: 1, collectionKey: 1, creditableAmount: 1, slot: 1, ordinal: 1, roundNumber: 1 }).lean() : [];
+    const finalKeys = new Set(final.map((c) => c.key));
+    const cap = capCreditsPerCollection(
+      siblings.filter((x) => x.roundNumber != null || finalKeys.has(x.key)).map((x) => ({ key: x.key, collectionKey: x.collectionKey, creditable: big(x.creditableAmount), slot: x.slot, ordinal: x.ordinal, consumed: x.roundNumber != null })),
+      new Map(recs.map((r) => [r.key, big(r.expectedLast60)])),
+    );
+    if (cap.blocked.length) this.log.warn({ blocked: cap.blocked.slice(0, 20) }, "funding credits held back by the per-claim allocation guard");
+    const credits = final.filter((c) => cap.allowed.has(c.key));
     const byStream: Record<string, bigint> = {};
     let total = 0n;
     for (const c of credits) {
@@ -443,7 +458,7 @@ export class RoundScheduler {
       total += v;
       byStream[c.stream] = (byStream[c.stream] ?? 0n) + v;
     }
-    return { credits, total, byStream, pendingFinality: candidates.length - credits.length };
+    return { credits, total, byStream, pendingFinality: candidates.length - final.length, heldByAllocationGuard: cap.blocked.length };
   }
 
   /**

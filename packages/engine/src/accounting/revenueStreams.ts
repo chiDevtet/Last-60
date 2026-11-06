@@ -1,17 +1,24 @@
 /**
  * Phase-aware revenue attribution and Last-60 buyer-reward funding (pure; no I/O).
  *
- * Forge's business rules (PR #6) define seven economically different streams. They are NEVER
+ * The approved Forge business model defines seven economically different streams. They are NEVER
  * collapsed into one "creator fee" total:
  *
- *   phase           stream                                      beneficiary   reward funding?
- *   bonding_curve   bonding_curve_creator_fee                   creator       no  (gross collection)
- *   bonding_curve   bonding_curve_creator_retained              creator       no  (derived: gross − contribution)
- *   bonding_curve   bonding_curve_last60_reward_contribution    Last-60       YES (observed transfer only)
- *   post_migration  cpmm_creator_trading_fee                    creator       no  (direct creator revenue)
- *   post_migration  forge_platform_lp_fee_collection            Forge         no  (gross collection)
- *   post_migration  forge_platform_lp_last60_contribution       Last-60       YES (observed transfer only)
- *   post_migration  forge_platform_lp_retained                  Forge         no  (derived: gross − contribution)
+ *   phase           stream                                      allocation of   paid to   reward funding?
+ *   bonding_curve   bonding_curve_creator_fee                   (gross)         creator   no  (gross collection, 0.50 % of volume)
+ *   bonding_curve   bonding_curve_creator_retained              creator 25 %    creator   no  (developer revenue; derived)
+ *   bonding_curve   bonding_curve_last60_reward_contribution    creator 75 %    Last-60   YES (observed transfer only)
+ *   post_migration  cpmm_creator_trading_fee                    creator 100 %   creator   no  (developer revenue; never funding)
+ *   post_migration  forge_platform_lp_fee_collection            (gross)         Forge     no  (Forge-owned Fee Key, gross claim)
+ *   post_migration  forge_platform_lp_last60_contribution       creator 50 %    Last-60   YES (the CREATOR'S allocation of Forge's
+ *                                                                                              LP claims, dedicated to buyer rewards;
+ *                                                                                              observed transfer only)
+ *   post_migration  forge_platform_lp_retained                  Forge 50 %      Forge     no  (derived: gross − contribution)
+ *
+ * The creator's 50 % LP allocation is NOT the creator's native CPMM creator fee and NOT personal
+ * developer revenue: Forge holds it (it claims the platform-owned Fee Key) and must route it to the
+ * Last-60 funding destination. It is attributed to the launch creator (`allocationOwner: creator`),
+ * custodied by Forge until transferred, and funds buyer rewards only once that transfer is observed.
  *
  * A fee RATE (bonding-curve creator fee 0.50 % of volume, CPMM creator fee 0.05 % of volume) says
  * how much is charged per trade. An ALLOCATION percentage (75 % / 50 %) is applied to fees ACTUALLY
@@ -41,20 +48,29 @@ export type ContributionStream = "bonding_curve_last60_reward_contribution" | "f
 export interface StreamInfo {
   phase: LaunchPhase;
   kind: "collection" | "contribution" | "retained";
+  /** Who finally receives the amount. */
   beneficiary: "creator" | "forge" | "last60";
+  /**
+   * Whose ALLOCATION the amount is under the approved model (null for gross collections). Both
+   * Last-60 contributions are creator allocations: 75 % of the creator's collected bonding-curve fee,
+   * and the creator's 50 % allocation of Forge's platform LP claims.
+   */
+  allocationOwner: "creator" | "forge" | null;
+  /** Wallet that holds the amount right after the on-chain claim (before any distribution). */
+  custodian: "creator" | "forge";
   /** Whether verified, reconciled amounts of this stream may fund buyer rewards. */
   rewardEligible: boolean;
   label: string;
 }
 
 export const STREAM_INFO: Record<RevenueStream, StreamInfo> = {
-  bonding_curve_creator_fee: { phase: "bonding_curve", kind: "collection", beneficiary: "creator", rewardEligible: false, label: "Bonding-curve creator fee collected (gross)" },
-  bonding_curve_creator_retained: { phase: "bonding_curve", kind: "retained", beneficiary: "creator", rewardEligible: false, label: "Bonding-curve creator fee retained by the creator" },
-  bonding_curve_last60_reward_contribution: { phase: "bonding_curve", kind: "contribution", beneficiary: "last60", rewardEligible: true, label: "Bonding-curve creator-fee contribution to Last-60" },
-  cpmm_creator_trading_fee: { phase: "post_migration", kind: "collection", beneficiary: "creator", rewardEligible: false, label: "CPMM creator trading fee (direct creator revenue)" },
-  forge_platform_lp_fee_collection: { phase: "post_migration", kind: "collection", beneficiary: "forge", rewardEligible: false, label: "Forge platform LP fees claimed (gross)" },
-  forge_platform_lp_last60_contribution: { phase: "post_migration", kind: "contribution", beneficiary: "last60", rewardEligible: true, label: "Forge platform LP contribution to Last-60" },
-  forge_platform_lp_retained: { phase: "post_migration", kind: "retained", beneficiary: "forge", rewardEligible: false, label: "Forge platform LP fees retained by Forge" },
+  bonding_curve_creator_fee: { phase: "bonding_curve", kind: "collection", beneficiary: "creator", allocationOwner: null, custodian: "creator", rewardEligible: false, label: "Bonding-curve creator fee collected (gross, 0.50 % of volume)" },
+  bonding_curve_creator_retained: { phase: "bonding_curve", kind: "retained", beneficiary: "creator", allocationOwner: "creator", custodian: "creator", rewardEligible: false, label: "Bonding-curve creator fee retained by the creator (25 %, developer revenue)" },
+  bonding_curve_last60_reward_contribution: { phase: "bonding_curve", kind: "contribution", beneficiary: "last60", allocationOwner: "creator", custodian: "creator", rewardEligible: true, label: "Bonding-curve creator fee → Last-60 buyer rewards (75 %)" },
+  cpmm_creator_trading_fee: { phase: "post_migration", kind: "collection", beneficiary: "creator", allocationOwner: "creator", custodian: "creator", rewardEligible: false, label: "CPMM creator trading fee (0.05 % of volume, developer revenue, never Last-60)" },
+  forge_platform_lp_fee_collection: { phase: "post_migration", kind: "collection", beneficiary: "forge", allocationOwner: null, custodian: "forge", rewardEligible: false, label: "Forge platform Fee Key LP fees claimed (gross)" },
+  forge_platform_lp_last60_contribution: { phase: "post_migration", kind: "contribution", beneficiary: "last60", allocationOwner: "creator", custodian: "forge", rewardEligible: true, label: "Creator's 50 % allocation of Forge LP fees → Last-60 buyer rewards" },
+  forge_platform_lp_retained: { phase: "post_migration", kind: "retained", beneficiary: "forge", allocationOwner: "forge", custodian: "forge", rewardEligible: false, label: "Forge platform LP fees retained by Forge (50 %)" },
 };
 
 /** The contribution / retained streams that belong to a collection stream (null: no split). */
@@ -70,15 +86,25 @@ export const SPLIT_OF: Record<CollectionStream, { contribution: ContributionStre
  * legacy_creator_fee_v1  — behaviour of PR #3–#5: a round's reward is REWARD_PERCENTAGE of the
  *                          verified creator-allocated fees of its period. Contributions are recorded
  *                          and reported but never fund rounds.
- * forge_phase_aware_v1   — Forge's two-phase model: rounds are funded ONLY by verified, reconciled
- *                          contribution transfers (bonding 75 % of collected creator fees, Forge LP 50 %
- *                          of collected platform LP fees). REWARD_PERCENTAGE is NOT applied to them
- *                          (they already are the reward share); creator-allocated fees of slots after the
- *                          activation slot are recorded and reported but no longer distributed, so the
- *                          same economic value is never counted twice.
+ * forge_phase_aware_v1   — PR #6's first phase-aware policy. RETIRED: it treated the Forge LP 50 % as a
+ *                          Forge-funded contribution with no creator attribution, let the split
+ *                          percentages be reconfigured, made amount-free `exclusive_window` links payable
+ *                          and did not require the CLAIM transaction to be finalized. Kept only so stored
+ *                          snapshots stay readable; it can no longer be selected, and its credits are
+ *                          never consumable.
+ * forge_phase_aware_v2   — the APPROVED model: rounds are funded ONLY by verified, finalized, correlated
+ *                          (same transaction or `last60:v1` memo) contribution transfers — 75 % of each
+ *                          collected bonding-curve creator fee and the creator's 50 % allocation of each
+ *                          Forge platform LP claim. The shares are fixed (7 500 / 5 000 bps). REWARD_PERCENTAGE
+ *                          is NOT applied to them (they already are the reward share); creator-allocated
+ *                          fees of slots after the activation slot are recorded and reported but no longer
+ *                          distributed, so the same economic value is never counted twice.
  */
-export type FundingPolicyVersion = "legacy_creator_fee_v1" | "forge_phase_aware_v1";
-export const FUNDING_POLICY_VERSIONS: readonly FundingPolicyVersion[] = ["legacy_creator_fee_v1", "forge_phase_aware_v1"];
+export type FundingPolicyVersion = "legacy_creator_fee_v1" | "forge_phase_aware_v1" | "forge_phase_aware_v2";
+export const FUNDING_POLICY_VERSIONS: readonly FundingPolicyVersion[] = ["legacy_creator_fee_v1", "forge_phase_aware_v1", "forge_phase_aware_v2"];
+/** The only phase-aware version that can be configured and whose credits can fund rounds. */
+export const CURRENT_PHASE_AWARE_VERSION = "forge_phase_aware_v2" as const;
+export const isPhaseAwareVersion = (v: FundingPolicyVersion): boolean => v === "forge_phase_aware_v1" || v === "forge_phase_aware_v2";
 
 export interface FundingPolicy {
   /** Stable id: hash of the version and every parameter (same id = same policy). */
@@ -96,13 +122,24 @@ export function makeFundingPolicy(p: Omit<FundingPolicy, "id">): FundingPolicy {
   for (const [k, v] of [["bondingCreatorFeeLast60Bps", p.bondingCreatorFeeLast60Bps], ["forgeLpLast60Bps", p.forgeLpLast60Bps]] as const) {
     if (!Number.isInteger(v) || v < 0 || v > 10_000) throw new Error(`funding policy ${k} must be an integer in [0, 10000], got ${v}`);
   }
-  if (p.version === "forge_phase_aware_v1" && (p.activationSlot === null || !Number.isInteger(p.activationSlot) || p.activationSlot < 0)) throw new Error("forge_phase_aware_v1 requires a non-negative integer activation slot");
+  if (isPhaseAwareVersion(p.version) && (p.activationSlot === null || !Number.isInteger(p.activationSlot) || p.activationSlot < 0)) throw new Error(`${p.version} requires a non-negative integer activation slot`);
+  if (p.version === "forge_phase_aware_v2" && (p.bondingCreatorFeeLast60Bps !== APPROVED_SHARES.bondingCreatorFeeLast60Bps || p.forgeLpLast60Bps !== APPROVED_SHARES.forgeLpLast60Bps)) {
+    throw new Error(`forge_phase_aware_v2 implements the approved model only: bonding 75 % (7500 bps) and Forge LP creator allocation 50 % (5000 bps); got ${p.bondingCreatorFeeLast60Bps} / ${p.forgeLpLast60Bps}`);
+  }
   const canon = JSON.stringify([p.version, p.activationSlot, p.bondingCreatorFeeLast60Bps, p.forgeLpLast60Bps]);
   return { ...p, id: createHash("sha256").update(canon).digest("hex").slice(0, 24) };
 }
 
-/** Forge's stated business rules: 25 % creator / 75 % Last-60 of collected bonding fees; 50 / 50 of Forge LP claims. */
-export const FORGE_POLICY_DEFAULTS = { bondingCreatorFeeLast60Bps: 7_500, forgeLpLast60Bps: 5_000 } as const;
+/**
+ * The approved economic model (fixed; not configurable under forge_phase_aware_v2):
+ *   bonding curve  — of each COLLECTED creator fee: 75 % Last-60 buyer rewards, 25 % creator;
+ *   post-migration — of each CLAIMED Forge platform LP fee: 50 % creator allocation → Last-60, 50 % Forge.
+ */
+export const APPROVED_SHARES = { bondingCreatorFeeLast60Bps: 7_500, forgeLpLast60Bps: 5_000 } as const;
+/** @deprecated name kept for callers of PR #6; identical to APPROVED_SHARES. */
+export const FORGE_POLICY_DEFAULTS = APPROVED_SHARES;
+/** Approved fee RATES (charged per trade, millionths of volume). Rates are context, never evidence of collection. */
+export const APPROVED_FEE_RATES = { bondingCreatorFeeRate: 5_000, cpmmCreatorFeeRate: 500 } as const;
 
 export function policyLast60Bps(policy: FundingPolicy, stream: CollectionStream): number | null {
   if (stream === "bonding_curve_creator_fee") return policy.bondingCreatorFeeLast60Bps;
@@ -123,10 +160,20 @@ export function policySnapshot(p: FundingPolicy): PolicySnapshot {
   return { v: 1, id: p.id, version: p.version, activationSlot: p.activationSlot, bondingCreatorFeeLast60Bps: p.bondingCreatorFeeLast60Bps, forgeLpLast60Bps: p.forgeLpLast60Bps };
 }
 
-/** Whether a round with this snapshot slot is governed by the phase-aware policy. */
+/**
+ * Whether a round with this snapshot slot is governed by the phase-aware policy. Only the current
+ * (approved) version can be in force; a retired v1 policy object never funds a round.
+ */
 export function phaseAwareInForce(policy: FundingPolicy, snapshotSlot: number): boolean {
-  return policy.version === "forge_phase_aware_v1" && policy.activationSlot !== null && snapshotSlot > policy.activationSlot;
+  return policy.version === CURRENT_PHASE_AWARE_VERSION && policy.activationSlot !== null && snapshotSlot > policy.activationSlot;
 }
+
+/**
+ * Correlation methods whose links may fund rewards under the approved policy. `exclusive_window`
+ * links by position, not by evidence naming the claim: it is recorded for reconciliation but never
+ * payable (a Forge wallet that also pays out other streams could otherwise be credited for them).
+ */
+export const PAYABLE_CORRELATION_METHODS: readonly CorrelationMethod[] = ["same_transaction", "memo"];
 
 // ── deterministic split ─────────────────────────────────────────────────────────────────────
 
@@ -364,4 +411,49 @@ export interface RevenueSnapshot {
   effectiveFeeConfig: Record<string, string | number | boolean | null>;
   verification: "verified" | "unverifiable" | "mismatch" | "not_declared";
   problems: string[];
+}
+
+// ── consumption guard: never more than the expected allocation per collection ────────────────
+
+export interface CapCredit {
+  key: string;
+  collectionKey: string;
+  creditable: bigint;
+  slot: number;
+  ordinal: number;
+  /** Already consumed by a round (counts against the allocation, never re-consumed). */
+  consumed: boolean;
+}
+
+/**
+ * Pure: the defence-in-depth cap applied when a round consumes credits. Credits are written one per
+ * inflow, each capped at the claim's remaining expected allocation at the time it was written; two
+ * reconciliation passes running concurrently could each see the same remaining amount. Walking every
+ * credit of a collection in chain order (consumed ones first count against the allocation) guarantees
+ * that the sum ever consumed for one claim never exceeds its expected Last-60 allocation. A credit
+ * that would exceed it — or whose claim has no reconciliation row — is not consumable.
+ */
+export function capCreditsPerCollection(credits: CapCredit[], expectedByCollection: Map<string, bigint>): { allowed: Set<string>; blocked: { key: string; collectionKey: string; reason: string }[] } {
+  const allowed = new Set<string>();
+  const blocked: { key: string; collectionKey: string; reason: string }[] = [];
+  const byCol = new Map<string, CapCredit[]>();
+  for (const c of credits) (byCol.get(c.collectionKey) ?? byCol.set(c.collectionKey, []).get(c.collectionKey)!).push(c);
+  for (const [col, list] of byCol) {
+    const expected = expectedByCollection.get(col);
+    const ordered = [...list].sort((a, b) => Number(b.consumed) - Number(a.consumed) || a.slot - b.slot || a.ordinal - b.ordinal || (a.key < b.key ? -1 : 1));
+    let remaining = expected ?? 0n;
+    for (const c of ordered) {
+      if (c.consumed) {
+        remaining -= c.creditable;
+        continue;
+      }
+      if (expected === undefined) blocked.push({ key: c.key, collectionKey: col, reason: "no_reconciliation_row_for_claim" });
+      else if (c.creditable > remaining) blocked.push({ key: c.key, collectionKey: col, reason: `over_allocation_guard: ${c.creditable} > remaining ${remaining < 0n ? 0n : remaining} of ${expected}` });
+      else {
+        remaining -= c.creditable;
+        allowed.add(c.key);
+      }
+    }
+  }
+  return { allowed, blocked };
 }

@@ -29,7 +29,11 @@ const SOL = 1_000_000_000n;
 const USD1 = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
 
 describe("revenue streams", () => {
-  test("seven distinct streams; only the two Last-60 contributions are reward-eligible", () => {
+  test("seven distinct streams; only the two Last-60 contributions are reward-eligible; both are CREATOR allocations", () => {
+    expect(STREAM_INFO.forge_platform_lp_last60_contribution).toMatchObject({ beneficiary: "last60", allocationOwner: "creator", custodian: "forge", rewardEligible: true });
+    expect(STREAM_INFO.bonding_curve_last60_reward_contribution).toMatchObject({ beneficiary: "last60", allocationOwner: "creator", custodian: "creator", rewardEligible: true });
+    expect(STREAM_INFO.forge_platform_lp_retained).toMatchObject({ beneficiary: "forge", allocationOwner: "forge", rewardEligible: false });
+    expect(STREAM_INFO.cpmm_creator_trading_fee).toMatchObject({ beneficiary: "creator", allocationOwner: "creator", rewardEligible: false });
     expect(REVENUE_STREAMS).toHaveLength(7);
     const eligible = REVENUE_STREAMS.filter((s) => STREAM_INFO[s].rewardEligible);
     expect(eligible.sort()).toEqual(["bonding_curve_last60_reward_contribution", "forge_platform_lp_last60_contribution"]);
@@ -74,17 +78,22 @@ describe("revenue streams", () => {
 });
 
 describe("versioned funding policy", () => {
-  test("ids hash every parameter; phase-aware needs an activation slot; legacy never funds from contributions", () => {
+  test("ids hash every parameter; phase-aware needs an activation slot; legacy and the retired v1 never fund from contributions", () => {
     const legacy = makeFundingPolicy({ version: "legacy_creator_fee_v1", activationSlot: null, ...FORGE_POLICY_DEFAULTS });
-    const a = makeFundingPolicy({ version: "forge_phase_aware_v1", activationSlot: 100, ...FORGE_POLICY_DEFAULTS });
-    const b = makeFundingPolicy({ version: "forge_phase_aware_v1", activationSlot: 100, bondingCreatorFeeLast60Bps: 7_000, forgeLpLast60Bps: 5_000 });
+    const a = makeFundingPolicy({ version: "forge_phase_aware_v2", activationSlot: 100, ...FORGE_POLICY_DEFAULTS });
+    const b = makeFundingPolicy({ version: "forge_phase_aware_v2", activationSlot: 101, ...FORGE_POLICY_DEFAULTS });
     expect(a.id).not.toBe(b.id);
-    expect(makeFundingPolicy({ version: "forge_phase_aware_v1", activationSlot: 100, ...FORGE_POLICY_DEFAULTS }).id).toBe(a.id);
-    expect(() => makeFundingPolicy({ version: "forge_phase_aware_v1", activationSlot: null, ...FORGE_POLICY_DEFAULTS })).toThrow();
+    expect(makeFundingPolicy({ version: "forge_phase_aware_v2", activationSlot: 100, ...FORGE_POLICY_DEFAULTS }).id).toBe(a.id);
+    expect(() => makeFundingPolicy({ version: "forge_phase_aware_v2", activationSlot: null, ...FORGE_POLICY_DEFAULTS })).toThrow();
+    // The approved shares are fixed under v2.
+    expect(() => makeFundingPolicy({ version: "forge_phase_aware_v2", activationSlot: 100, bondingCreatorFeeLast60Bps: 7_000, forgeLpLast60Bps: 5_000 })).toThrow("approved model");
+    expect(() => makeFundingPolicy({ version: "forge_phase_aware_v2", activationSlot: 100, bondingCreatorFeeLast60Bps: 7_500, forgeLpLast60Bps: 10_000 })).toThrow("approved model");
     expect(() => makeFundingPolicy({ version: "forge_phase_aware_v1", activationSlot: 1, bondingCreatorFeeLast60Bps: 10_001, forgeLpLast60Bps: 1 })).toThrow();
     expect(phaseAwareInForce(legacy, 10 ** 9)).toBe(false);
     expect(phaseAwareInForce(a, 100)).toBe(false); // strictly after the activation slot
     expect(phaseAwareInForce(a, 101)).toBe(true);
+    // A retired v1 policy object (e.g. read back from a stored snapshot) is never in force.
+    expect(phaseAwareInForce(makeFundingPolicy({ version: "forge_phase_aware_v1", activationSlot: 100, ...FORGE_POLICY_DEFAULTS }), 10 ** 9)).toBe(false);
   });
 });
 
@@ -258,17 +267,22 @@ describe("configuration", () => {
     expect(d.rewards.rewardBps).toBe(4_000);
     expect(d.revenue.policy.bondingCreatorFeeLast60Bps).toBe(7_500);
   });
-  test("phase-aware policy requires an activation slot and at least one destination; fails closed otherwise", () => {
-    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v1" }).join("\n")).toContain("REWARD_FUNDING_POLICY_ACTIVATION_SLOT");
-    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v1", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "5" }).join("\n")).toContain("LAST60_FUNDING_DESTINATIONS");
-    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v1", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "x", LAST60_FUNDING_DESTINATIONS: DEST }).join("\n")).toContain("non-negative integer");
+  test("phase-aware policy requires an activation slot, a destination and the Forge Fee Key owner; fails closed otherwise; v1 is retired", () => {
+    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v1", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "5", LAST60_FUNDING_DESTINATIONS: DEST, FORGE_PLATFORM_LP_BENEFICIARY: FORGE }).join("\n")).toContain("forge_phase_aware_v1 is retired");
+    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2" }).join("\n")).toContain("REWARD_FUNDING_POLICY_ACTIVATION_SLOT");
+    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "5" }).join("\n")).toContain("LAST60_FUNDING_DESTINATIONS");
+    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "5", LAST60_FUNDING_DESTINATIONS: DEST }).join("\n")).toContain("FORGE_PLATFORM_LP_BENEFICIARY: is required");
+    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "x", LAST60_FUNDING_DESTINATIONS: DEST }).join("\n")).toContain("non-negative integer");
+    // The approved percentages cannot be changed, under any policy.
+    expect(problems({ BONDING_CREATOR_FEE_LAST60_PERCENTAGE: "70" }).join("\n")).toContain("approved model is 75");
+    expect(problems({ FORGE_PLATFORM_LP_LAST60_PERCENTAGE: "100" }).join("\n")).toContain("approved model is 50");
     expect(problems({ LAST60_FUNDING_DESTINATIONS: "not-a-key" }).length).toBeGreaterThan(0);
     expect(problems({ FORGE_PLATFORM_LP_BENEFICIARY: DEST, LAST60_FUNDING_DESTINATIONS: DEST }).join("\n")).toContain("must not include FORGE_PLATFORM_LP_BENEFICIARY");
     expect(problems({ BONDING_CREATOR_FEE_LAST60_PERCENTAGE: "101" }).length).toBeGreaterThan(0);
     expect(problems({ EXPECTED_CPMM_CREATOR_FEE_RATE: "1000001" }).length).toBeGreaterThan(0);
-    const ok = loadConfig("test", { ...base, REWARD_FUNDING_POLICY: "forge_phase_aware_v1", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "466000000", LAST60_FUNDING_DESTINATIONS: DEST, FORGE_PLATFORM_LP_BENEFICIARY: FORGE, EXPECTED_CPMM_CREATOR_FEE_RATE: "500", FUNDING_CORRELATION_MODE: "exclusive_window" });
+    const ok = loadConfig("test", { ...base, REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "466000000", LAST60_FUNDING_DESTINATIONS: DEST, FORGE_PLATFORM_LP_BENEFICIARY: FORGE, EXPECTED_CPMM_CREATOR_FEE_RATE: "500", FUNDING_CORRELATION_MODE: "exclusive_window" });
     expect(ok.revenue).toMatchObject({ fundingDestinations: [DEST], forgePlatformLpBeneficiary: FORGE, correlationMode: "exclusive_window" });
-    expect(ok.revenue.policy).toMatchObject({ version: "forge_phase_aware_v1", activationSlot: 466_000_000 });
+    expect(ok.revenue.policy).toMatchObject({ version: "forge_phase_aware_v2", activationSlot: 466_000_000, bondingCreatorFeeLast60Bps: 7_500, forgeLpLast60Bps: 5_000 });
     expect(ok.provider.expected.cpmmCreatorFeeRate).toBe(500);
   });
 });

@@ -130,7 +130,7 @@ export function renderRevenueReport(r: RevenueReport): string {
   const L: string[] = [];
   const p = r.policy;
   L.push(`LAST60 revenue report — ${r.generatedAt}${r.sourcePool ? ` — bonding pool ${r.sourcePool}` : ""}`);
-  L.push(`Funding policy: ${p.version} (id ${p.id}); activation slot ${p.activationSlot ?? "—"}; bonding contribution ${p.bondingCreatorFeeLast60Bps / 100}% of COLLECTED creator fees; Forge LP contribution ${p.forgeLpLast60Bps / 100}% of COLLECTED platform LP fees${p.phaseAwareInForce === null ? "" : `; phase-aware in force at slot ${p.inForceAtSlot}: ${p.phaseAwareInForce ? "yes" : "no"}`}`);
+  L.push(`Funding policy: ${p.version} (id ${p.id}); activation slot ${p.activationSlot ?? "—"}; bonding: ${p.bondingCreatorFeeLast60Bps / 100}% of COLLECTED creator fees to Last-60 (creator keeps ${(10_000 - p.bondingCreatorFeeLast60Bps) / 100}%); Forge LP: creator's ${p.forgeLpLast60Bps / 100}% allocation of CLAIMED platform LP fees to Last-60 (Forge keeps ${(10_000 - p.forgeLpLast60Bps) / 100}%); CPMM creator fees: 0% to Last-60${p.phaseAwareInForce === null ? "" : `; phase-aware in force at slot ${p.inForceAtSlot}: ${p.phaseAwareInForce ? "yes" : "no"}`}`);
   L.push("Amounts are integer base units of each fee mint. A fee RATE is not an allocation; an expected split is not a payment.");
   L.push("");
   L.push(`BONDING CURVE — ${STREAM_INFO.bonding_curve_creator_fee.label}`);
@@ -152,7 +152,7 @@ export function renderRevenueReport(r: RevenueReport): string {
   for (const [m, x] of Object.entries(r.postMigration.forgePlatformLp)) {
     L.push(`  mint ${m}: ${x.collections} claim(s), ${x.verifiedCollections} verified`);
     L.push(`    gross platform LP fees claimed ${x.grossClaimed}`);
-    L.push(`    Last-60 expected / received    ${x.last60ExpectedContribution} / ${x.last60FundingReceived}   (creditable ${x.last60FundingCreditable})`);
+    L.push(`    creator allocation → Last-60   expected ${x.last60ExpectedContribution} / received ${x.last60FundingReceived}   (creditable ${x.last60FundingCreditable})`);
     L.push(`    Forge retained expected        ${x.forgeRetainedExpected}   (implied ${x.forgeRetainedImplied}; independently observed: n/a)`);
     L.push(`    untransferred / unverified     ${x.untransferred} / ${x.unverifiedGross}   statuses ${JSON.stringify(x.statuses)}`);
   }
@@ -160,7 +160,7 @@ export function renderRevenueReport(r: RevenueReport): string {
   const b = r.buyerRewards;
   L.push("BUYER-REWARD FUNDING");
   L.push(`  verified bonding-curve funding   ${JSON.stringify(b.verifiedBondingCurveFunding)}`);
-  L.push(`  verified Forge LP funding        ${JSON.stringify(b.verifiedForgeLpFunding)}`);
+  L.push(`  verified Forge LP funding        ${JSON.stringify(b.verifiedForgeLpFunding)}   (creator's 50 % LP allocation)`);
   L.push(`  eligible / consumed / remaining  ${JSON.stringify(b.eligibleBalanceByMint)} / ${JSON.stringify(b.consumedByRounds)} / ${JSON.stringify(b.remainingAvailable)}`);
   L.push(`  ineligible credits               ${b.ineligibleCredits.count} ${JSON.stringify(b.ineligibleCredits.byReason)}`);
   L.push(`  unlinked funding inflows         ${b.unlinkedFundingInflows.count} ${JSON.stringify(b.unlinkedFundingInflows.byMint)}`);

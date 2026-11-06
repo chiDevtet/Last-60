@@ -170,6 +170,16 @@ export class Reconciler {
       const ledger: any[] = await this.d.db.LedgerEntry.aggregate([{ $match: { roundNumber: r.roundNumber, type: "PAYOUT_SCHEDULED" } }, { $group: { _id: null, t: { $sum: "$amount" } } }]);
       if (big(ledger[0]?.t ?? 0) !== paidTotal) problems.push(`round #${r.roundNumber}: ledger PAYOUT_SCHEDULED ≠ payout rows`);
     }
+    // No claim may ever have funded rounds with more than its expected Last-60 allocation.
+    const perClaim: any[] = await this.d.db.RewardFunding.aggregate([{ $match: { roundNumber: { $ne: null } } }, { $group: { _id: "$collectionKey", t: { $sum: "$creditableAmount" } } }]);
+    if (perClaim.length) {
+      const recs: any[] = await this.d.db.RevenueReconciliation.find({ key: { $in: perClaim.map((x) => x._id) } }, { key: 1, expectedLast60: 1 }).lean();
+      const exp = new Map(recs.map((x) => [x.key, big(x.expectedLast60)]));
+      for (const x of perClaim) {
+        const e = exp.get(x._id);
+        if (e === undefined || big(x.t) > e) problems.push(`claim ${String(x._id).slice(0, 80)}: consumed funding ${big(x.t)} exceeds its expected Last-60 allocation ${e ?? "(no reconciliation row)"}`);
+      }
+    }
     const confirmedNoSig = await this.d.db.Payout.countDocuments({ state: "confirmed", confirmedSignature: null });
     if (confirmedNoSig) problems.push(`${confirmedNoSig} confirmed payouts without a signature`);
     // Period re-check (most recent rounds): recompute each executed round's eligible fees from the
