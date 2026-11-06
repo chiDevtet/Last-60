@@ -7,6 +7,7 @@
  * Usage:
  *   LAUNCH_PROVIDER=meteora_dbc POOL_ADDRESS=… TOKEN_MINT=… [FEE_BENEFICIARY_ROLE=creator] \
  *   [EXPECTED_DBC_CREATOR_TRADING_FEE_PERCENTAGE=75 EXPECTED_DBC_CREATOR_LP_PERCENTAGE=75] \
+ *   [EXPECTED_LAUNCHLAB_PLATFORM_CONFIG=5zZFa8Ki… EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE=5000] \
  *   SOLANA_RPC_URL=… bun scripts/verify-allocation.ts [--forgepad] [--json]
  *
  * Exit code: 0 verified · 2 mismatch / unverifiable · 3 not declared · 1 error.
@@ -30,8 +31,9 @@ const expected: ExpectedAllocation = {
   dbcCreatorLpPercentage: int(env.EXPECTED_DBC_CREATOR_LP_PERCENTAGE),
   launchlabCreatorFeeRate: int(env.EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE),
   launchlabCreatorLpScale: int(env.EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE),
+  launchlabPlatformConfig: env.EXPECTED_LAUNCHLAB_PLATFORM_CONFIG?.trim() || null,
 };
-if (args.has("--forgepad")) for (const t of FORGEPAD_INTENDED[id]) expected[t.key] ??= t.value;
+if (args.has("--forgepad")) for (const t of FORGEPAD_INTENDED[id]) (expected as any)[t.key] ??= t.value;
 
 const rpc = new RpcClient({ urls: [env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com"], maxRps: Number(env.RPS ?? 4), retries: 6 });
 const provider = createProvider({ id, poolAddress: env.POOL_ADDRESS, tokenMint: env.TOKEN_MINT, role, payoutMint: env.PAYOUT_ASSET_MINT ?? "So11111111111111111111111111111111111111112", expected }, rpc) as MigrationAwareProvider;

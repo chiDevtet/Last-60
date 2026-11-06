@@ -125,13 +125,12 @@ test added). (Logs cited by the round-1 report were never committed to the repos
   real `collect_cp_fees` from a *creator* LP lock has been observed (the sampled platform locks 100 %
   of the LP to itself). DAMM v1 and AMM v4 destinations are unsupported.
 * **Fee collection** (auto-claim, post-migration claims) was not executed on-chain; it stays manual.
-* **Forgepad**'s configuration has NOT been verified: no Forgepad pool or platform-config address is
-  available. `bun run verify:allocation --forgepad` checks a pool against Forgepad's intended targets
-  (DBC 75 % / 75 %; LaunchLab `creator_fee_rate` 5 000, `creator_scale` 500 000). The only LaunchLab
-  platform config in the fixtures (`4Bu96XjU…`, not known to be Forgepad's) has `creator_fee_rate` 500
-  and `creator_scale` 100 000 — a mismatch against those targets. A 500 000 `creator_scale` is not
-  possible for PlatformConfigs created or updated after the 2026-08-17 LaunchLab upgrade, and in any
-  case no longer yields a creator LP Fee Key for migrations executed after that upgrade.
+* **Forgepad LaunchLab PlatformConfig** `5zZFa8Ki…` is decoded and validated on mainnet (see
+  `docs/FEE_ACCOUNTING.md` §2a; `bun run verify:platform-config`). Still unverified: no Forgepad
+  LaunchLab **pool** or **migration** has been examined (none found among the last 400 transactions
+  of Forgepad's platform NFT wallet, back to slot 465 101 895), so the creator wallet of a specific
+  launch, the CPMM `pool_creator` / `enable_creator_fee` and the migration lock records remain
+  launch-specific checks. No Forgepad DBC pool / config address was supplied.
 * **Undeclared allocations are not distributed**: with `EXPECTED_*` empty every round reports its
   creator fees as `allocation_not_declared_not_verified` and pays nothing.
 * **Screenshots** in `docs/screenshots/` predate the public-copy change and still show an older

@@ -126,7 +126,12 @@ Notes (round 3):
   verified. Supported means implemented and verified offline on real mainnet transactions.
 * LaunchLab locked LP: since the 2026-08-17 Raydium upgrade, migrations assign `creator_scale` to the
   platform's single Fee Key; a creator LP entitlement exists only if the migration transaction minted
-  a creator lock (read from that transaction, never inferred from `creator_scale`).
+  a creator lock (read from that transaction, never inferred from `creator_scale`). Observed on
+  mainnet (platform `4Bu96XjU…`, `creator_scale` 100 000): the last creator-owned Fee Key was minted at
+  slot 439 305 681 (2026-08-14), every migration from slot 440 109 663 (2026-08-18) minted it to the
+  platform NFT wallet. Locks minted to `platform_nft_wallet` are labelled platform-owned
+  (`platform_owned_locked_lp`) even when the creator IS that wallet (Forgepad's fee and NFT wallet are
+  the same address).
 * Reattachment: both workers attach only the persisted, verified spec of THIS launch
   (`storedSpecProblems`); a verified spec is never rewritten on restart; a different graduation for
   the same launch is recorded as `conflict` and detached until an operator reviews it.

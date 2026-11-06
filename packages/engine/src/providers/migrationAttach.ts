@@ -38,8 +38,8 @@ function lpCheckOf(provider: LaunchProvider) {
 
 export function specFor(provider: LaunchProvider, info: PoolInfo, v: VerifiedMigration): DestinationSpec | null {
   const inner = provider instanceof MigrationAwareProvider ? provider.inner : provider;
-  const creatorScale = inner instanceof RaydiumLaunchLabProvider ? (inner.platformConfigState()?.creatorScale?.toString() ?? null) : null;
-  return destinationSpec(info, v, lpCheckOf(provider), { creatorScale });
+  const pc = inner instanceof RaydiumLaunchLabProvider ? inner.platformConfigState() : null;
+  return destinationSpec(info, v, lpCheckOf(provider), pc ? { creatorScale: pc.creatorScale?.toString() ?? null, platformScale: pc.platformScale?.toString() ?? null, platformNftWallet: pc.platformLockNftWallet ?? null } : {});
 }
 
 export type MigrationOutcome = MigrationStatus | "conflict";

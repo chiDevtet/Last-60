@@ -61,6 +61,7 @@ pull request.
 
 ```bash
 bun run verify:allocation [--forgepad]                    # declared vs on-chain creator allocation (read-only)
+bun run verify:platform-config [ADDRESS] [--pool P]       # decode + explain a LaunchLab PlatformConfig (default: Forgepad's; read-only)
 bun run verify:fees meteora_dbc <pool> <mint> creator     # full-history attribution == on-chain counters
 bun run verify:round <n> --fees                           # re-derive a round's recipients & fees from public data
 ```

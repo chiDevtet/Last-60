@@ -10,7 +10,7 @@
  *   gen-schedule-key           print a new SCHEDULE_ENCRYPTION_KEY
  */
 import { randomBytes } from "node:crypto";
-import { ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, type ProcessRole } from "@last60/engine";
+import { ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, type ProcessRole } from "@last60/engine";
 
 const [cmd, ...args] = process.argv.slice(2);
 const print = (v: unknown) => console.log(JSON.stringify(jsonSafe(v), null, 2));
@@ -71,8 +71,11 @@ try {
     case "reconcile": {
       const s = await settings.get(true);
       const rpc = new RpcClient({ urls: s.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
-      const provider = createProvider({ id: s.launchProvider, poolAddress: s.poolAddress, tokenMint: s.tokenMint, role: s.feeBeneficiaryRole, payoutMint: s.payoutAssetMint }, rpc);
+      // Same target (incl. declarations) and the same persisted destination as the workers, so the
+      // reconciler sees exactly the bases the indexer and rewards worker resolved.
+      const provider = createProvider(providerTargetFor(s, cfg), rpc);
       await provider.load();
+      await attachStoredMigration(db, provider);
       const r = new Reconciler({ db, cfg, settings, rpc, provider: () => provider, payoutWallet: s.expectedPayoutPublicKey, terminal: new TerminalWriter(db) });
       print(await r.run());
       break;

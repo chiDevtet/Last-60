@@ -149,7 +149,9 @@ describe("Raydium LaunchLab bonding-curve allocation", () => {
     const f = fixture("launchlab-accounts.json");
     const pool = (await loaded()).info;
     const pc = decodeLaunchLabPlatformConfig(Buffer.from(f.accounts[pool.accounts.platformConfig!].data, "base64"));
-    const { info } = await loaded("creator", { launchlabCreatorFeeRate: Number(pc.creatorFeeRate) });
+    // The rate alone is not enough: the platform identity must be declared too.
+    expect((await loaded("creator", { launchlabCreatorFeeRate: Number(pc.creatorFeeRate) })).info.allocation!.verification).toBe("not_declared");
+    const { info } = await loaded("creator", { launchlabCreatorFeeRate: Number(pc.creatorFeeRate), launchlabPlatformConfig: pool.accounts.platformConfig! });
     expect(info.allocation!.verification).toBe("verified");
   });
 

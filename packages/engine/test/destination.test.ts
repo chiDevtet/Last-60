@@ -222,10 +222,29 @@ describe("CPMM destination", () => {
     };
   }
 
-  test("locked-LP fee collection is attributed only from the creator's migration lock, signed by the creator", async () => {
-    const base = await cpmmSpec();
+  /**
+   * A PRE-upgrade migration (slot before the 2026-08-17 change) on a platform with platform_scale
+   * 800 000 / creator_scale 200 000: the real platform lock plus a creator lock in the scale ratio —
+   * the only lock layout that proves a creator-owned Fee Key.
+   */
+  async function provenCreatorLockSpec() {
     const creatorLock = Keypair.generate().publicKey.toBase58();
-    const spec = { ...base, cpmm: { ...base.cpmm!, beneficiaryLocks: [{ lockPda: creatorLock, nftMint: Keypair.generate().publicKey.toBase58() }] } };
+    const ll = new RaydiumLaunchLabProvider(null, { poolAddress: llFx.bondingPool, tokenMint: lM.baseMint, role: "creator", expected: { dbcCreatorTradingFeePercentage: null, dbcCreatorLpPercentage: null, launchlabCreatorFeeRate: null, launchlabCreatorLpScale: 200_000 } });
+    const plat = { ...llPlatform, platformScale: 800_000n, creatorScale: 200_000n, burnScale: 0n };
+    const info = ll.hydrate(llBonding, plat, { baseTokenProgram: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", quoteTokenProgram: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" });
+    const v = await verifyMigration(fixtureRpc({ ...llFx, accounts: { ...cFx.accounts, ...llFx.accounts } }), lM, { base: lM.baseMint, quote: lM.quoteMint, bondingCreator: llBonding.creator, platform: { cpConfig: llPlatform.cpConfig, platformCpCreator: null } });
+    const pLock = v.locks[0]!;
+    expect(pLock.nftOwnerAtMigration).toBe(llPlatform.platformLockNftWallet!);
+    const creatorAmount = (pLock.lpAmount * 200_000n) / 800_000n;
+    const pre = { ...v, slot: 439_000_000, locks: [...v.locks, { ...pLock, lockPda: creatorLock, nftMint: Keypair.generate().publicKey.toBase58(), nftOwnerAtMigration: llBonding.creator, lpAmount: creatorAmount, holder: llBonding.creator }] };
+    const spec = destinationSpec(info, pre, ll.lpCheck, { creatorScale: "200000", platformScale: "800000", platformNftWallet: llPlatform.platformLockNftWallet })!;
+    return { spec, creatorLock };
+  }
+
+  test("locked-LP fee collection is attributed only from the creator's migration lock, signed by the creator", async () => {
+    const { spec, creatorLock } = await provenCreatorLockSpec();
+    expect(spec.lpAllocation!.verification).toBe("verified");
+    expect(spec.cpmm!.beneficiaryLocks.map((l) => l.lockPda)).toEqual([creatorLock]);
     const a = buildDestination(spec, null);
     const creator = spec.ctx.beneficiary;
     const mine = a.parse(normalizeTransaction(lockCollectTx({ lockPda: creatorLock, signer: creator, recipientOwner: creator, amount0: 1_000n, amount1: 2_000n, slot: lM.slot + 10 }, spec))).attributions!;
@@ -236,7 +255,7 @@ describe("CPMM destination", () => {
     // The platform's lock (100% of LP on this real platform) is never the creator's.
     const platformLock = lM.locks![0]!.lockPda;
     const theirs = a.parse(normalizeTransaction(lockCollectTx({ lockPda: platformLock, signer: llPlatform.platformLockNftWallet!, recipientOwner: llPlatform.platformLockNftWallet!, amount0: 5_000n, amount1: 7_000n, slot: lM.slot + 11 }, spec))).attributions!;
-    expect(theirs.every((r) => r.creatorAmount === 0n && !r.payoutEligible && r.excludedReason === "lock_not_minted_to_beneficiary_at_migration")).toBe(true);
+    expect(theirs.every((r) => r.creatorAmount === 0n && !r.payoutEligible && r.excludedReason === "platform_owned_locked_lp")).toBe(true);
     // The creator's lock collected by someone who bought the fee-key NFT: not the creator's anymore.
     const buyer = new PublicKey(Buffer.alloc(32, 8)).toBase58();
     const moved = a.parse(normalizeTransaction(lockCollectTx({ lockPda: creatorLock, signer: buyer, recipientOwner: buyer, amount0: 1n, amount1: 1n, slot: lM.slot + 12 }, spec))).attributions!;
@@ -339,14 +358,18 @@ describe("CPMM destination — collections", () => {
     expect(p.allocation.verification).toBe("unverifiable"); // pool_creator is not the platform wallet
   });
 
-  test("creator_scale > 0 declared as expected but no creator lock at migration → MISMATCH (2026-08-17 LaunchLab semantics)", async () => {
+  test("creator_scale > 0 declared as expected but no creator lock at migration → no creator entitlement, never distributable (2026-08-17 LaunchLab semantics)", async () => {
     const ll = new RaydiumLaunchLabProvider(null, { poolAddress: llFx.bondingPool, tokenMint: lM.baseMint, role: "creator", expected: { dbcCreatorTradingFeePercentage: null, dbcCreatorLpPercentage: null, launchlabCreatorFeeRate: null, launchlabCreatorLpScale: 500_000 } });
     const plat = { ...llPlatform, creatorScale: 500_000n };
     const info = ll.hydrate(llBonding, plat, { baseTokenProgram: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", quoteTokenProgram: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" });
     expect(ll.lpCheck.verification).toBe("verified"); // the config matches the declaration …
     const v = await verifyMigration(fixtureRpc({ ...llFx, accounts: { ...cFx.accounts, ...llFx.accounts } }), lM, { base: lM.baseMint, quote: lM.quoteMint, bondingCreator: llBonding.creator, platform: { cpConfig: llPlatform.cpConfig, platformCpCreator: null } });
-    const spec = destinationSpec(info, v, ll.lpCheck, { creatorScale: "500000" })!;
-    expect(spec.lpAllocation!.verification).toBe("mismatch"); // … but the migration minted no creator Fee Key
+    const spec = destinationSpec(info, v, ll.lpCheck, { creatorScale: "500000", platformScale: String(llPlatform.platformScale), platformNftWallet: llPlatform.platformLockNftWallet })!;
+    // … but the migration minted no creator Fee Key: the declared config value matched, yet there is
+    // no creator entitlement to pay — creator_scale is not payable to the creator.
+    expect(spec.lpAllocation!.verification).toBe("unverifiable");
+    expect(spec.cpmm!.beneficiaryLocks).toEqual([]);
+    expect(spec.cpmm!.platformLocks!.map((l) => l.lockPda)).toEqual([lM.locks![0]!.lockPda]);
     expect(spec.lpAllocation!.problems.join()).toContain("2026-08-17");
   });
 
