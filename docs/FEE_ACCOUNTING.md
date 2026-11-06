@@ -30,22 +30,35 @@ other pools, unresolved observations). Code: `packages/engine/src/accounting/att
 | Evidence (account, position, instruction) | `evidence` |
 | Certainty | `feeStatus` / `status`: `estimated`, `observed`, `collected`, `reconciled`, `confirmed`, `unresolved` |
 | Payout eligibility | `payoutEligible` |
-| Allocation basis | `basisId` + `basis` snapshot (role, beneficiary, on-chain parameters, source account, verification) |
+| Allocation basis | `basisId` + immutable `basis` snapshot (v1, on **both** collections): provider, source pool, destination pool, phase, role, beneficiary, on-chain parameters, source accounts, verification, problems, stable basis id |
 
 Rules:
 
-* **Only `payoutEligible` creator-allocated amounts are distributed.** `periodFees` sums
-  `eligibleFee` of eligible swaps and `creatorAmount` of eligible attributions; everything else is
-  recorded per round as `ineligibleFees` and as `FEE_EXCLUDED` ledger entries (never paid).
+* **Only distributable creator-allocated amounts are paid.** `periodFees` sums `eligibleFee` of swaps
+  and `creatorAmount` of attributions that pass ALL of (first failure names the reason):
+  1. `payoutEligible = true` (decided at ingestion);
+  2. evidence status final — `observed`, `collected`, `reconciled` or `confirmed` (`fee_status_*`);
+  3. an immutable v1 `basis` snapshot (`legacy_record_without_allocation_snapshot`);
+  4. a basis **verified** against an operator declaration — in its snapshot, or because its id is one
+     of the bases the loaded provider verifies now (`allocation_<verification>_not_verified`). The id
+     hashes provider, pool, phase, role, beneficiary and every on-chain parameter, so the same id is
+     the same basis.
+
+  Everything else is recorded per round as `ineligibleFees` and as `FEE_EXCLUDED` ledger entries
+  (never paid). The bases used and their verification are stored on the round
+  (`feeBreakdown.bases`, `feeBreakdown.verifiedBasisIds`) and reused by reconciliation.
 * **`estimated` is never payable** (e.g. a CPMM creator-fee accrual whose final amount is decided at
   collection). **`unresolved`** marks anything that cannot be proven from chain data; no amount is
   invented for it.
 * **Idempotent and durable.** Swaps are keyed `(signature, eventIndex)`, claims `(signature, index)`,
   attributions by a unique `key`; all writes are `$setOnInsert`, so the first observation wins and
   re-processing never double counts or reinterprets a record.
-* **Historical basis is immutable.** Each record stores the basis it was generated under. Changing
-  the beneficiary role on a pool that has records under another role is refused (settings store
-  and worker attach) — see §6.
+* **Historical basis is immutable.** Each record stores the complete basis it was generated under,
+  written once. Model middleware rejects any later `$set` / `$unset` / … of a record's basis, amounts,
+  eligibility, status, phase, pools, beneficiary or evidence; only bookkeeping fields (round number,
+  finality / drop state, block position) change. A record naming a basis the loaded provider cannot
+  produce is stored with `excludedReason = allocation_basis_snapshot_unavailable` and never paid.
+  Role / beneficiary / provider changes over existing history are refused — see §6.
 
 ## 2. Where creator allocations come from
 
@@ -72,8 +85,32 @@ uses the **actual positions**, not the percentage.
 millionths of the **trade value** and is *added* to the total fee rate: the program charges
 `total_fee = ⌈amount × Σrates / 10⁶⌉` and splits it pro rata to the rates (Raydium SDK
 `Curve.splitFee`). A rate of 5 000 therefore means the creator receives ≈ 0.5 % **of the traded
-amount**, not 0.5 % of the other fees. Verified on a real mainnet trade (`test/attribution.test.ts`).
-Similarly `creator_scale` is the creator's share of the migrated LP in millionths.
+amount**, not 0.5 % of the other fees. Exact formula (`launchLabFeeSplit`):
+
+```
+Σ            = protocol (GlobalConfig.trade_fee_rate) + platform (PlatformConfig.fee_rate)
+               + creator (PlatformConfig.creator_fee_rate) + share (instruction argument)      — millionths
+total_fee    = ⌈amount × Σ / 1 000 000⌉        buy: quote in; sell: gross quote out
+platform_fee = ⌊total_fee × platform / Σ⌋     share_fee = ⌊total_fee × share / Σ⌋
+creator_fee  = ⌊total_fee × creator / Σ⌋      protocol_fee = total_fee − the three (rounding remainder)
+```
+
+Independently verified (`test/launchlab-fee-semantics.test.ts`): identical to the Raydium SDK's own
+`Curve.calculateFee` / `splitFee` over a grid of amounts and rates; **bit-exact** on a real mainnet
+`TradeEvent` (slot 465 800 122) with its real PlatformConfig (`fee_rate` 7 500, `creator_fee_rate`
+**500** = 0.05 %; the event admits exactly one integer Σ = 10 500, proving the protocol rate 2 500):
+creator 27 894 lamports on a 55 789 550-lamport buy — 0.05 % of the trade, whereas 0.05 % of the
+total fee would be 292. Raydium's documentation (raydium-docs-v1 `products/launchlab/platform-config`)
+gives `MAX_CREATOR_FEE_RATE = 5000` (50 bps). The LaunchLab program source is not public; the
+deployed layouts used are the published IDL and SDK, cross-checked on mainnet accounts. Accounting
+never recomputes the fee: it uses `TradeEvent.creator_fee`, cross-checked with the vault transfer.
+
+`creator_scale` (millionths of migrated LP) **no longer implies a creator LP Fee Key**: since the
+2026-08-17 LaunchLab upgrade, new / updated PlatformConfigs must have `creator_scale = 0`, and
+migrations executed after the upgrade fold `platform_scale + creator_scale` into ONE platform-owned
+Fee Key (including launches created before the upgrade). The creator's migrated-LP entitlement is
+therefore taken only from the lock records of the actual migration transaction; a positive
+`creator_scale` without a creator lock is `unverifiable` (or `mismatch` if it was declared), never paid.
 
 **The creator fee vault is shared** by every pool of a creator with the same quote mint. Deposits
 from the creator's *other* pools are indexed (the vault is watched) and recorded as
@@ -101,9 +138,21 @@ EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE           EXPECTED_LAUNCHLAB_CREATOR_LP_SCAL
 
 | Result | Effect |
 |---|---|
-| `verified` | on-chain value equals the declaration; fees payable |
-| `not_declared` | no declaration; on-chain value used as read, pool warning shown |
+| `verified` | on-chain value equals the declaration; fees **distributable** |
+| `not_declared` | no declaration; fees recorded with the on-chain value and reported (`NOT DECLARED` pool warning, `allocation_not_declared_not_verified` in the round) but **never distributed** — `not_declared` is never presented as verified |
 | `mismatch` / `unverifiable` | pool flagged (`ALLOCATION MISMATCH` warning, admin status, terminal); fees **recorded from chain** but `payoutEligible = false` — the declared value is never substituted |
+
+The CPMM creator-fee basis has no declaration of its own: it is `verified` only when the pool facts
+prove the beneficiary is the CPMM `pool_creator` with the creator fee enabled **and** the LaunchLab
+bonding allocation was verified; otherwise `not_declared` / `unverifiable`. Roles other than
+`creator` have no declarable allocation and are therefore recorded but never distributed.
+
+**Operator report.** `bun run verify:allocation` (read-only: `getAccountInfo`, and for a graduated
+pool `getSignaturesForAddress` / `getTransaction`) prints, per allocation: the declared value, the
+on-chain value, Forgepad's intended target, the beneficiary, the fee mint(s) and the outcome; exit
+code 0 verified · 2 mismatch / unverifiable · 3 not declared. `--forgepad` fills undeclared values
+with Forgepad's intended targets (DBC 75 % / 75 %; LaunchLab `creator_fee_rate` 5 000,
+`creator_scale` 500 000) — targets to check, never assumed for any pool. `--json` for machines.
 
 The beneficiary wallet comes from chain state (`pool.creator`, DBC `fee_claimer`, LaunchLab platform
 fee wallet). For migrated LP, the basis also lists which positions / locks belong to the beneficiary.
@@ -122,7 +171,11 @@ verified**, the destination pool (`PoolInfo.accountingPools`). Therefore:
   the read slot in `observedSlot`; consecutive cumulative deltas tile exactly (fees read slightly after
   the snapshot are simply not counted again in the next period);
 * checkpoint records are keyed by snapshot slot, so a resumed execution reuses them;
-* migration processing is idempotent (same migration → same spec → attach is a no-op).
+* migration processing is idempotent and never rewrites history: both workers attach the **persisted**
+  spec only after checking it belongs to the loaded launch (supported path, provider, bonding pool,
+  beneficiary, role, mints, migration signature, every required check true); re-resolution of the
+  same graduation keeps the original spec and its allocation snapshots; a *different* graduation for
+  the same launch is recorded as `conflict` and detaches the destination (operator review).
 
 ## 5. Allocation (`packages/engine/src/rewards/allocation.ts`)
 
@@ -133,14 +186,22 @@ pool        = rewardShare + rolloverIn
 per         = ⌊pool / n⌋          dust = pool − per × n   (retained, recorded)
 n = 0 or per < MIN_PAYOUT_LAMPORTS → no payouts; pool → rolloverOut (rollover) or retained (retain)
 ```
-`fees` is the period's **payout-eligible creator allocation** only. Invariant (property-tested and
+`fees` is the period's **distributable creator allocation** only (§1). `REWARD_BPS`
+(`REWARD_PERCENTAGE=75` → 7 500) is LAST60's split of those fees between buyer rewards and retained
+funds; it is unrelated to the creator's on-chain allocation percentage, the LaunchLab creator fee
+rate, or the creator's migrated-LP share. Invariant (property-tested and
 checked by the reconciler): `fees + rolloverIn = retained + dust + rolloverOut + Σ payouts`.
 
 ## 6. Configuration changes
 
-* **Role changes** (`feeBeneficiaryRole`) on a pool with records under another basis are refused,
-  both by the settings store and when a worker attaches with a different environment role. History
-  is never re-attributed implicitly; use a new pool instead.
+* **Role / pool / provider changes.** Every path that can change who fees are attributed to — the
+  settings store (admin API: role, pool or provider change), indexer attachment, rewards-worker
+  provider (re)load — checks the launch's history in **both** `swaps` and `fee_attributions` (bonding
+  pool and destination; LP checkpoints and fee collections count even without any swap). It refuses
+  when any record was attributed under another role, provider or beneficiary wallet, carries no
+  provable basis (legacy row without a snapshot whose `basisId` is not a current basis), or carries
+  an internally inconsistent snapshot. History is never re-attributed implicitly; use a new pool.
+  Upgrading a deployment that holds pre-snapshot records therefore requires operator review.
 * **On-chain parameter changes** (e.g. a LaunchLab platform changing `creator_fee_rate`) take effect
   from the trade that carries them: LaunchLab's per-event `creator_fee` reflects the rate in force at
   execution, and each record keeps its own basis snapshot.
@@ -183,6 +244,10 @@ collection, LP-lock fee collection) is manual; LAST60 observes and accounts it.
 ## 10. Evidence
 
 * DBC full-history reconciliations (`docs/VERIFICATION.md` §2) — exact on two real pools.
+* `test/launchlab-fee-semantics.test.ts` — LaunchLab formula vs SDK and a real TradeEvent; the
+  Forgepad allocation report. `test/basis-guards.test.ts` (pure) and `test/basis-history.test.ts`,
+  `test/migration-attach.test.ts` (MongoDB) — snapshot guards, immutability, distributability,
+  reattachment.
 * Real-transaction tests: `test/attribution.test.ts` (allocation, exclusions, rate-vs-share, U4),
   `test/destination.test.ts` (DAMM v2 swap/claim/checkpoints, CPMM swap and a real creator-fee
   collection), `test/migration.test.ts` (strict verification + tampering),

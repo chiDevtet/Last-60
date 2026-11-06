@@ -112,10 +112,10 @@ describe("fee records are immutable", () => {
     const r = await rig();
     await swapRow(r, { sig: "s", slot: 5, fee: 1n });
     await persistAttributions(r.db, [attribution({ key: "cp:1", slot: 9, creatorAmount: 10n })], INFO);
-    await expect(r.db.Swap.updateOne({ signature: "s" }, { $set: { "basis.role": "partner" } })).rejects.toThrow(/immutable/);
-    await expect(r.db.Swap.updateMany({}, { $set: { payoutEligible: true, eligibleFee: dec(9n) } })).rejects.toThrow(/immutable/);
-    await expect(r.db.FeeAttribution.updateOne({ key: "cp:1" }, { $set: { creatorAmount: dec(99n) } })).rejects.toThrow(/immutable/);
-    await expect(r.db.FeeAttribution.updateMany({}, { $unset: { basis: 1 } })).rejects.toThrow(/immutable/);
+    await expect(r.db.Swap.updateOne({ signature: "s" }, { $set: { "basis.role": "partner" } }).exec()).rejects.toThrow(/immutable/);
+    await expect(r.db.Swap.updateMany({}, { $set: { payoutEligible: true, eligibleFee: dec(9n) } }).exec()).rejects.toThrow(/immutable/);
+    await expect(r.db.FeeAttribution.updateOne({ key: "cp:1" }, { $set: { creatorAmount: dec(99n) } }).exec()).rejects.toThrow(/immutable/);
+    await expect(r.db.FeeAttribution.updateMany({}, { $unset: { basis: 1 } }).exec()).rejects.toThrow(/immutable/);
     // bookkeeping fields stay writable
     await r.db.FeeAttribution.updateMany({ key: "cp:1" }, { $set: { roundNumber: 1 } });
     const a: any = await r.db.FeeAttribution.findOne({ key: "cp:1" }).lean();
