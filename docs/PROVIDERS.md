@@ -121,6 +121,16 @@ different fee mechanism. LAST60 handles it as follows (code: `providers/migratio
 | DBC → DAMM v1 | — | ✗ | ✗ | **Unsupported**: layouts and the lock-escrow fee model are not verified here; marked unverified, never accounted |
 | LaunchLab → AMM v4 | — | ✗ | ✗ (AMM v4 has no creator fee) | **Unsupported**: marked unverified, never accounted |
 
+Notes (round 3):
+* No path is "proven live": no reward round across a real graduation has been run and independently
+  verified. Supported means implemented and verified offline on real mainnet transactions.
+* LaunchLab locked LP: since the 2026-08-17 Raydium upgrade, migrations assign `creator_scale` to the
+  platform's single Fee Key; a creator LP entitlement exists only if the migration transaction minted
+  a creator lock (read from that transaction, never inferred from `creator_scale`).
+* Reattachment: both workers attach only the persisted, verified spec of THIS launch
+  (`storedSpecProblems`); a verified spec is never rewritten on restart; a different graduation for
+  the same launch is recorded as `conflict` and detached until an operator reviews it.
+
 ### Facts verified for the destinations
 
 * **DAMM v2** (IDL `cp_amm` 0.2.5, vendored in `providers/destination/idl/`): fees are taken on the

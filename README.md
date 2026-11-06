@@ -52,11 +52,15 @@ INDEXER_BACKFILL=none
 bun run test        # real MongoDB replica set, fault-injecting chain, real Solana runtime (LiteSVM),
                     # real mainnet transaction fixtures — no network, no real keys (count: docs/VERIFICATION.md)
 bun run typecheck
+bun run build:web
 ```
+CI (`.github/workflows/ci.yml`) runs install (frozen lockfile), test, typecheck and build on every
+pull request.
 
 ## Verify the engine against the chain
 
 ```bash
+bun run verify:allocation [--forgepad]                    # declared vs on-chain creator allocation (read-only)
 bun run verify:fees meteora_dbc <pool> <mint> creator     # full-history attribution == on-chain counters
 bun run verify:round <n> --fees                           # re-derive a round's recipients & fees from public data
 ```
@@ -98,7 +102,8 @@ bun run verify:round <n> --fees                           # re-derive a round's 
 | 15 | Runs without the frontend | ✔ separate processes |
 
 **Before going live:** resolve the production blockers in [Audit §7](docs/AUDIT.md) — verify the
-real Forgepad pool and its declared allocation in dry-run, observe a graduation end-to-end, and run
+real Forgepad pool and declare its allocation (`EXPECTED_*`; undeclared or mismatching allocations
+are recorded but never distributed) in dry-run, observe a graduation end-to-end, and run
 an authorized small-value payout test — then follow the go-live sequence in
 [Deployment](docs/DEPLOYMENT.md). Live mainnet payouts require `PAYOUT_MODE=live` **and**
 `ALLOW_MAINNET_PAYOUTS=true`; fee collection stays `manual` until the claim signer is verified.
@@ -118,5 +123,5 @@ packages/
   shared/     DTOs and exact amount formatting (browser-safe)
 brand/        identity assets
 scripts/      fixtures, brand rendering, verification and screenshot tools
-docs/         documentation, evidence, screenshots
+docs/         documentation, screenshots
 ```

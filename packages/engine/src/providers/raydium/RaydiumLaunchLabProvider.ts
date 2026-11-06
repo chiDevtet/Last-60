@@ -157,11 +157,13 @@ export interface LaunchLabPlatformConfig {
 }
 
 /**
- * Byte offsets follow the Raydium SDK `PlatformConfig` layout. Verified on the mainnet account in
- * test/fixtures/mainnet/launchlab-accounts.json (4Bu96XjU…): fee_rate 7500, creator_fee_rate 500
- * (0.05% of trade value), platform_scale 0, creator_scale 100 000, burn_scale 900 000, cp_config =
- * the CPMM config used by that platform's migrations. (An earlier comment here said
- * creator_fee_rate 5000 / platform_scale 1 000 000; that does not match the fixture.)
+ * Byte offsets follow the Raydium SDK `PlatformConfig` layout. Verified on two mainnet accounts:
+ *   EB2LqTh8… (fixtures/mainnet/migration-launchlab-cpmm.json): fee_rate 7500, creator_fee_rate 5000
+ *     (0.5% of trade value — the program maximum), platform_scale 1 000 000, creator_scale 0;
+ *   4Bu96XjU… (fixtures/mainnet/launchlab-accounts.json): fee_rate 7500, creator_fee_rate 500
+ *     (0.05%), platform_scale 0, creator_scale 100 000, burn_scale 900 000;
+ * cp_config = the CPMM config used by that platform's migrations. Rates differ per platform — they
+ * are always read from the pool's own PlatformConfig, never assumed.
  */
 export function decodeLaunchLabPlatformConfig(data: Buffer): LaunchLabPlatformConfig {
   if (!data.subarray(0, 8).equals(PLATFORM_CONFIG_DISC)) throw new ProviderValidationError("account is not a LaunchLab PlatformConfig");
