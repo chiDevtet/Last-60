@@ -42,30 +42,102 @@ export function specFor(provider: LaunchProvider, info: PoolInfo, v: VerifiedMig
   return destinationSpec(info, v, lpCheckOf(provider), { creatorScale });
 }
 
-export async function resolveAndAttachMigration(db: Models, rpc: ChainRpc, provider: LaunchProvider): Promise<{ status: MigrationStatus; verified: VerifiedMigration | null; spec: DestinationSpec | null }> {
+export type MigrationOutcome = MigrationStatus | "conflict";
+
+/** Supported source → destination kinds. Everything else is unsupported and never attached. */
+const SUPPORTED_KIND: Record<string, DestinationSpec["kind"]> = { meteora_dbc: "dbc_damm_v2", raydium_launchlab: "launchlab_cpmm" };
+
+/** The facts that identify ONE graduation. A verified spec is only ever reused for the same facts. */
+function identityOf(x: { kind: string; pool?: string; destinationPool?: string; program?: string; destinationProgram?: string; ctx?: { sourcePool: string; migrationSignature: string; migrationSlot: number }; bondingPool?: string; signature?: string; slot?: number }) {
+  return JSON.stringify([x.kind, x.pool ?? x.destinationPool, x.program ?? x.destinationProgram, x.ctx?.sourcePool ?? x.bondingPool, x.ctx?.migrationSignature ?? x.signature, x.ctx?.migrationSlot ?? x.slot]);
+}
+
+/**
+ * Pure: why a persisted destination spec must NOT be attached to this loaded launch (empty = ok).
+ * The spec must describe a supported graduation OF THIS bonding pool, for this provider, beneficiary,
+ * role and mint pair, with a self-consistent allocation basis — and the stored verification record
+ * it came from must still show every required check true.
+ */
+export function storedSpecProblems(info: PoolInfo, migration: any): string[] {
+  const p: string[] = [];
+  const spec: DestinationSpec | null = migration?.spec ?? null;
+  if (!migration || migration.status !== "verified" || migration.verified !== true) p.push(`stored migration status is "${migration?.status ?? "none"}", not verified`);
+  if (!spec) return [...p, "no stored destination spec"];
+  const required: string[] = Array.isArray(migration.requiredChecks) ? migration.requiredChecks : [];
+  if (!required.length || !required.every((c) => migration.checks?.[c] === true)) p.push("stored verification record does not show every required check passing");
+  if (migration.supported !== true) p.push("stored migration is not a supported destination");
+  if (SUPPORTED_KIND[info.provider] !== spec.kind) p.push(`destination kind ${spec.kind} is not the supported path for ${info.provider}`);
+  if (spec.ctx.sourceProvider !== info.provider) p.push(`spec provider ${spec.ctx.sourceProvider} ≠ ${info.provider}`);
+  if (spec.ctx.sourcePool !== info.poolAddress) p.push(`spec source pool ${spec.ctx.sourcePool} ≠ ${info.poolAddress}`);
+  if (spec.ctx.beneficiary !== info.beneficiary) p.push(`spec beneficiary ${spec.ctx.beneficiary} ≠ ${info.beneficiary}`);
+  if (spec.ctx.baseMint !== info.tokenMint || spec.ctx.quoteMint !== info.quoteMint) p.push("spec mints differ from the launch's mints");
+  if (migration.destinationPool && migration.destinationPool !== spec.pool) p.push("spec pool differs from the verified destination pool");
+  if (migration.signature && migration.signature !== spec.ctx.migrationSignature) p.push("spec migration signature differs from the verified migration");
+  for (const b of [spec.allocation, spec.lpAllocation].filter(Boolean) as DestinationSpec["allocation"][]) {
+    if (b.pool !== spec.pool || b.role !== info.feeBeneficiaryRole || b.beneficiary !== info.beneficiary || b.provider !== info.provider) p.push(`destination basis ${b.id} does not belong to this pool / role / beneficiary / provider`);
+  }
+  return p;
+}
+
+/**
+ * Find, strictly verify and persist the graduation of the loaded bonding pool, then attach the
+ * destination FROM THE PERSISTED RECORD (so the indexer and the rewards worker always attach the
+ * exact same spec). Re-running is idempotent and never rewrites a verified spec:
+ *   - same graduation, still verified  → the ORIGINAL spec (and its allocation snapshots) is kept;
+ *   - same graduation, now failing     → detached (status unverified), original kept as history;
+ *   - a DIFFERENT graduation is found  → status "conflict", detached; operator review required.
+ */
+export async function resolveAndAttachMigration(db: Models, rpc: ChainRpc, provider: LaunchProvider): Promise<{ status: MigrationOutcome; verified: VerifiedMigration | null; spec: DestinationSpec | null }> {
   const info = provider instanceof MigrationAwareProvider ? provider.inner.info() : provider.info();
   if (info.provider === "mock" || info.status !== "migrated") return { status: "not_found", verified: null, spec: null };
   const m = await findMigration(rpc, info.provider, info.poolAddress);
   if (!m) return { status: "not_found", verified: null, spec: null };
   const v = await verifyMigration(rpc, m, verifyContextOf(provider, info));
   const verified = migrationVerified(v);
-  const spec = verified ? specFor(provider, info, v) : null;
-  const status: MigrationStatus = !v.supported ? "unsupported" : verified && spec ? "verified" : "unverified";
-  await db.Pool.updateOne(
-    { key: `${info.provider}:${info.poolAddress}` },
-    { $set: { migration: jsonSafe({ ...v, verified: status === "verified", status, spec, resolvedAt: new Date() }) } },
-  );
-  if (provider instanceof MigrationAwareProvider) provider.attach(spec);
+  const fresh = verified ? specFor(provider, info, v) : null;
+  const key = { key: `${info.provider}:${info.poolAddress}` };
+  const doc: any = await db.Pool.findOne(key, { migration: 1 }).lean();
+  const prior: DestinationSpec | null = doc?.migration?.spec ?? doc?.migration?.verifiedSpec ?? null;
+  let status: MigrationOutcome = !v.supported ? "unsupported" : verified && fresh ? "verified" : "unverified";
+  let spec: DestinationSpec | null = status === "verified" ? fresh : null;
+  if (prior && identityOf(prior) !== identityOf({ ...m, kind: m.kind })) {
+    status = "conflict";
+    spec = null;
+    v.notes.push(`a different graduation (${m.kind} ${m.destinationPool}, tx ${m.signature}) was found than the one previously verified (${prior.kind} ${prior.pool}, tx ${prior.ctx.migrationSignature}); destination detached — operator review required`);
+  } else if (prior && status === "verified") {
+    spec = prior; // never rewrite the allocation snapshots of an already-verified graduation
+  }
+  await db.Pool.updateOne(key, {
+    $set: {
+      migration: jsonSafe({ ...v, verified: status === "verified", status, spec, verifiedSpec: prior ?? spec, resolvedAt: new Date(), ...(prior ? { reverifiedAt: new Date() } : {}) }),
+    },
+  });
+  if (provider instanceof MigrationAwareProvider) await attachStoredMigration(db, provider);
   return { status, verified: v, spec };
 }
 
-/** Re-attach the destination recorded (and verified) by the indexer — used by the rewards worker. */
+/**
+ * Attach the destination recorded (and verified) on `pools.migration` — used by both workers, at
+ * start and on every refresh. Anything that does not belong to this exact launch is refused and the
+ * destination is detached (fail safe): nothing from an unverified, stale or mismatched destination
+ * reaches fee accounting or buyer tracking.
+ */
 export async function attachStoredMigration(db: Models, provider: LaunchProvider): Promise<boolean> {
   if (!(provider instanceof MigrationAwareProvider)) return false;
   const info = provider.inner.info();
   const doc: any = await db.Pool.findOne({ key: `${info.provider}:${info.poolAddress}` }, { migration: 1 }).lean();
-  const spec: DestinationSpec | null = doc?.migration?.status === "verified" && doc.migration.spec ? doc.migration.spec : null;
-  // The spec must belong to this pool and beneficiary; anything else is ignored (fail safe).
-  if (spec && (spec.ctx.sourcePool !== info.poolAddress || spec.ctx.beneficiary !== info.beneficiary)) return provider.attach(null);
-  return provider.attach(spec);
+  if (!doc?.migration?.spec) return provider.attach(null);
+  const problems = storedSpecProblems(info, doc.migration);
+  if (problems.length) {
+    lastAttachProblems.set(info.poolAddress, problems);
+    return provider.attach(null);
+  }
+  lastAttachProblems.delete(info.poolAddress);
+  return provider.attach(doc.migration.spec);
+}
+
+const lastAttachProblems = new Map<string, string[]>();
+/** Why the stored destination of a pool was last refused (for logs / operator reports). */
+export function storedMigrationRefusal(pool: string): string[] | null {
+  return lastAttachProblems.get(pool) ?? null;
 }

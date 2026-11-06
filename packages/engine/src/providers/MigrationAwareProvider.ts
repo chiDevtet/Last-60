@@ -53,7 +53,7 @@ export class MigrationAwareProvider implements LaunchProvider {
       ...base,
       watchAddresses: [...new Set([...base.watchAddresses, ...d.watchAddresses()])],
       accountingPools: [base.poolAddress, d.pool],
-      destination: { kind: d.kind, program: d.program, pool: d.pool, migrationSlot: d.migrationSlot, migrationSignature: d.migrationSignature, supported: true, allocation: d.allocation },
+      destination: { kind: d.kind, program: d.program, pool: d.pool, migrationSlot: d.migrationSlot, migrationSignature: d.migrationSignature, supported: true, allocation: d.allocation, ...(d.lpAllocation ? { lpAllocation: d.lpAllocation } : {}) },
       watchFromSlot: Object.fromEntries(d.watchAddresses().map((a) => [a, d.migrationSlot])),
     };
   }

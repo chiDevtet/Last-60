@@ -23,6 +23,7 @@
     "brand:render": "bun scripts/render-brand.ts",
     "fixtures:fetch": "bun scripts/fetch-fixtures.ts",
     "verify:fees": "bun scripts/verify-fee-attribution.ts",
+    "verify:allocation": "bun scripts/verify-allocation.ts",
     "verify:round": "bun scripts/verify-round.ts",
     "find:pool": "bun scripts/find-active-pool.ts",
     "screenshot": "bun scripts/screenshot.ts"

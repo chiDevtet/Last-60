@@ -16,7 +16,7 @@ import { LogsSubscriber } from "../chain/ws";
 import type { Models } from "../db/models";
 import { big } from "../db/decimal";
 import { attachStoredMigration, createProvider, resolveAndAttachMigration, type LaunchProvider, type PoolInfo } from "../providers";
-import { roleChangeBlockReason } from "../accounting/attribution";
+import { basesOf, roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
 import { rootLogger, type Logger } from "../util/logger";
@@ -85,16 +85,18 @@ export class Indexer {
     this.ws = null;
     this.rpc = this.deps.rpc ?? new RpcClient({ urls: s.rpcUrls, timeoutMs: this.deps.cfg.solana.timeoutMs, maxRps: this.deps.cfg.solana.maxRps, maxTxVersion: this.deps.cfg.solana.maxTxVersion, logger: this.log });
     const provider = createProvider({ id: s.launchProvider, poolAddress: s.poolAddress, tokenMint: s.tokenMint, role: s.feeBeneficiaryRole, payoutMint: s.payoutAssetMint, expected: this.deps.cfg.provider.expected }, this.rpc);
-    const loaded = await provider.load();
-    // U1: never index a pool under a different beneficiary role than its existing records (an
-    // environment change bypasses the settings-store check, so it is enforced here too).
-    const blocked = await roleChangeBlockReason(this.deps.db, loaded.poolAddress, loaded.feeBeneficiaryRole);
+    await provider.load();
+    await attachStoredMigration(this.deps.db, provider);
+    // U1: never index a launch under a different role / beneficiary / provider than its existing
+    // fee records (swaps AND non-swap attributions, bonding pool AND destination). An environment
+    // change bypasses the settings-store check, so it is enforced here too, on the loaded facts.
+    const loaded = provider.info();
+    const blocked = await roleChangeBlockReason(this.deps.db, loaded.poolAddress, loaded.feeBeneficiaryRole, { provider: loaded.provider, beneficiary: loaded.beneficiary, currentBasisIds: new Set(basesOf(loaded).keys()) });
     if (blocked) {
-      await this.terminal.error(`Indexer refused to attach: fee beneficiary role conflicts with existing records for this pool.`, `role-conflict:${loaded.poolAddress}:${loaded.feeBeneficiaryRole}`).catch(() => undefined);
+      await this.terminal.error(`Indexer refused to attach: the fee beneficiary basis conflicts with existing records for this pool.`, `role-conflict:${loaded.poolAddress}:${loaded.feeBeneficiaryRole}`).catch(() => undefined);
       throw new Error(blocked);
     }
     this.provider = provider;
-    await attachStoredMigration(this.deps.db, this.provider);
     this.pool = this.provider.info();
     await this.savePool(this.pool);
     this.log.info({ provider: this.pool.provider, pool: this.pool.poolAddress, mint: this.pool.tokenMint, beneficiary: this.pool.beneficiary, status: this.pool.status, feeParams: this.pool.feeParams }, "provider loaded");
@@ -365,7 +367,7 @@ export class Indexer {
       if (r.status === "verified") {
         await this.terminal.warn(`Pool graduated (${m.kind.replace("_", " → ")}) to ${dest} — destination verified on-chain; post-migration activity is now tracked.`, `migration-dest:${p.poolAddress}`);
       } else {
-        await this.terminal.warn(`Pool graduated (${m.kind.replace("_", " → ")}) to ${dest} — destination ${r.status === "unsupported" ? "type is not supported" : "NOT verified"} (${m.failed.join(", ") || m.notes.join("; ")}). Post-migration fees are not accounted.`, `migration-dest:${p.poolAddress}`);
+        await this.terminal.warn(`Pool graduated (${m.kind.replace("_", " → ")}) to ${dest} — destination ${r.status === "unsupported" ? "type is not supported" : r.status === "conflict" ? "CONFLICTS with the previously verified graduation" : "NOT verified"} (${m.failed.join(", ") || m.notes.join("; ")}). Post-migration fees are not accounted.`, `migration-dest:${p.poolAddress}`);
       }
       this.pool = this.provider.info();
       await this.savePool(this.pool);

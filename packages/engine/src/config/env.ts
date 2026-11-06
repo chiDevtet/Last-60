@@ -422,6 +422,9 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     if (!raw.TOKEN_MINT) problems.push("TOKEN_MINT: is required");
     if (!raw.POOL_ADDRESS) problems.push("POOL_ADDRESS: is required");
   }
+  if (raw.LAUNCH_PROVIDER === "mock" && raw.NODE_ENV === "production") {
+    problems.push("LAUNCH_PROVIDER: mock is synthetic test data and is refused in production");
+  }
   if (raw.LAUNCH_PROVIDER === "meteora_dbc" && raw.FEE_BENEFICIARY_ROLE === "platform") {
     problems.push('FEE_BENEFICIARY_ROLE: "platform" is a Raydium LaunchLab role; use "creator" or "partner" for Meteora DBC');
   }

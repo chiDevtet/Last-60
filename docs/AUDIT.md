@@ -6,7 +6,10 @@ creator-fee-only accounting, strict migration verification, post-migration provi
 previously unresolved findings U1–U8. No live payouts were enabled, no mainnet transaction was sent,
 no fee was claimed and no wallet or deployment was touched; all chain evidence comes from read-only
 RPC calls (`getAccountInfo`, `getMultipleAccounts`, `getSignaturesForAddress`, `getTransaction`) and
-the programs' public source code.
+the programs' public source code. **Round 3** (2026-11-06, branch `fix/post-pr3-hardening` on top of
+`main` `c48fde3` = merge of PR #3): follow-up hardening after the PR #3 review (§3, Round 3). Same
+constraints: no transaction sent, no fee claimed, no live payout enabled, no production variable
+changed, nothing deployed.
 
 ## 1. Verdict
 
@@ -16,10 +19,19 @@ observed graduation, and an authorized small-value live test. The code now accou
 on-chain-verified creator allocations, fails safe (records but never pays) whenever an allocation
 cannot be proven, and keeps every payout safeguard of round 1.
 
+Round 3 does not change that verdict. It closes code gaps (historical-basis protection on all fee
+records, immutable snapshots, distribution limited to declared-and-verified allocations, stricter
+reattachment, CI); the operational blockers in §7 remain, and live graduation support is still
+unproven end-to-end.
+
 ## 2. Test evidence
 
 | Run | Result |
 |---|---|
+| Round 3 — CI (GitHub Actions) on PR #4 — `bun run test` | **217 pass / 0 fail across 18 files** (run 42145258284, `db72bdb`); first run 216 pass / 1 fail (assertion bug in a new test, fixed) |
+| Round 3 — local sandbox (no downloadable `mongod`) | 125 DB-free tests pass; MongoDB-backed files not runnable there (they run in CI) |
+| Round 3 — `bun run typecheck`, `bun run build:web` | exit 0 / exit 0 (locally and in CI) |
+| Round 2 figures below were reported by the round-2 author | not re-run separately; superseded by the CI run |
 | `main` (`4cf1bd3`) — `bun run test`, re-run for this round | **109 pass / 0 fail** (55.1 s) — confirms the round-1 figure |
 | Branch — `bun run test` | **172 pass / 0 fail** across 14 files (57.2 s) |
 | Branch — `bun run typecheck` (engine, shared, api, worker, web) | clean (exit 0) |
@@ -75,6 +87,31 @@ loss, or broken deployment; **Medium** = wrong-but-safe behaviour, false halts, 
 | Reconciliation | bonding counters; LaunchLab ≥ only | exact LaunchLab, DAMM v2 checkpoint totals vs on-chain counters, payout-ledger repair |
 | Public copy | advertised a fixed percentage | neutral ("eligible creator fees are allocated to payouts"); social images re-rendered |
 
+### Round 3 — post-PR #3 hardening (`fix/post-pr3-hardening`, each with regression tests)
+
+| # | Sev. | Issue | Fix | Tests |
+|---|---|---|---|---|
+| R1 | High | `roleChangeBlockReason` accepted `FeeAttribution` but queried only `swaps` (by `pool`, not `sourcePool`): a launch with only LP checkpoints / CPMM collections, or with history only on its destination pool, could change role. | Checks `swaps` **and** `fee_attributions` across `pool` / `sourcePool` / `destinationPool`; detects other role, provider, beneficiary, legacy rows without a provable basis and internally inconsistent snapshots. Applied on admin updates (now on role, pool **or** provider change), indexer attach and rewards-worker provider load, with the loaded beneficiary and current basis ids. | `basis-guards`, `basis-history`, `creator-fee-regressions` U1 |
+| R2 | High | `fee_attributions` stored only `basisId`; swap snapshots lacked provider / pools / phase / problems (and were `{role, beneficiary, params}` when the provider had no basis). | Immutable v1 `AllocationSnapshot` on every swap and attribution; unresolvable basis → stored, `allocation_basis_snapshot_unavailable`, never payable; model middleware forbids rewriting basis / amounts / eligibility / status. | `basis-guards`, `basis-history` |
+| R3 | High | `not_declared` allocations were payable (`basisPayable`), i.e. presented as good as verified; legacy swap rows without attribution fields were counted as eligible; estimated / unresolved statuses were not excluded by the sum itself. | `periodFees` distributes only `payoutEligible` + final status + v1 snapshot + **verified** basis (snapshot, or id equal to a basis verified now); everything else is reported with a reason. Round stores the bases used; reconciliation reuses them. Provider warnings say `NOT DECLARED … NOT distributed`. | `basis-history`, `attribution`, `creator-fee-regressions` |
+| R4 | Medium | Re-resolution after a restart overwrote `pools.migration.spec` (new allocation snapshots, possibly another graduation); the indexer attached its in-memory spec, the rewards worker the persisted one; the stored spec was checked only for source pool and beneficiary. | Both attach the persisted spec after `storedSpecProblems` (supported path, provider, pool, beneficiary, role, mints, signature, all required checks); a verified spec is never rewritten; a different graduation → `conflict`, detached. | `basis-guards`, `migration-attach` |
+| R5 | Medium | CPMM creator-fee basis hard-coded `not_declared`; a `creator_scale` with no creator lock was only `unverifiable` even when declared. | CPMM basis inherits the bonding verification only when `pool_creator` = beneficiary and the creator fee is enabled (else `unverifiable`); declared-and-unmet `creator_scale` → `mismatch`, explained by the 2026-08-17 LaunchLab upgrade. | `destination` |
+| R6 | Medium | Mock provider (synthetic data) accepted in production. | Refused when `NODE_ENV=production` and by the settings store on mainnet-beta. | config validation |
+| R7 | Low (doc) | `.env.example` / docs did not separate creator allocation %, LaunchLab creator fee **rate** on trade value, migrated-LP share and `REWARD_PERCENTAGE`; stale "merge PR #3" blocker, unverified test counts, missing evidence logs cited as present. | Rewritten (§7, §8, `VERIFICATION.md`, `FEE_ACCOUNTING.md`). | — |
+| R8 | — | No CI. | `.github/workflows/ci.yml`: frozen install, test (with MongoDB replica set), typecheck, build:web on every PR. | CI itself |
+
+**LaunchLab `creator_fee_rate` (independently verified):** the existing interpretation is correct and
+was not changed — `creator_fee = ⌊⌈amount × Σrates / 10⁶⌉ × creator_rate / Σrates⌋`, ≈ rate × trade
+value. Evidence: Raydium SDK `Curve` functions (identical over a grid), a real mainnet TradeEvent
+reproduced bit-exactly, Raydium docs (`MAX_CREATOR_FEE_RATE = 5000` = 50 bps). The program source is
+not public, so "program source" verification was not possible; this is stated, not assumed.
+
+**New finding — LaunchLab LP split changed on 2026-08-17:** per Raydium's docs, new/updated
+PlatformConfigs must have `creator_scale = 0`, and every migration executed after the upgrade folds
+`creator_scale` into the platform's single Fee Key. Forgepad's intended "creator migrated LP scale
+500 000" therefore cannot produce a creator LP entitlement for current migrations; the code takes the
+entitlement only from the migration's actual lock records.
+
 ## 4. Live-money execution paths — review notes
 
 * **Native SOL / SPL transfers** — one recipient per transaction, canonical on-curve recipients only,
@@ -124,7 +161,9 @@ loss, or broken deployment; **Medium** = wrong-but-safe behaviour, false halts, 
 * `creator_fee_rate` is a fee rate in millionths of the **trade value**, added to the total fee rate
   (e.g. 5 000 = 0.5 % of each trade) — proven on a real trade; it is not a share of the fee.
 * Real platform sampled (`EB2LqTh8…`): `fee_rate` 7 500, `creator_fee_rate` 5 000, `platform_scale`
-  1 000 000, `creator_scale` 0 — i.e. on that platform the creator gets **no** migrated LP.
+  1 000 000, `creator_scale` 0 — i.e. on that platform the creator gets **no** migrated LP. A second
+  real platform (`4Bu96XjU…`, round 3): `creator_fee_rate` 500 (0.05 %), `creator_scale` 100 000 —
+  rates differ per platform and are always read from chain.
 * Post-graduation the creator's income changes mechanism entirely (§6).
 
 ## 6. Post-graduation (migration) — findings and work done
@@ -150,25 +189,32 @@ live round across a real graduation, and a real `collect_cp_fees` from a creator
 
 ## 7. Production deployment blockers (remaining)
 
-1. **Review and merge `fix/creator-fee-accounting`**; re-run `bun run test` / `typecheck` / `build:web`.
-2. **Verify the real Forgepad pool in dry-run**: set `EXPECTED_*` to Forgepad's intended allocation
-   and confirm `pools.allocation.verification = verified` (no `ALLOCATION MISMATCH`); check
-   `feeParams` (creator LP percentage / `creator_scale`), `beneficiary`, collect-fee mode (fees in the
-   token are not distributable as SOL); run `verify:fees` and `verify:round`.
-3. **Observe a real graduation end-to-end in dry-run** for the launch type used (DBC → DAMM v2 or
-   LaunchLab → CPMM): `pools.migration.status = verified`, destination buyers indexed, first
-   post-migration round's creator fees re-derived independently. Until then post-migration accounting
-   is verified only offline on real transactions.
+1. ~~Review and merge `fix/creator-fee-accounting`~~ — merged as PR #3 (`c48fde3`). Review and merge
+   this round's PR; CI must be green.
+2. **Verify the real Forgepad pool** (read-only): `bun run verify:allocation --forgepad` with the
+   production `LAUNCH_PROVIDER`, `POOL_ADDRESS`, `TOKEN_MINT`. Needed from Forgepad: the pool address(es)
+   and launch type, the DBC `PoolConfig` / LaunchLab `PlatformConfig` address, the intended values per
+   launch type, who is `pool.creator` / `fee_claimer` / `platform_fee_wallet` / `platform_cp_creator`,
+   and — for LaunchLab — whether any migration is expected to mint a creator Fee Key (impossible after
+   the 2026-08-17 upgrade). Then set `EXPECTED_*` to the **confirmed** values: until they are declared
+   and verified, no fees are distributed (by design).
+3. **Observe a real graduation end-to-end in dry-run** for the launch type used: `pools.migration.status
+   = verified`, destination buyers indexed, the first post-migration round's creator fees re-derived
+   independently. Until then post-migration accounting is verified only offline on real transactions;
+   **creator LP-lock collection is verified on synthetic transactions only**.
 4. **Fee collection stays manual** until the actual Forgepad signer, authority, beneficiary and claim
-   permissions are verified (who is `pool.creator` / CPMM `pool_creator` / position & fee-key NFT
-   holder, and who can sign their claims).
+   permissions are verified.
 5. **Deployment config**: fixed `ecosystem.config.cjs`, no root `.env` on hosts, `API_TRUST_PROXY_HOPS=1`,
-   `PUBLIC_SITE_URL` and `CORS_ORIGINS` (now mandatory in production), API bound to 127.0.0.1.
+   `PUBLIC_SITE_URL` and `CORS_ORIGINS`, API bound to 127.0.0.1.
 6. **RPC**: one dedicated provider for the rewards worker.
 7. **Authorized small-value live payout test** (only LiteSVM / FakeChain so far).
-8. **CI**: none in the repository — add one running test, typecheck and build on every PR.
-9. **Dashboard screenshots** in `docs/screenshots/` predate the copy change (they show an older
-   percentage headline); re-capture from a running deployment.
+8. ~~CI~~ — added in round 3 (`.github/workflows/ci.yml`).
+9. **Dashboard screenshots** in `docs/screenshots/` predate the copy change (older percentage
+   headline); re-capture from a running deployment (not possible in round 3).
+10. **Upgrading an existing deployment**: records written before round 3 have no v1 snapshot. They are
+    not distributable, and a worker refuses to attach if such records cannot be matched to a current
+    basis id. Plan an operator review (or a new pool) before upgrading any instance that has history.
+11. **Partner / platform roles** have no declarable allocation and are therefore never distributed.
 
 ## 8. Documentation vs. code discrepancies
 
@@ -184,6 +230,9 @@ live round across a real graduation, and a real `collect_cp_fees` from a creator
 | `models.ts`: `orderInSlot` = tx position × 1000 + event index | Event index only (U7) — documentation fixed in round 2. |
 | API.md: nonce message bound to `PUBLIC_SITE_URL` | Fell back to request `Origin`/`Host` when unset (U6) — fixed in round 2. |
 | README: "90 tests" / "109 tests" | 109 on `main` (re-verified); see §2 for this branch. |
+| VERIFICATION: "172 passing" (round 2) | Reported, not CI-verified; round 3 CI: 217 tests across 18 files (§2). |
+| `.env.example`: "Leave empty if not known (a warning is shown)" for `EXPECTED_*` | Round 3: empty = not distributed (R3); comment rewritten. |
+| `RaydiumLaunchLabProvider` comment: one PlatformConfig's rates presented as general | Round 3: both sampled platforms listed; rates are per platform. |
 | PROVIDERS (old): post-migration needs checkpoint tracking over time | Refined: claimable is a cumulative counter readable at each snapshot (§6). |
 | PROVIDERS / OPERATIONS: "switch to the post-migration adapter" | Round 2: verified destinations attach automatically; docs updated. |
 | Public copy: fixed percentage headline | Round 2: removed from UI, metadata, README, social images; screenshots pending (§7.9). |

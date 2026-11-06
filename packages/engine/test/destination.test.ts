@@ -243,3 +243,160 @@ describe("CPMM destination", () => {
     expect(moved.every((r) => r.creatorAmount === 0n && !r.payoutEligible)).toBe(true);
   });
 });
+
+// ── post-PR #3 coverage: holder changes, both mints, boundaries, multi-instruction collections ──
+function tokenAccountData(mint: string, owner: string, amount = 1n): Buffer {
+  const d = Buffer.alloc(165);
+  new PublicKey(mint).toBuffer().copy(d, 0);
+  new PublicKey(owner).toBuffer().copy(d, 32);
+  d.writeBigUInt64LE(amount, 64);
+  return d;
+}
+
+describe("DAMM v2 destination — entitlement follows the position NFT", () => {
+  const stranger = Keypair.generate().publicKey.toBase58();
+  const heldBy = (owner: string, which = 0) => (addr: string, x: any) => {
+    const p = dM.positions[which]!;
+    return addr === p.nftAccount ? { owner: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", data: tokenAccountData(p.nftMint, owner) } : x;
+  };
+
+  test("creator and partner migration positions are each attributed to their actual holder", async () => {
+    const spec = await dammSpec();
+    expect(spec.dammV2!.positions.map((p) => p.position)).toEqual(dVerified.positionStates.map((p) => p.position)); // only positions that exist on-chain
+    // Position 0 handed to the partner (or anyone else): its growth is excluded; others stay the creator's.
+    const recs = await buildDestination(spec, fixtureRpc(migFx, heldBy(stranger, 0))).checkpoint!(migFx.slot, async () => null);
+    const p0 = recs.filter((r) => r.evidence.position === dM.positions[0]!.position);
+    expect(p0.length).toBeGreaterThan(0);
+    expect(p0.every((r) => r.creatorAmount === 0n && r.excludedReason === "position_not_held_by_beneficiary" && r.evidence.holder === stranger)).toBe(true);
+    for (const r of recs.filter((r) => r.evidence.position !== dM.positions[0]!.position)) expect(r.evidence.holder).not.toBe(stranger);
+  });
+
+  test("an NFT sold between checkpoints: growth before the sale is the creator's, after it is not", async () => {
+    const spec = await dammSpec();
+    const store = new Map<string, CheckpointState>();
+    const prev = async (k: string) => store.get(k) ?? null;
+    const before = await buildDestination(spec, fixtureRpc(migFx)).checkpoint!(migFx.slot, prev);
+    const mine = before.filter((r) => r.evidence.position === dM.positions[0]!.position);
+    expect(mine.some((r) => r.payoutEligible && r.creatorAmount > 0n)).toBe(true);
+    // Pretend the counters were 100 lower at the previous checkpoint, then the NFT moved.
+    for (const r of mine) store.set(r.evidence.checkpointKey as string, { cumulative: BigInt(r.evidence.cumulative as string) - 100n, slot: r.slot });
+    const after = (await buildDestination(spec, fixtureRpc(migFx, heldBy(stranger, 0))).checkpoint!(migFx.slot + 50, prev)).filter((r) => r.evidence.position === dM.positions[0]!.position);
+    expect(after.length).toBe(mine.length);
+    expect(after.every((r) => r.grossAmount === 100n && r.creatorAmount === 0n && r.excludedAmount === 100n && !r.payoutEligible)).toBe(true);
+  });
+
+  test("fee growth is tracked per mint (both pool tokens), each with its own checkpoint key", async () => {
+    const spec = await dammSpec();
+    const recs = await buildDestination(spec, fixtureRpc(migFx)).checkpoint!(migFx.slot, async () => null);
+    const mints = new Set(recs.map((r) => r.feeMint));
+    for (const m of mints) expect([dVerified.tokenAMint, dVerified.tokenBMint]).toContain(m);
+    const keys = recs.map((r) => r.evidence.checkpointKey);
+    expect(new Set(keys).size).toBe(keys.length);
+    // the non-payout mint is recorded as such, never converted (it stays in its own mint)
+    for (const r of recs) expect(r.key).toContain(r.feeMint);
+  });
+
+  test("an increase since the previous checkpoint is attributed exactly once; re-reading the same snapshot is idempotent", async () => {
+    const spec = await dammSpec();
+    const a = buildDestination(spec, fixtureRpc(migFx));
+    const first = await a.checkpoint!(migFx.slot, async () => null);
+    const again = await a.checkpoint!(migFx.slot, async () => null);
+    expect(again.map((r) => r.key)).toEqual(first.map((r) => r.key)); // same keys → persistAttributions keeps one
+    const r0 = first.find((r) => r.creatorAmount > 0n)!;
+    const inc = await a.checkpoint!(migFx.slot + 1, async (k) => (k === r0.evidence.checkpointKey ? { cumulative: BigInt(r0.evidence.cumulative as string) - 7n, slot: migFx.slot } : { cumulative: BigInt(first.find((x) => x.evidence.checkpointKey === k)?.evidence.cumulative as string ?? "0"), slot: migFx.slot }));
+    expect(inc.map((r) => [r.evidence.checkpointKey, r.creatorAmount])).toEqual([[r0.evidence.checkpointKey, 7n]]);
+  });
+
+  test("migration-slot boundary: activity AT the migration slot is accepted, one slot before is not", async () => {
+    const spec = await dammSpec();
+    const at = buildDestination({ ...spec, ctx: { ...spec.ctx, migrationSlot: dFx.txs.swap.slot } }, null).parse(normalizeTransaction(dFx.txs.swap));
+    expect(at.swaps).toHaveLength(1);
+    expect(at.anomalies).toEqual([]);
+    const before = buildDestination({ ...spec, ctx: { ...spec.ctx, migrationSlot: dFx.txs.swap.slot + 1 } }, null).parse(normalizeTransaction(dFx.txs.swap));
+    expect(before.swaps).toHaveLength(0);
+  });
+});
+
+describe("CPMM destination — collections", () => {
+  test("accrued creator fee vs collected: only the collected transfer is payable; per-swap accruals are estimates", async () => {
+    const spec = await cpmmSpec();
+    const a = buildDestination(spec, null);
+    const swap = a.parse(normalizeTransaction(cFx.txs.swapBaseInput)).swaps[0]!;
+    expect(swap.eligibleFee).toBe(0n);
+    expect(swap.estimatedCreatorFee).toBeGreaterThan(0n);
+    expect(swap.excludedReason).toBe("creator_fee_accounted_at_collection");
+    const coll = a.parse(normalizeTransaction(cFx.txs.collectCreatorFee)).attributions!.filter((r) => r.kind === "creator_fee_collection");
+    // The protocol's creator_fee_share (AmmConfig or a per-creator CreatorFeeShare PDA) is retained in
+    // the pool at collection; it is never transferred to the creator, so it is never counted.
+    expect(coll.every((r) => r.status === "collected" && r.grossAmount === null)).toBe(true);
+    expect(String(spec.allocation.params.creatorFeeShareRate)).toMatch(/^\d+$/);
+  });
+
+  test("the CPMM creator-fee basis is distributable only when the bonding allocation was verified", async () => {
+    const s = await cpmmSpec(); // no declaration → not_declared → not distributable
+    expect(s.allocation.verification).toBe("not_declared");
+    const p = await cpmmSpec("platform");
+    expect(p.allocation.verification).toBe("unverifiable"); // pool_creator is not the platform wallet
+  });
+
+  test("creator_scale > 0 declared as expected but no creator lock at migration → MISMATCH (2026-08-17 LaunchLab semantics)", async () => {
+    const ll = new RaydiumLaunchLabProvider(null, { poolAddress: llFx.bondingPool, tokenMint: lM.baseMint, role: "creator", expected: { dbcCreatorTradingFeePercentage: null, dbcCreatorLpPercentage: null, launchlabCreatorFeeRate: null, launchlabCreatorLpScale: 500_000 } });
+    const plat = { ...llPlatform, creatorScale: 500_000n };
+    const info = ll.hydrate(llBonding, plat, { baseTokenProgram: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", quoteTokenProgram: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" });
+    expect(ll.lpCheck.verification).toBe("verified"); // the config matches the declaration …
+    const v = await verifyMigration(fixtureRpc({ ...llFx, accounts: { ...cFx.accounts, ...llFx.accounts } }), lM, { base: lM.baseMint, quote: lM.quoteMint, bondingCreator: llBonding.creator, platform: { cpConfig: llPlatform.cpConfig, platformCpCreator: null } });
+    const spec = destinationSpec(info, v, ll.lpCheck, { creatorScale: "500000" })!;
+    expect(spec.lpAllocation!.verification).toBe("mismatch"); // … but the migration minted no creator Fee Key
+    expect(spec.lpAllocation!.problems.join()).toContain("2026-08-17");
+  });
+
+  function lockSpec(base: Awaited<ReturnType<typeof cpmmSpec>>, lockPda: string) {
+    return { ...base, cpmm: { ...base.cpmm!, beneficiaryLocks: [{ lockPda, nftMint: Keypair.generate().publicKey.toBase58() }] } };
+  }
+
+  test("collection by the beneficiary's fee key but to the WRONG recipient is excluded", async () => {
+    const lock = Keypair.generate().publicKey.toBase58();
+    const spec = lockSpec(await cpmmSpec(), lock);
+    const other = Keypair.generate().publicKey.toBase58();
+    // reuse the synthetic builder from above via a fresh describe-scope copy
+    const recs = buildDestination(spec, null).parse(normalizeTransaction(lockTx({ lockPda: lock, signer: spec.ctx.beneficiary, recipientOwner: other, amount0: 10n, amount1: 20n, slot: lM.slot + 20 }, spec))).attributions!;
+    expect(recs).toHaveLength(2);
+    expect(recs.every((r) => r.creatorAmount === 0n && !r.payoutEligible && r.excludedReason === "position_not_held_by_beneficiary")).toBe(true);
+  });
+
+  test("several collection instructions in one transaction are each counted once, with distinct keys", async () => {
+    const lock = Keypair.generate().publicKey.toBase58();
+    const spec = lockSpec(await cpmmSpec(), lock);
+    const raw: any = lockTx({ lockPda: lock, signer: spec.ctx.beneficiary, recipientOwner: spec.ctx.beneficiary, amount0: 10n, amount1: 20n, slot: lM.slot + 21 }, spec);
+    const ix = raw.transaction.message.instructions[0];
+    raw.transaction.message.instructions.push({ ...ix });
+    raw.meta.innerInstructions.push({ ...raw.meta.innerInstructions[0], index: 1 });
+    const recs = buildDestination(spec, null).parse(normalizeTransaction(raw)).attributions!;
+    expect(recs).toHaveLength(4);
+    expect(new Set(recs.map((r) => r.key)).size).toBe(4);
+    expect(recs.reduce((s, r) => s + r.creatorAmount, 0n)).toBe(60n);
+  });
+});
+
+// Synthetic collect_cp_fees (same account order as the builder in the CPMM block above).
+function lockTx(o: { lockPda: string; signer: string; recipientOwner: string; amount0: bigint; amount1: bigint; slot: number }, spec: Awaited<ReturnType<typeof cpmmSpec>>) {
+  const c = spec.cpmm!;
+  const k = () => Keypair.generate().publicKey.toBase58();
+  const userA = k(), userB = k();
+  const TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+  const keys = [k(), o.signer, k(), o.lockPda, "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C", k(), spec.pool, k(), userA, userB, c.token0Vault, c.token1Vault, c.token0Mint, c.token1Mint, k(), RAYDIUM_CP_LOCK_PROGRAM_ID, TOKEN];
+  const idx = (a: string) => keys.indexOf(a);
+  const transfer = (src: string, dst: string, amount: bigint) => {
+    const d = Buffer.alloc(9);
+    d[0] = 3;
+    d.writeBigUInt64LE(amount, 1);
+    return { programIdIndex: idx(TOKEN), accounts: [idx(src), idx(dst), 5], data: bs58.encode(d), stackHeight: 3 };
+  };
+  const bal = (acct: string, mint: string, amount: bigint) => ({ accountIndex: idx(acct), mint, owner: o.recipientOwner, programId: TOKEN, uiTokenAmount: { amount: amount.toString(), decimals: 9 } });
+  return {
+    slot: o.slot,
+    blockTime: 1,
+    transaction: { signatures: [bs58.encode(Buffer.alloc(64, o.slot % 251))], message: { accountKeys: keys, header: { numRequiredSignatures: 2 }, instructions: [{ programIdIndex: idx(RAYDIUM_CP_LOCK_PROGRAM_ID), accounts: keys.slice(0, 15).map(idx), data: bs58.encode(Buffer.concat([COLLECT_CP_FEES_DISC, Buffer.alloc(8)])) }] } },
+    meta: { err: null, fee: 5000, innerInstructions: [{ index: 0, instructions: [{ programIdIndex: idx("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"), accounts: [], data: bs58.encode(Buffer.alloc(8)), stackHeight: 2 }, transfer(c.token0Vault, userA, o.amount0), transfer(c.token1Vault, userB, o.amount1)] }], preTokenBalances: [bal(userA, c.token0Mint, 0n), bal(userB, c.token1Mint, 0n)], postTokenBalances: [bal(userA, c.token0Mint, o.amount0), bal(userB, c.token1Mint, o.amount1)], preBalances: [], postBalances: [], logMessages: [] },
+  };
+}

@@ -21,6 +21,7 @@ import { RaydiumLaunchLabProvider, LAUNCHLAB_PROGRAM_ID, decodeLaunchLabPlatform
 import dbcIdl from "../src/providers/meteora/idl/dynamic_bonding_curve.json";
 import llIdl from "../src/providers/raydium/idl/raydium_launchpad.json";
 import type { ExpectedAllocation } from "../src/config/env";
+import { basisDistributable, basisPayable } from "../src/accounting/attribution";
 
 const FIX = join(import.meta.dir, "fixtures/mainnet");
 const fixture = (name: string) => JSON.parse(readFileSync(join(FIX, name), "utf8"));
@@ -89,10 +90,13 @@ describe("Meteora DBC bonding-curve allocation", () => {
     expect(s.excludedReason).toContain("allocation_mismatch");
   });
 
-  test("an undeclared allocation is accounted from chain and warned about", () => {
+  test("an undeclared allocation is accounted from chain, warned about, and NOT distributable", () => {
     const { p } = dbcFor(fixture("dbc-buy-direct.json"), 75);
     expect(p.info().allocation!.verification).toBe("not_declared");
-    expect(p.info().warnings!.some((w) => w.includes("not declared"))).toBe(true);
+    expect(p.info().warnings!.some((w) => /not declared/i.test(w) && /NOT distributed/.test(w))).toBe(true);
+    // not_declared is never presented as verified and never distributed
+    expect(basisDistributable(p.info().allocation)).toBe(false);
+    expect(basisPayable(p.info().allocation!)).toBe(true); // recorded as eligible-in-principle at ingestion
   });
 
   test("the allocation basis changes when the on-chain parameters change (history keeps its own basis)", () => {

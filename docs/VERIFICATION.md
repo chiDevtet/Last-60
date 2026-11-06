@@ -1,9 +1,29 @@
 # Verification report
 
 What was verified, how, and against what. Everything listed as verified was observed, not
-assumed. Date: 2026-11-05.
+assumed. Updated 2026-11-06 (post-PR #3 hardening).
 
-## 1. Automated tests — 172 passing (`bun run test`)
+Four kinds of evidence are distinguished throughout and must not be confused:
+
+| Kind | Meaning | Where |
+|---|---|---|
+| **Automated tests** | code paths exercised by `bun run test` (unit + MongoDB replica-set integration + LiteSVM); CI runs them on every pull request | §1, `.github/workflows/ci.yml` |
+| **Real mainnet fixtures** | real transactions / accounts captured read-only from mainnet and replayed offline in tests | `packages/engine/test/fixtures/mainnet/` |
+| **Dry-run operation** | the four processes running against mainnet with `PAYOUT_MODE=dry_run` (nothing sent) | §3 (round-1 report; logs not in the repository) |
+| **Live transaction verification** | a real payout / claim sent on mainnet and verified | **none** — never performed |
+
+## 1. Automated tests (`bun run test`)
+
+Counts are from actual executions, not estimates:
+
+| Run | Result |
+|---|---|
+| CI (GitHub Actions, ubuntu-22.04, MongoDB 8.0.4 replica set) on PR #4 — see the PR's checks | **217 pass / 0 fail across 18 files** (47.5 s; run [42145258284](https://github.com/chiDevtet/Last-60/actions/runs/42145258284), commit `db72bdb`); typecheck and build:web passed in the same run. The first run had 216 pass / 1 fail — an assertion bug in a new test, fixed |
+| Local sandbox without a downloadable `mongod` (DB-free suites only) | 125 pass; the 10 MongoDB-backed files cannot start there |
+| Before this round (`main` at `c48fde3`), same local sandbox | 95 pass (DB-free suites only) |
+
+Earlier figures in this file ("172 passing") were reported by the PR #3 author and are superseded by
+the CI run above.
 
 Round-1 suites (counts as of the original report; several were extended since):
 
@@ -27,7 +47,17 @@ Added in round 2 (creator-fee accounting, migration, U1–U8):
 | `test/creator-fee-regressions.test.ts` | Periods across graduation tile exactly; keyed idempotent attributions (duplicate ingestion); ineligible amounts reported, never paid, gross never used; a full round over a migrated launch writes the checkpoint once at the snapshot slot; U1 role-change refusal (settings and worker attach); U2 crash between payout update and ledger write → nothing half-done, exact-once retry, legacy repair; U3 lagging node never drops, dropped rows don't block the window; U5 concurrent workers never both sign, SPL token / rent shortfalls; U8 SPL decimals; shared-vault reconciliation exact and over-attribution halts. |
 | `apps/api/test/hardening.test.ts` (extended) | U6: production requires `PUBLIC_SITE_URL` + `CORS_ORIGINS`; Host header never used; SIWS fields tamper-proof; foreign browser origin refused at verify; SSE per-IP cap. U8: CORS never reflects arbitrary origins. |
 
-Typecheck: `bun run typecheck` clean (exit 0) across engine, shared, api, worker, web. Production web build: `bun run build:web` succeeds (exit 0).
+Added after PR #3 (this round):
+
+| Suite | What it proves |
+|---|---|
+| `test/launchlab-fee-semantics.test.ts` | LaunchLab fee formula identical to the Raydium SDK's `Curve.calculateFee/splitFee`; **bit-exact** reproduction of a real mainnet `TradeEvent` from its real PlatformConfig (`creator_fee_rate` 500 = 0.05 % of trade value; protocol rate 2 500 proven from the event); 5 000 = 0.5 % of trade value ≠ 0.5 % of fees; rounding; Forgepad allocation report (mismatch / not_declared / verified). |
+| `test/basis-guards.test.ts` | Pure guards: historical-record conflicts (role, provider, beneficiary, legacy, partial and inconsistent snapshots) for swaps and attributions; fail-closed snapshot resolution; only `verified` bases distributable; stored destination specs refused unless they belong to the loaded launch (unsupported DAMM v1 / AMM v4 kinds refused). |
+| `test/basis-history.test.ts` (MongoDB) | Role change refused for history consisting only of swaps, only LP checkpoints, only fee collections, or legacy rows; allowed on a new pool; indexer **and** rewards worker refuse a conflicting beneficiary / role; fee records immutable; unresolvable basis never payable; legacy / estimated / unresolved / undeclared amounts never paid; non-payout mint never converted; duplicate collections counted once. |
+| `test/migration-attach.test.ts` (MongoDB) | On the real DBC → DAMM v2 migration: both workers attach the same persisted spec; re-resolution keeps the original spec; a different graduation is a conflict and detaches; a tampered stored spec (beneficiary, failed check) is never attached. |
+| `test/destination.test.ts` (extended) | DAMM v2: creator vs partner/other holder per position, NFT sold between checkpoints, both mints, increase attributed once / idempotent snapshot, migration-slot boundary. CPMM: accrual vs collection (protocol share never counted), CPMM basis verification, `creator_scale` vs 2026-08-17 semantics, wrong recipient, several collections in one transaction. |
+
+Typecheck: `bun run typecheck` clean (exit 0) across engine, shared, api, worker, web. Production web build: `bun run build:web` succeeds (exit 0). Both also run in CI.
 
 ## 2. Fee attribution vs. on-chain accounting (real pools, full history)
 
@@ -39,7 +69,8 @@ compares with the program's own unclaimed counters at the same slot.
 | DBC `46ou9r…` | creator 100% | 259 | 203,187,431 | 0 | 203,187,431 | 203,187,431 | exact |
 | DBC `3cz51P…` | creator 44% | 68 | 807,297,326 | 807,283,921 | 13,405 | 13,405 | exact |
 
-Logs: `docs/evidence/dbc-fee-reconciliation-*.log`.
+(The round-1 report cited logs in `docs/evidence/`; they were never committed. These figures are
+reported, not reproducible from the repository — re-run `bun run verify:fees` to reproduce.)
 
 ## 3. Live mainnet run (dry-run payouts)
 
@@ -66,7 +97,7 @@ Round #2's first verification showed the engine 9% below the chain for the full 
 cause: the pool was switched mid-period with `INDEXER_BACKFILL=none`, so swaps between the
 previous snapshot and the attach were not indexed. Verified by re-running from the attach slot
 (exact match), then **fixed**: attaching now ingests the whole current reward period (regression
-test added). Logs: `docs/evidence/launchlab-*.log`.
+test added). (Logs cited by the round-1 report were never committed to the repository.)
 
 ### Bugs found by the live run and fixed
 
@@ -94,10 +125,19 @@ test added). Logs: `docs/evidence/launchlab-*.log`.
   real `collect_cp_fees` from a *creator* LP lock has been observed (the sampled platform locks 100 %
   of the LP to itself). DAMM v1 and AMM v4 destinations are unsupported.
 * **Fee collection** (auto-claim, post-migration claims) was not executed on-chain; it stays manual.
-* **Forgepad**'s specific configuration could not be verified from public sources. The adapters read
-  the allocation from chain and check it against the operator's declaration (`EXPECTED_*`); this must
-  be done on the real Forgepad pool in dry-run before going live.
-* The `docs/evidence/*.log` files cited in §2–§3 were never committed to the repository.
+* **Forgepad**'s configuration has NOT been verified: no Forgepad pool or platform-config address is
+  available. `bun run verify:allocation --forgepad` checks a pool against Forgepad's intended targets
+  (DBC 75 % / 75 %; LaunchLab `creator_fee_rate` 5 000, `creator_scale` 500 000). The only LaunchLab
+  platform config in the fixtures (`4Bu96XjU…`, not known to be Forgepad's) has `creator_fee_rate` 500
+  and `creator_scale` 100 000 — a mismatch against those targets. A 500 000 `creator_scale` is not
+  possible for PlatformConfigs created or updated after the 2026-08-17 LaunchLab upgrade, and in any
+  case no longer yields a creator LP Fee Key for migrations executed after that upgrade.
+* **Undeclared allocations are not distributed**: with `EXPECTED_*` empty every round reports its
+  creator fees as `allocation_not_declared_not_verified` and pays nothing.
+* **Screenshots** in `docs/screenshots/` predate the public-copy change and still show an older
+  percentage headline; they could not be re-captured in this round (no running deployment).
+* The LaunchLab program source is not public; its semantics were verified against the published
+  IDL / SDK, Raydium's documentation and real mainnet events and accounts, not against program code.
 * Social handle availability for the brand was not verifiable without authenticated APIs.
 * The brief's ordering example lists "A, E, D, C, B", but under its own rule A's latest buy (3rd
   transaction) is older than C, D, E, giving "E, D, C, A, B". The selected set — and every payout

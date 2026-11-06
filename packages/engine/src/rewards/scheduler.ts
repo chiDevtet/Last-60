@@ -11,6 +11,7 @@
  *   - Allocation, payouts and ledger entries are committed in ONE MongoDB transaction.
  */
 import type { Keypair } from "@solana/web3.js";
+import { basesOf, basisDistributable } from "../accounting/attribution";
 import type { AppConfig } from "../config/env";
 import type { EffectiveSettings, SettingsStore } from "../config/runtime";
 import type { ChainRpc } from "../chain/rpc";
@@ -279,11 +280,16 @@ export class RoundScheduler {
           const last: any = await this.d.db.FeeAttribution.findOne({ checkpointKey: key, slot: { $lt: snapshotSlot }, cumulative: { $ne: null } }, { cumulative: 1, slot: 1 }).sort({ slot: -1 }).lean();
           return last ? { cumulative: BigInt(last.cumulative), slot: last.slot } : null;
         });
-        if (records.length) await persistAttributions(this.d.db, records);
+        if (records.length) await persistAttributions(this.d.db, records, provider.info());
       }
       const excluded = new Set([...settings.excludedWallets, pool.beneficiary, pool.creator, ...(this.d.payer ? [this.d.payer.publicKey.toBase58()] : []), ...(settings.expectedPayoutPublicKey ? [settings.expectedPayoutPublicKey] : [])]);
       const selection = await selectRecipients(this.d.db, this.d.rpc, { ...period, minBuyQuote: settings.minBuyQuote, buyerCount: settings.buyerCount, excluded });
-      const fees = await periodFees(this.d.db, period, settings.payoutAssetMint);
+      // Only allocations verified against the operator's declaration are distributable; the bases
+      // used (and their verification) are stored with the round so reconciliation re-derives the
+      // same figure and an auditor can see why fees were or were not distributed.
+      const bases = [...basesOf(pool).values()];
+      const verifiedBasisIds = bases.filter((b) => basisDistributable(b)).map((b) => b.id);
+      const fees = await periodFees(this.d.db, period, settings.payoutAssetMint, { verifiedBasisIds });
       const rolloverIn = prev ? big(prev.rolloverOut) : 0n;
       const a = allocate({ fees: fees.payout, rolloverIn, rewardBps: settings.rewardBps, recipients: selection.recipients.map((r) => r.wallet), minPayout: settings.minPayoutLamports, skippedRoundPolicy: settings.skippedRoundPolicy });
       const dryRun = settings.payoutMode !== "live";
@@ -318,7 +324,7 @@ export class RoundScheduler {
               fees: dec(a.fees),
               nonPayoutAssetFees: fees.other.map((o) => ({ mint: o.mint, amount: dec(o.amount) })),
               ineligibleFees: fees.ineligible.map((o) => ({ mint: o.mint, amount: dec(o.amount), reason: o.reason.slice(0, 300) })),
-              feeBreakdown: { byPhase: fees.byPhase, swaps: fees.swaps, attributions: fees.attributions },
+              feeBreakdown: { byPhase: fees.byPhase, swaps: fees.swaps, attributions: fees.attributions, verifiedBasisIds, bases: bases.map((b) => ({ id: b.id, phase: b.phase, pool: b.pool, role: b.role, beneficiary: b.beneficiary, verification: b.verification })) },
               reward: dec(a.pool),
               retained: dec(a.retained + a.retainedPool),
               rolloverIn: dec(a.rolloverIn),

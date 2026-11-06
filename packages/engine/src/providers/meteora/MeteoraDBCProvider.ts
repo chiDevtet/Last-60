@@ -207,7 +207,9 @@ export class MeteoraDBCProvider implements LaunchProvider {
     const lpPct = dbcCreatorLpPercentage(cfg);
     const lpCheck = this.opts.role === "creator" ? verifyDeclared("creator LP percentage", lpPct, this.opts.expected?.dbcCreatorLpPercentage) : { verification: "not_declared" as const, problems: [] };
     const warnings = [...dbcConfigWarnings(this.opts.role, cfg), ...check.problems.map((p) => `ALLOCATION MISMATCH: ${p}; bonding-curve fees are recorded but NOT eligible for payout`), ...lpCheck.problems.map((p) => `ALLOCATION MISMATCH: ${p}; migrated LP fees will NOT be eligible for payout`)];
-    if (this.opts.role === "creator" && check.verification === "not_declared") warnings.push("creator bonding-curve allocation not declared (EXPECTED_DBC_CREATOR_TRADING_FEE_PERCENTAGE); the on-chain value is used as read");
+    if (this.opts.role === "creator" && check.verification === "not_declared") warnings.push("NOT DECLARED: creator bonding-curve allocation (EXPECTED_DBC_CREATOR_TRADING_FEE_PERCENTAGE) — fees are recorded with the on-chain value but are NOT distributed until it is declared and verified");
+    if (this.opts.role === "creator" && lpCheck.verification === "not_declared") warnings.push("NOT DECLARED: creator migrated-LP allocation (EXPECTED_DBC_CREATOR_LP_PERCENTAGE) — post-graduation LP fees will be recorded but NOT distributed until it is declared and verified");
+    if (this.opts.role !== "creator") warnings.push(`the "${this.opts.role}" role has no declarable allocation: its fees are recorded but never distributed`);
     this.lpCheck = lpCheck;
     this.cached = {
       provider: this.id,

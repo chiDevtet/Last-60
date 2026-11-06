@@ -21,6 +21,8 @@ export interface DestinationAdapter {
   readonly migrationSignature: string;
   /** Basis of the beneficiary's post-migration allocation (positions / locks / creator-fee recipient). */
   readonly allocation: AllocationBasis;
+  /** Separate basis of the migrated-LP entitlement, when it differs from `allocation` (CPMM locked LP). */
+  readonly lpAllocation?: AllocationBasis;
   watchAddresses(): string[];
   /** Pure: decode destination-pool activity of one transaction. */
   parse(tx: NormalizedTx): ParsedTransaction;

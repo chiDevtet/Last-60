@@ -1,0 +1,52 @@
+# CI for every pull request (and pushes to main): install from the lockfile, run the full test suite
+# (unit + MongoDB replica-set integration tests), type-check every package and build the web app.
+# Any failing step fails the workflow. Nothing here holds keys, sends transactions or deploys.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # 22.04: MongoDB publishes 8.0.x server builds for this distro (used by the integration tests).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      # The integration tests start their OWN single-node replica set (packages/engine/src/testing/mongod.ts,
+      # required for multi-document transactions); mongodb-memory-server only downloads the binary.
+      MONGOMS_VERSION: "8.0.4"
+      MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.cache/mongodb-binaries
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Cache MongoDB binary
+        uses: actions/cache@v4
+        with:
+          path: .cache/mongodb-binaries
+          key: mongod-${{ runner.os }}-ubuntu2204-${{ env.MONGOMS_VERSION }}
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Test
+        run: bun run test
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build web
+        run: bun run build:web
