@@ -18,7 +18,7 @@ Counts are from actual executions, not estimates:
 
 | Run | Result |
 |---|---|
-| CI (GitHub Actions, ubuntu-22.04, MongoDB 8.0.4 replica set) on PR #4 — see the PR's checks | **217 tests across 18 files** (first run: 216 pass / 1 fail — a test-assertion bug, fixed; the fixed run is linked from the PR) |
+| CI (GitHub Actions, ubuntu-22.04, MongoDB 8.0.4 replica set) on PR #4 — see the PR's checks | **217 pass / 0 fail across 18 files** (47.5 s; run [42145258284](https://github.com/chiDevtet/Last-60/actions/runs/42145258284), commit `db72bdb`); typecheck and build:web passed in the same run. The first run had 216 pass / 1 fail — an assertion bug in a new test, fixed |
 | Local sandbox without a downloadable `mongod` (DB-free suites only) | 125 pass; the 10 MongoDB-backed files cannot start there |
 | Before this round (`main` at `c48fde3`), same local sandbox | 95 pass (DB-free suites only) |
 

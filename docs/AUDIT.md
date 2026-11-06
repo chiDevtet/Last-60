@@ -28,7 +28,7 @@ unproven end-to-end.
 
 | Run | Result |
 |---|---|
-| Round 3 — CI (GitHub Actions) on PR #4 — `bun run test` | **217 tests across 18 files**; first run 216 pass / 1 fail (assertion bug in a new test, fixed); see the PR checks for the final run |
+| Round 3 — CI (GitHub Actions) on PR #4 — `bun run test` | **217 pass / 0 fail across 18 files** (run 42145258284, `db72bdb`); first run 216 pass / 1 fail (assertion bug in a new test, fixed) |
 | Round 3 — local sandbox (no downloadable `mongod`) | 125 DB-free tests pass; MongoDB-backed files not runnable there (they run in CI) |
 | Round 3 — `bun run typecheck`, `bun run build:web` | exit 0 / exit 0 (locally and in CI) |
 | Round 2 figures below were reported by the round-2 author | not re-run separately; superseded by the CI run |
