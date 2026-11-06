@@ -1,5 +1,12 @@
 # Fee accounting
 
+> **Phase-aware reward funding (PR #6)** — Forge's two-phase business model (bonding-curve creator
+> fees 25 % creator / 75 % Last-60 of what is collected; CPMM creator fees direct creator revenue;
+> Forge platform LP claims 50 % Last-60 / 50 % Forge), its seven revenue streams, claim ↔ transfer
+> correlation and the versioned funding policy are specified in [REWARD_FUNDING.md](REWARD_FUNDING.md).
+> This document remains the specification of creator-allocated fee attribution, which the default
+> `legacy_creator_fee_v1` policy distributes unchanged.
+
 LAST60 distributes **fees, never volume** — and only the fees that on-chain configuration and
 position ownership actually **allocate to the token creator** (more generally: to the configured
 beneficiary). Eligible creator fees are tracked and allocated for payouts; payouts are based on
@@ -78,7 +85,7 @@ uses the **actual positions**, not the percentage.
 | Phase | Creator allocation | Evidence | Excluded |
 |---|---|---|---|
 | Bonding curve | `TradeEvent.creator_fee` | event of the trade instruction, cross-checked against that instruction's transfer into the creator fee vault (a disagreement makes the trade `unresolved`) | protocol, platform and share fees |
-| After migration (CPMM) — creator fee | the exact amount **transferred to the pool creator by a `collect_creator_fee(_permissionless)` instruction**, when the CPMM `pool_creator` is the creator | collection instruction's own token transfers | the protocol's `creator_fee_share_rate` retained at collection; collections to anyone else |
+| After migration (CPMM) — creator fee | the exact amount **transferred to the pool creator by a `collect_creator_fee(_permissionless)` instruction**, when the CPMM `pool_creator` is the creator, the verified `creator_fee_on` mode and the effective creator-fee share rate are established | collection instruction's own token transfers; PoolState `creator_fee_on`; AmmConfig default share rate and the per-creator `CreatorFeeShare` override (REWARD_FUNDING.md §6) | the protocol's creator-fee share retained at collection (override if present, else AmmConfig); collections to anyone else |
 | After migration (CPMM) — migrated LP | LP fees collected (`collect_cp_fees`, Raydium LP-lock program) from the lock whose fee-key NFT was **minted to the creator at migration**, signed by and paid to the creator | migration transaction's `lock_cp_liquidity` CPIs; collection instruction's transfers | the platform's lock, collections by a different fee-key holder, LP principal (permanently locked) |
 
 **`creator_fee_rate` is a fee rate, not a share.** `PlatformConfig.creator_fee_rate` is expressed in
@@ -244,15 +251,17 @@ verified**, the destination pool (`PoolInfo.accountingPools`). Therefore:
 ```
 rewardShare = ⌊fees × REWARD_BPS / 10_000⌋
 retained    = fees − rewardShare
-pool        = rewardShare + rolloverIn
+pool        = rewardShare + funding + rolloverIn      funding = verified Last-60 contributions (phase-aware policy; 0 under legacy)
 per         = ⌊pool / n⌋          dust = pool − per × n   (retained, recorded)
 n = 0 or per < MIN_PAYOUT_LAMPORTS → no payouts; pool → rolloverOut (rollover) or retained (retain)
 ```
 `fees` is the period's **distributable creator allocation** only (§1). `REWARD_BPS`
 (`REWARD_PERCENTAGE=75` → 7 500) is LAST60's split of those fees between buyer rewards and retained
 funds; it is unrelated to the creator's on-chain allocation percentage, the LaunchLab creator fee
-rate, or the creator's migrated-LP share. Invariant (property-tested and
-checked by the reconciler): `fees + rolloverIn = retained + dust + rolloverOut + Σ payouts`.
+rate, or the creator's migrated-LP share — and it is **not** the bonding-curve 75 % or the Forge LP
+50 %, which are source-specific policy parameters applied to collected amounts (REWARD_FUNDING.md).
+`REWARD_BPS` is never applied to `funding`. Invariant (property-tested and checked by the
+reconciler): `fees + funding + rolloverIn = retained + dust + rolloverOut + Σ payouts`.
 
 ## 6. Configuration changes
 
@@ -282,6 +291,7 @@ Append-only, one row per economic fact, unique idempotency `key`:
 | `PAYOUT_CONFIRMED` | `…:<payoutId>` | written **in the same MongoDB transaction** as the confirmation and buyer statistics |
 | `PAYOUT_SIMULATED` / `PAYOUT_FAILED` / `PAYOUT_REQUEUED` | `…:<payoutId>` | dry-run / exhausted (atomic) / operator requeue |
 | `FEE_CLAIMED` | `…:<signature>[:<i>]` | on-chain claim of bonding-curve or position fees |
+| `FUNDING_CREDITED` | `…:r<n>:<stream>` | verified, reconciled Last-60 contributions consumed by round n (phase-aware policy) |
 
 ## 8. Collection
 
