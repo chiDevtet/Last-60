@@ -157,9 +157,15 @@ export class Reconciler {
     for (const r of rounds) {
       const payouts: any[] = await this.d.db.Payout.find({ roundNumber: r.roundNumber }, { amount: 1 }).lean();
       const paidTotal = payouts.reduce((s, p) => s + big(p.amount), 0n);
-      const lhs = big(r.fees) + big(r.rolloverIn);
+      const lhs = big(r.fees) + big(r.funding ?? 0) + big(r.rolloverIn);
       const rhs = big(r.retained) + big(r.dust) + big(r.rolloverOut) + paidTotal;
-      if (lhs !== rhs) problems.push(`round #${r.roundNumber}: fees+rollover ${lhs} ≠ retained+dust+rollover+payouts ${rhs}`);
+      if (lhs !== rhs) problems.push(`round #${r.roundNumber}: fees+funding+rollover ${lhs} ≠ retained+dust+rollover+payouts ${rhs}`);
+      // Phase-aware funding: the credits marked with this round must sum to the round's funding, and
+      // the FUNDING_CREDITED ledger entries must agree (no credit consumed twice or silently dropped).
+      const consumed: any[] = await this.d.db.RewardFunding.aggregate([{ $match: { roundNumber: r.roundNumber } }, { $group: { _id: null, t: { $sum: "$creditableAmount" }, n: { $sum: 1 } } }]);
+      if (big(consumed[0]?.t ?? 0) !== big(r.funding ?? 0)) problems.push(`round #${r.roundNumber}: consumed funding credits ${big(consumed[0]?.t ?? 0)} ≠ round funding ${big(r.funding ?? 0)}`);
+      const fl: any[] = await this.d.db.LedgerEntry.aggregate([{ $match: { roundNumber: r.roundNumber, type: "FUNDING_CREDITED" } }, { $group: { _id: null, t: { $sum: "$amount" } } }]);
+      if (big(fl[0]?.t ?? 0) !== big(r.funding ?? 0)) problems.push(`round #${r.roundNumber}: ledger FUNDING_CREDITED ≠ round funding`);
       if (payouts.length !== r.recipientCount || paidTotal !== big(r.perRecipient) * BigInt(r.recipientCount)) problems.push(`round #${r.roundNumber}: payout rows do not match allocation`);
       const ledger: any[] = await this.d.db.LedgerEntry.aggregate([{ $match: { roundNumber: r.roundNumber, type: "PAYOUT_SCHEDULED" } }, { $group: { _id: null, t: { $sum: "$amount" } } }]);
       if (big(ledger[0]?.t ?? 0) !== paidTotal) problems.push(`round #${r.roundNumber}: ledger PAYOUT_SCHEDULED ≠ payout rows`);
@@ -174,7 +180,13 @@ export class Reconciler {
       if (r.snapshotSlot == null || !r.config?.pool || !r.config?.payoutMint) continue;
       const pool = r.config.pools?.length ? r.config.pools : r.config.previousPool ? [r.config.previousPool, r.config.pool] : r.config.pool;
       // Same distributable-basis set as the round used (rounds written before it was stored: none).
-      const now = await periodFees(this.d.db, { pool, afterSlot: r.prevSnapshotSlot ?? null, periodStartAt: r.periodStartAt ?? null, snapshotSlot: r.snapshotSlot }, r.config.payoutMint, { verifiedBasisIds: r.feeBreakdown?.verifiedBasisIds ?? [] });
+      // Phase-aware rounds distributed creator-allocated fees only up to the policy's activation slot.
+      const cap: number | null = r.fundingPolicy?.legacyFeeSlotCap ?? null;
+      if (cap !== null && r.prevSnapshotSlot != null && r.prevSnapshotSlot >= cap) {
+        if (big(r.fees) !== 0n) problems.push(`round #${r.roundNumber}: distributed ${big(r.fees)} creator-allocated fees after the phase-aware activation slot ${cap}`);
+        continue;
+      }
+      const now = await periodFees(this.d.db, { pool, afterSlot: r.prevSnapshotSlot ?? null, periodStartAt: r.periodStartAt ?? null, snapshotSlot: cap !== null ? Math.min(cap, r.snapshotSlot) : r.snapshotSlot }, r.config.payoutMint, { verifiedBasisIds: r.feeBreakdown?.verifiedBasisIds ?? [] });
       if (now.payout !== big(r.fees)) problems.push(`round #${r.roundNumber}: period fees are now ${now.payout} but ${big(r.fees)} were distributed (${now.payout > big(r.fees) ? "transactions ingested after the snapshot" : "counted transactions later dropped"})`);
     }
     const status = problems.length ? "mismatch" : "ok";

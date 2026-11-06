@@ -128,6 +128,16 @@ Forgepad's real PlatformConfig `5zZFa8Ki…` was decoded on mainnet (FEE_ACCOUNT
 The existing DBC targets (75 % creator) already matched the owner's 25 / 75 statement; LaunchLab
 targets are now the decoded on-chain values, never derived from the DBC split.
 
+### Round 5 — phase-aware reward funding and CPMM hardening (PR #6, each with regression tests)
+
+| # | Finding | Fix |
+|---|---|---|
+| G1 | `creator_fee_on` was decoded but only `enable_creator_fee` was kept; a pool's creator-fee mint mode was never verified | Mode decoded per raydium-cp-swap `CreatorFeeOn` and persisted on the verified migration, spec, basis snapshot and reports; unknown → `unverifiable`; pre-PR bases (no mode) never distributable (`cpmm_creator_fee_basis_unresolved`) |
+| G2 | A per-creator `CreatorFeeShare` override (22 exist on mainnet, one on Forgepad's AmmConfig) could silently replace the AmmConfig share rate | PDA derived and read at verification; default / override / effective reported separately with the slot; invalid override → `unverifiable` |
+| G3 | No model for Forge's two-phase revenue: bonding creator-fee contribution, CPMM creator fees and Forge platform LP claims would have been indistinguishable from creator-allocated fees | Seven explicit streams; contributions fund rounds only when observed, correlated (same tx / memo / opt-in exclusive window), verified, ≤ policy, finalized, and only under the versioned `forge_phase_aware_v1` policy |
+| G4 | Applying `REWARD_PERCENTAGE` to both creator fees and contributions would double count (and reinterpret the setting) | Legacy fees capped at the activation slot; `REWARD_PERCENTAGE` never applied to contributions; pre-activation bonding accruals absorbed before a contribution is creditable |
+| G5 | Forgepad inspection: no 25 / 75 bonding split exists; the deployed Raydium worker claims bonding **platform** fees every 5 min (not LP fees) and writes them to `total_postmigration_*`; the LP harvester is undeployed, hourly, quote-leg only, swaps USD1, no correlation memo | Documented (REWARD_FUNDING.md §10–11); nothing from those flows is fundable until Forgepad sends same-transaction or memo-correlated contributions to the configured destinations |
+
 ## 4. Live-money execution paths — review notes
 
 * **Native SOL / SPL transfers** — one recipient per transaction, canonical on-curve recipients only,
@@ -231,6 +241,10 @@ live round across a real graduation, and a real `collect_cp_fees` from a creator
     not distributable, and a worker refuses to attach if such records cannot be matched to a current
     basis id. Plan an operator review (or a new pool) before upgrading any instance that has history.
 11. **Partner / platform roles** have no declarable allocation and are therefore never distributed.
+12. **Phase-aware funding** (PR #6): requires the Forgepad-side changes in REWARD_FUNDING.md §11
+    (destination, same-transaction or memo correlation, exact same-mint amounts, a bonding 75 %
+    mechanism, a deployed LP claimer). Keep `REWARD_FUNDING_POLICY=legacy_creator_fee_v1` until
+    `bun run cli revenue` shows reconciled claims and linked inflows on real Forge transactions.
 
 ## 8. Documentation vs. code discrepancies
 

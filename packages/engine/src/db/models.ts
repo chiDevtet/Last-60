@@ -4,6 +4,9 @@
  *   swaps            (signature, eventIndex)
  *   fee_claims       (signature, index)
  *   fee_attributions (key)  — non-swap fee facts (LP checkpoints, collections, exclusions)
+ *   revenue_events   (key), (signature, ordinal, stream, feeMint) — phase-aware collections / funding inflows
+ *   reward_funding   (key = funding inflow) — one credit per transfer, consumed by one round
+ *   revenue_reconciliations (key = collection) — derived per-claim reconciliation
  *   rounds           (roundNumber), (roundIndex)
  *   payouts          (roundNumber, recipient), confirmedSignature
  *   ledger_entries   (key)  — idempotency key per economic fact
@@ -228,6 +231,151 @@ feeAttributionSchema.index({ sourcePool: 1, slot: 1 });
 feeAttributionSchema.index({ checkpointKey: 1, slot: -1 });
 guardImmutable(feeAttributionSchema, ["basis", "basisId", "creatorAmount", "excludedAmount", "grossAmount", "excludedReason", "status", "payoutEligible", "phase", "beneficiary", "pool", "sourcePool", "destinationPool", "provider", "feeMint", "kind", "cumulative", "evidence"]);
 
+// ─── revenue events (phase-aware streams; accounting/revenueStreams.ts) ─────────
+/**
+ * Immutable on-chain facts of the phase-aware revenue model: fee COLLECTIONS (bonding-curve creator
+ * fee, CPMM creator fee, Forge platform LP fee claim) and FUNDING INFLOWS (transfers into a configured
+ * Last-60 funding destination). One row per (signature, instruction ordinal, stream, mint): retries,
+ * re-indexing and restarts can never create a second row.
+ */
+export const REVENUE_EVENT_STREAMS = ["bonding_curve_creator_fee", "cpmm_creator_trading_fee", "forge_platform_lp_fee_collection", "last60_funding_inflow"] as const;
+const revenueEventSchema = new Schema(
+  {
+    key: { type: String, required: true, unique: true },
+    kind: { type: String, enum: ["collection", "funding_inflow"], required: true },
+    stream: { type: String, enum: REVENUE_EVENT_STREAMS, required: true },
+    chain: { type: String, default: "solana" },
+    cluster: { type: String, required: true },
+    provider: { type: String, required: true },
+    launchPhase: { type: String, default: null }, // "bonding_curve" | "post_migration" | null (inflow)
+    tokenMint: { type: String, required: true },
+    sourcePool: { type: String, required: true },
+    pool: { type: String, required: true },
+    signature: { type: String, required: true },
+    /** Top-level instruction index and inner index (null = top-level) of the instruction that moved the funds. */
+    instructionIndex: { type: Number, required: true },
+    innerInstructionIndex: { type: Number, default: null },
+    /** Execution-order ordinal across the whole transaction. */
+    ordinal: { type: Number, required: true },
+    slot: { type: Number, required: true },
+    blockTime: { type: Date, default: null },
+    feeMint: { type: String, required: true },
+    /** Accounting asset (native SOL and WSOL share one asset; nothing else is merged). */
+    asset: { type: String, required: true },
+    decimals: { type: Number, default: null },
+    grossAmount: { type: D, default: null },
+    netAmount: { type: D, required: true },
+    sourceAccount: { type: String, default: null },
+    destinationAccount: { type: String, default: null },
+    sourceOwner: { type: String, default: null },
+    destinationOwner: { type: String, default: null },
+    /** Actual beneficiary of the collected amount (creator / Forge platform wallet / Last-60 destination). */
+    beneficiary: { type: String, default: null },
+    status: { type: String, enum: FEE_STATUSES, required: true },
+    /** Raw events are never payable themselves; eligibility lives on `reward_funding` credits. */
+    payoutEligible: { type: Boolean, default: false },
+    excludedReason: { type: String, default: null },
+    memoClaimSignature: { type: String, default: null },
+    evidence: { type: Schema.Types.Mixed, default: null },
+    snapshot: { type: Schema.Types.Mixed, required: true },
+    commitment: { type: String, enum: ["confirmed", "finalized"], required: true },
+    createdAt: { type: Date, default: Date.now },
+  },
+  { collection: "revenue_events", versionKey: false },
+);
+revenueEventSchema.index({ signature: 1, ordinal: 1, stream: 1, feeMint: 1 }, { unique: true });
+revenueEventSchema.index({ sourcePool: 1, kind: 1, slot: 1 });
+revenueEventSchema.index({ kind: 1, sourceOwner: 1, asset: 1, slot: 1 });
+revenueEventSchema.index({ stream: 1, slot: 1 });
+guardImmutable(revenueEventSchema, ["key", "kind", "stream", "provider", "launchPhase", "tokenMint", "sourcePool", "pool", "signature", "instructionIndex", "innerInstructionIndex", "ordinal", "slot", "feeMint", "asset", "grossAmount", "netAmount", "sourceAccount", "destinationAccount", "sourceOwner", "destinationOwner", "beneficiary", "status", "payoutEligible", "excludedReason", "memoClaimSignature", "evidence", "snapshot"]);
+
+/**
+ * Reward-funding credits: one per funding inflow correlated to a collection (unique `key` = the
+ * inflow event key, so one transfer funds at most one claim, once). Amounts are immutable; only the
+ * round bookkeeping (`roundNumber`, `consumedAt`) is written later, conditionally on `roundNumber:
+ * null` inside the round's transaction, so a credit is consumed by exactly one round.
+ */
+const rewardFundingSchema = new Schema(
+  {
+    key: { type: String, required: true, unique: true },
+    stream: { type: String, enum: ["bonding_curve_last60_reward_contribution", "forge_platform_lp_last60_contribution"], required: true },
+    collectionKey: { type: String, required: true },
+    correlationMethod: { type: String, enum: ["same_transaction", "memo", "exclusive_window"], required: true },
+    provider: { type: String, required: true },
+    tokenMint: { type: String, required: true },
+    sourcePool: { type: String, required: true },
+    pool: { type: String, required: true },
+    signature: { type: String, required: true },
+    ordinal: { type: Number, required: true },
+    slot: { type: Number, required: true },
+    /** Slot of the collection this inflow distributes. */
+    collectionSlot: { type: Number, required: true },
+    blockTime: { type: Date, default: null },
+    /** Accounting asset funded (WSOL mint for native SOL / WSOL). */
+    fundingMint: { type: String, required: true },
+    observedAmount: { type: D, required: true },
+    /** Portion supported by the policy (≤ remaining expected contribution of the claim). */
+    creditableAmount: { type: D, required: true },
+    /** Portion above the policy amount (recorded, never payable). */
+    excessAmount: { type: D, required: true },
+    status: { type: String, enum: FEE_STATUSES, required: true },
+    payoutEligible: { type: Boolean, required: true },
+    ineligibleReason: { type: String, default: null },
+    policy: { type: Schema.Types.Mixed, required: true },
+    snapshot: { type: Schema.Types.Mixed, required: true },
+    roundNumber: { type: Number, default: null },
+    consumedAt: { type: Date, default: null },
+    createdAt: { type: Date, default: Date.now },
+  },
+  { collection: "reward_funding", versionKey: false },
+);
+rewardFundingSchema.index({ collectionKey: 1, slot: 1 });
+rewardFundingSchema.index({ roundNumber: 1, fundingMint: 1 });
+rewardFundingSchema.index({ payoutEligible: 1, roundNumber: 1, fundingMint: 1, slot: 1 });
+guardImmutable(rewardFundingSchema, ["key", "stream", "collectionKey", "correlationMethod", "provider", "tokenMint", "sourcePool", "pool", "signature", "ordinal", "slot", "collectionSlot", "fundingMint", "observedAmount", "creditableAmount", "excessAmount", "status", "payoutEligible", "ineligibleReason", "policy", "snapshot"]);
+
+/**
+ * Per-collection reconciliation (durable claim record). DERIVED: recomputed idempotently from the
+ * immutable collection event and its credits, so a restart or re-run converges to the same row.
+ */
+const revenueReconciliationSchema = new Schema(
+  {
+    key: { type: String, required: true, unique: true }, // = collection event key (correlation id)
+    stream: { type: String, required: true },
+    provider: String,
+    tokenMint: String,
+    sourcePool: String,
+    pool: String,
+    collectionSignature: String,
+    collectionOrdinal: Number,
+    collectionSlot: Number,
+    collectionBlockTime: { type: Date, default: null },
+    feeMint: String,
+    asset: String,
+    decimals: { type: Number, default: null },
+    recipient: String,
+    creator: { type: String, default: null },
+    gross: D,
+    expectedLast60: D,
+    expectedRetained: D,
+    actualLast60: D,
+    creditable: D,
+    excess: D,
+    untransferred: D,
+    impliedRetained: D,
+    status: { type: String, enum: ["awaiting_distribution", "partial", "reconciled", "excess", "unresolved", "not_applicable"], required: true },
+    verified: Boolean,
+    discrepancies: { type: [String], default: [] },
+    problems: { type: [String], default: [] },
+    distributions: { type: Schema.Types.Mixed, default: [] },
+    policy: Schema.Types.Mixed,
+    updatedAt: { type: Date, default: Date.now },
+  },
+  { collection: "revenue_reconciliations", versionKey: false },
+);
+revenueReconciliationSchema.index({ sourcePool: 1, stream: 1, collectionSlot: 1 });
+revenueReconciliationSchema.index({ status: 1 });
+
 // ─── unique buyer activity ──────────────────────────────────────────────────────
 const buyerActivitySchema = new Schema(
   {
@@ -290,6 +438,11 @@ const roundSchema = new Schema(
     ineligibleFees: [{ _id: false, mint: String, amount: D, reason: String }],
     /** Per-phase breakdown of the distributed fees (bonding curve / post-migration / migrated LP). */
     feeBreakdown: { type: Schema.Types.Mixed, default: null },
+    /** Reward-funding policy in force for this round (immutable snapshot) and contributions consumed. */
+    fundingPolicy: { type: Schema.Types.Mixed, default: null },
+    /** Σ verified Last-60 contributions (payout asset) consumed by this round; 0/null under the legacy policy. */
+    funding: { type: D, default: null },
+    fundingBreakdown: { type: Schema.Types.Mixed, default: null },
     reward: { type: D, default: null },
     retained: { type: D, default: null },
     rolloverIn: { type: D, default: null },
@@ -394,6 +547,7 @@ export const LEDGER_TYPES = [
   "PAYOUT_REQUEUED",
   "FEE_CLAIMED",
   "FEE_EXCLUDED", // fees recorded in a round's period but not allocated / not provable (never paid)
+  "FUNDING_CREDITED", // verified, reconciled Last-60 contribution consumed by a round (phase-aware policy)
 ] as const;
 export type LedgerType = (typeof LEDGER_TYPES)[number];
 
@@ -484,6 +638,9 @@ export const schemas = {
   Swap: swapSchema,
   FeeClaim: feeClaimSchema,
   FeeAttribution: feeAttributionSchema,
+  RevenueEvent: revenueEventSchema,
+  RewardFunding: rewardFundingSchema,
+  RevenueReconciliation: revenueReconciliationSchema,
   BuyerActivity: buyerActivitySchema,
   Round: roundSchema,
   Payout: payoutSchema,

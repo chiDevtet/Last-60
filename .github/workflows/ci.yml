@@ -42,6 +42,22 @@ jobs:
       - name: Install (frozen lockfile)
         run: bun install --frozen-lockfile
 
+      # Explicit, named run of the accounting-safety suites (phase-aware revenue streams, funding
+      # credits and round funding, CPMM creator_fee_on / CreatorFeeShare, migration verification,
+      # immutable snapshots). A missing file fails this step. They run again in the full suite below.
+      - name: Revenue, funding and migration verification suites
+        run: >-
+          bun test
+          packages/engine/test/revenue-model.test.ts
+          packages/engine/test/revenue-funding.test.ts
+          packages/engine/test/cpmm-migration-hardening.test.ts
+          packages/engine/test/forgepad-launchlab.test.ts
+          packages/engine/test/migration.test.ts
+          packages/engine/test/migration-attach.test.ts
+          packages/engine/test/basis-guards.test.ts
+          packages/engine/test/basis-history.test.ts
+          packages/engine/test/config.test.ts
+
       - name: Test
         run: bun run test
 

@@ -327,6 +327,8 @@ export class MeteoraDBCProvider implements LaunchProvider {
           quoteAmount: toBig(f(ev.data, "token_quote_amount")),
           slot: tx.slot,
           blockTime: tx.blockTime,
+          // Instruction-scoped evidence: the claim instruction (its vault → recipient transfers).
+          evidence: { instruction: parent.ordinal, event: isCreatorClaim ? "EvtClaimCreatorTradingFee" : "EvtClaimTradingFee" },
         } satisfies NormalizedFeeClaim);
       }
     }

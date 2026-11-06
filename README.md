@@ -17,6 +17,7 @@ kept private until it happens. Payouts are based on verified creator fee allocat
 | **Indexer** (`apps/worker` → `indexer`) | WebSocket fast path + gap-free cursor polling + backfill; idempotent ingestion; finality tracking and fork exclusion; v1-transaction aware. |
 | **Launch providers** | Meteora DBC and Raydium LaunchLab adapters from the official IDLs, validated on real mainnet data; switch with `LAUNCH_PROVIDER` (or live, from the admin console). Strictly verified graduation to Meteora DAMM v2 and Raydium CPMM with post-migration buyer tracking and creator-entitlement accounting. |
 | **Creator-fee accounting** | Only fees allocated to the creator by on-chain configuration and position ownership are counted; every record carries gross / allocated / excluded amounts, its allocation basis, evidence and payout eligibility ([Fee accounting](docs/FEE_ACCOUNTING.md)). |
+| **Phase-aware reward funding** | Forge's two-phase model kept as seven separate streams: bonding-curve creator fees (25 % creator / 75 % Last-60 of what is **collected**), CPMM creator fees (direct creator revenue, never funding) and Forge platform LP claims (50 % Last-60 / 50 % Forge). Only **observed, correlated** transfers into a Last-60 funding destination fund rounds, capped at the policy amount, once, under a versioned policy ([Reward funding](docs/REWARD_FUNDING.md)). |
 | **API** (`apps/api`) | Public REST + Server-Sent Events from whitelisted DTOs; wallet-signature admin API with audited, version-checked configuration. |
 | **Web** (`apps/web`, Next.js 16) | Countdown centerpiece with final-minute intensification, live reward pool, buyer feed, live engine terminal, payout history with Solscan links, stats and charts, admin console, brand page. |
 | **Brand** (`brand/`) | LAST60 identity — logo (light/dark), icon, favicons, social image, X banner, OG image. |
@@ -64,6 +65,8 @@ bun run verify:allocation [--forgepad]                    # declared vs on-chain
 bun run verify:platform-config [ADDRESS] [--pool P]       # decode + explain a LaunchLab PlatformConfig (default: Forgepad's; read-only)
 bun run verify:fees meteora_dbc <pool> <mint> creator     # full-history attribution == on-chain counters
 bun run verify:round <n> --fees                           # re-derive a round's recipients & fees from public data
+bun run report:revenue [--pool P] [--json]                # phase-aware revenue streams, per fee mint (read-only)
+bun run cli revenue | revenue-reconcile                   # same report / re-run claim ↔ transfer reconciliation
 ```
 
 ## Documentation
@@ -72,6 +75,7 @@ bun run verify:round <n> --fees                           # re-derive a round's 
 |---|---|
 | [Architecture](docs/ARCHITECTURE.md) | processes, rounds, snapshot, payouts, privacy, failure handling |
 | [Fee accounting](docs/FEE_ACCOUNTING.md) | formulas, periods, ledger, collection, reconciliation |
+| [Reward funding](docs/REWARD_FUNDING.md) | two-phase business model, revenue streams, claim ↔ transfer evidence, funding policy, Forgepad findings and required Forgepad changes, runbook |
 | [Providers](docs/PROVIDERS.md) | Meteora DBC & Raydium LaunchLab internals, graduation support matrix |
 | [Database](docs/DATABASE.md) | collections, constraints, state machines, reconstruction |
 | [API](docs/API.md) | public, SSE and admin endpoints |
@@ -101,6 +105,7 @@ bun run verify:round <n> --fees                           # re-derive a round's 
 | 13 | Scheduling information stays private | ✔ not in any public response, terminal line, log or admin endpoint (tested) |
 | 14 | Provider switch by configuration only | ✔ performed live via the admin API |
 | 15 | Runs without the frontend | ✔ separate processes |
+| 16 | Phase-aware reward funding (PR #6) | ✔ streams, correlation, reconciliation, policy-gated round funding and CPMM `creator_fee_on` / `CreatorFeeShare` verification, tested on real fixtures and synthetic Forge flows; **not funding live rounds**: the default policy is legacy and Forgepad does not yet send correlated contributions ([§11](docs/REWARD_FUNDING.md#11-required-forgepad-side-changes-not-part-of-this-repository)) |
 
 **Before going live:** resolve the production blockers in [Audit §7](docs/AUDIT.md) — verify the
 real Forgepad pool and declare its allocation (`EXPECTED_*`; undeclared or mismatching allocations

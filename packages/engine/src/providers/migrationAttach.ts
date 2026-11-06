@@ -39,7 +39,8 @@ function lpCheckOf(provider: LaunchProvider) {
 export function specFor(provider: LaunchProvider, info: PoolInfo, v: VerifiedMigration): DestinationSpec | null {
   const inner = provider instanceof MigrationAwareProvider ? provider.inner : provider;
   const pc = inner instanceof RaydiumLaunchLabProvider ? inner.platformConfigState() : null;
-  return destinationSpec(info, v, lpCheckOf(provider), pc ? { creatorScale: pc.creatorScale?.toString() ?? null, platformScale: pc.platformScale?.toString() ?? null, platformNftWallet: pc.platformLockNftWallet ?? null } : {});
+  const expectedCpmmCreatorFeeRate = inner instanceof RaydiumLaunchLabProvider ? (inner.expectedAllocation()?.cpmmCreatorFeeRate ?? null) : null;
+  return destinationSpec(info, v, lpCheckOf(provider), pc ? { creatorScale: pc.creatorScale?.toString() ?? null, platformScale: pc.platformScale?.toString() ?? null, platformNftWallet: pc.platformLockNftWallet ?? null, expectedCpmmCreatorFeeRate } : {});
 }
 
 export type MigrationOutcome = MigrationStatus | "conflict";

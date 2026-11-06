@@ -150,6 +150,17 @@ Notes (round 3):
   example the CPMM `pool_creator` is the LaunchLab creator, `creator_fee_rate` = 14 950 and the share
   rate 50 000 (millionths); the platform locked 100 % of the LP to itself (`creator_scale` = 0), so the
   creator has no migrated-LP entitlement there.
+* **CPMM `creator_fee_on`** (PoolState byte 389; raydium-cp-swap `CreatorFeeOn`): `0` both tokens (fee on
+  the swap's input), `1` only token 0, `2` only token 1. Decoded, verified and persisted through the
+  verified migration, the destination spec, the basis snapshot and the reports; any other value makes
+  the CPMM creator-fee basis unverifiable. The real example pool uses `1` (token 0 = WSOL).
+* **CPMM `CreatorFeeShare`** (raydium-cp-swap `states/creator_fee_share.rs`): PDA
+  `["creator_fee_share", pool_creator, amm_config]`, 145 bytes; when it exists and is CPMM-owned its
+  `share_rate` overrides `AmmConfig.creator_fee_share_rate`, else the default applies. The real
+  collection fixture passes exactly this PDA (account #15) and it was empty (default 50 000 applied).
+  22 overrides exist on mainnet (all rate 0, one creator), one on Forgepad's AmmConfig. Verification
+  records the default, the override and the effective rate with the slot read
+  (`test/fixtures/mainnet/cpmm-creator-fee-share.json`, `bun run fixtures:cpmm-fee-share`).
 * A real creator-fee collection moved 1 683 458 372 lamports to the creator while the creator's
   token account changed by only 1 090 712 680 over the whole transaction (a later instruction moved
   part of it) — the reason all claims and collections are measured per instruction.

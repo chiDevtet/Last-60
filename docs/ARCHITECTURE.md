@@ -162,8 +162,14 @@ leaders safe.
    for the snapshot slot. Eligible fees = Σ payout-eligible creator allocations in the period (swap
    `eligibleFee` + attribution `creatorAmount`) in the payout asset. Other assets are recorded, not
    converted; ineligible amounts are recorded as `FEE_EXCLUDED`.
+5b. Reward funding policy (`docs/REWARD_FUNDING.md`): under `legacy_creator_fee_v1` (default) the
+   step above is the only funding source. Under `forge_phase_aware_v1`, for a snapshot after the
+   activation slot, eligible creator fees count only up to that slot and the round additionally
+   consumes verified, reconciled Last-60 contribution credits (payout asset, finalized transfers,
+   not yet consumed) — inside the step-7 transaction, conditionally, so each credit funds one round.
 6. Allocation (pure integer function, `rewards/allocation.ts`):
-   * `reward = ⌊fees · REWARD_BPS / 10000⌋ + rolloverIn`, `retained = fees − ⌊…⌋`
+   * `reward = ⌊fees · REWARD_BPS / 10000⌋ + funding + rolloverIn`, `retained = fees − ⌊…⌋`
+     (`funding` = consumed contributions; `REWARD_BPS` is never applied to it)
    * `per = ⌊reward / n⌋`, `dust = reward − per·n` (recorded as retained dust)
    * `n = 0` or `per < MIN_PAYOUT_LAMPORTS` → no payouts, `reward` carried forward
      (`SKIPPED_ROUND_POLICY=rollover`, default) or retained (`retain`).
@@ -212,6 +218,12 @@ See `docs/FEE_ACCOUNTING.md` for the full ledger specification. Summary:
   on-chain unclaimed counter (DBC) or vault balance (LaunchLab) at a common slot, checks
   per-round ledger invariants, and checks the payout wallet covers pending payouts.
   Over-attribution (engine believes more fees exist than the chain holds) halts payouts.
+* **Phase-aware revenue streams (PR #6):** the indexer also watches `LAST60_FUNDING_DESTINATIONS`.
+  Each ingested transaction is decoded into immutable `revenue_events` (bonding-curve creator-fee
+  collections, CPMM creator-fee collections, Forge platform LP claims, funding inflows); inflows are
+  correlated to claims (same transaction, `last60:v1:` memo, or opt-in exclusive window), producing
+  one `reward_funding` credit per inflow and derived `revenue_reconciliations` per claim. Seven
+  streams are reported separately; only the two Last-60 contributions can fund rounds.
 
 ## 8. Privacy of scheduling information
 

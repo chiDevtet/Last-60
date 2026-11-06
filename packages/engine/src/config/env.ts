@@ -6,6 +6,7 @@ import { PublicKey } from "@solana/web3.js";
 import { z } from "zod";
 import { parseUnits, WSOL_MINT } from "@last60/shared";
 import { jsonSafe } from "../util/json";
+import { makeFundingPolicy, type FundingCorrelationMode, type FundingPolicy } from "../accounting/revenueStreams";
 
 export type ProcessRole = "indexer" | "rewards" | "api" | "cli" | "test";
 
@@ -125,6 +126,23 @@ const RawEnv = z.object({
   EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE: z.string().optional(),
   EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE: z.string().optional(),
   EXPECTED_LAUNCHLAB_PLATFORM_CONFIG: z.string().optional(),
+  /** CPMM AmmConfig.creator_fee_rate the migrated pool must use (millionths of swap value; Forgepad 500 = 0.05 %). */
+  EXPECTED_CPMM_CREATOR_FEE_RATE: z.string().optional(),
+
+  // Phase-aware reward funding (PR #6; docs/REWARD_FUNDING.md). Default: the legacy policy, unchanged.
+  REWARD_FUNDING_POLICY: z.enum(["legacy_creator_fee_v1", "forge_phase_aware_v1"]).default("legacy_creator_fee_v1"),
+  /** Phase-aware policy governs slots strictly after this slot (required with forge_phase_aware_v1). */
+  REWARD_FUNDING_POLICY_ACTIVATION_SLOT: z.string().optional(),
+  /** Wallets that receive Last-60 funding (native SOL to the wallet, SPL to token accounts it owns). */
+  LAST60_FUNDING_DESTINATIONS: csv(pubkey),
+  /** Expected owner of Forge's platform LP Fee Key (must equal the PlatformConfig platform_nft_wallet). */
+  FORGE_PLATFORM_LP_BENEFICIARY: optionalPubkey,
+  /** Share of each COLLECTED bonding-curve creator fee that funds Last-60 (creator keeps the rest). */
+  BONDING_CREATOR_FEE_LAST60_PERCENTAGE: z.string().default("75"),
+  /** Share of each COLLECTED Forge platform LP fee claim that funds Last-60 (Forge keeps the rest). */
+  FORGE_PLATFORM_LP_LAST60_PERCENTAGE: z.string().default("50"),
+  /** strict: same-transaction or memo correlation only. exclusive_window: also the unambiguous latest claim. */
+  FUNDING_CORRELATION_MODE: z.enum(["strict", "exclusive_window"]).default("strict"),
 
   BUYER_COUNT: int(5, 1, 50),
   MIN_BUY_SOL: z.string().default("0.05"),
@@ -212,6 +230,17 @@ export interface ExpectedAllocation {
   launchlabCreatorFeeRate: number | null;
   launchlabCreatorLpScale: number | null;
   launchlabPlatformConfig?: string | null;
+  /** CPMM AmmConfig.creator_fee_rate (millionths of swap value). */
+  cpmmCreatorFeeRate?: number | null;
+}
+
+export interface RevenueConfig {
+  policy: FundingPolicy;
+  /** Configured Last-60 funding destination wallets (owners). */
+  fundingDestinations: string[];
+  /** Expected Forge platform LP Fee Key owner; null = not declared (Forge LP contributions unresolved). */
+  forgePlatformLpBeneficiary: string | null;
+  correlationMode: FundingCorrelationMode;
 }
 
 export interface AppConfig {
@@ -291,6 +320,7 @@ export interface AppConfig {
     trustProxyHops: number;
   };
   reconciliation: { intervalMs: number; haltOnOverAttribution: boolean; toleranceLamports: bigint };
+  revenue: RevenueConfig;
   terminal: { retentionDays: number };
   public: { appName: string; explorer: string };
   /** Secrets are kept out of the main object so it can be logged/inspected safely. */
@@ -484,7 +514,33 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     launchlabCreatorFeeRate: expectedInt("EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE", raw.EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE, 1_000_000),
     launchlabCreatorLpScale: expectedInt("EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE", raw.EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE, 1_000_000),
     launchlabPlatformConfig: expectedPubkey("EXPECTED_LAUNCHLAB_PLATFORM_CONFIG", raw.EXPECTED_LAUNCHLAB_PLATFORM_CONFIG),
+    cpmmCreatorFeeRate: expectedInt("EXPECTED_CPMM_CREATOR_FEE_RATE", raw.EXPECTED_CPMM_CREATOR_FEE_RATE, 1_000_000),
   };
+  const share = (name: string, v: string): number => {
+    try {
+      return percentToBps(v);
+    } catch (e) {
+      problems.push(`${name}: ${(e as Error).message}`);
+      return 0;
+    }
+  };
+  let activationSlot: number | null = null;
+  if (raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT !== undefined && raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT.trim() !== "") {
+    if (!/^\d+$/.test(raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT.trim())) problems.push("REWARD_FUNDING_POLICY_ACTIVATION_SLOT: must be a non-negative integer slot");
+    else activationSlot = Number(raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT.trim());
+  }
+  const phaseAware = raw.REWARD_FUNDING_POLICY === "forge_phase_aware_v1";
+  if (phaseAware && activationSlot === null) problems.push("REWARD_FUNDING_POLICY_ACTIVATION_SLOT: is required with REWARD_FUNDING_POLICY=forge_phase_aware_v1 (rounds snapshotting after it are funded by verified contributions only)");
+  if (phaseAware && raw.LAST60_FUNDING_DESTINATIONS.length === 0) problems.push("LAST60_FUNDING_DESTINATIONS: at least one destination wallet is required with REWARD_FUNDING_POLICY=forge_phase_aware_v1");
+  if (raw.FORGE_PLATFORM_LP_BENEFICIARY && raw.LAST60_FUNDING_DESTINATIONS.includes(raw.FORGE_PLATFORM_LP_BENEFICIARY)) problems.push("LAST60_FUNDING_DESTINATIONS: must not include FORGE_PLATFORM_LP_BENEFICIARY (a self-transfer is not a contribution)");
+  const bondingBps = raw.BONDING_CREATOR_FEE_LAST60_PERCENTAGE.trim() === "0" ? 0 : share("BONDING_CREATOR_FEE_LAST60_PERCENTAGE", raw.BONDING_CREATOR_FEE_LAST60_PERCENTAGE);
+  const lpBps = raw.FORGE_PLATFORM_LP_LAST60_PERCENTAGE.trim() === "0" ? 0 : share("FORGE_PLATFORM_LP_LAST60_PERCENTAGE", raw.FORGE_PLATFORM_LP_LAST60_PERCENTAGE);
+  let policy: FundingPolicy | null = null;
+  try {
+    policy = makeFundingPolicy({ version: raw.REWARD_FUNDING_POLICY, activationSlot: phaseAware ? activationSlot : null, bondingCreatorFeeLast60Bps: bondingBps, forgeLpLast60Bps: lpBps });
+  } catch (e) {
+    if (!problems.length) problems.push(`REWARD_FUNDING_POLICY: ${(e as Error).message}`);
+  }
   if (role === "api" && raw.NODE_ENV === "production") {
     // Never fall back to request headers for the sign-in domain, and never reflect arbitrary origins.
     if (raw.ADMIN_WALLETS.length > 0 && !raw.PUBLIC_SITE_URL) problems.push("PUBLIC_SITE_URL: is required in production when ADMIN_WALLETS is set (admin sign-in messages are bound to it)");
@@ -579,6 +635,12 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
       intervalMs: raw.RECONCILIATION_INTERVAL_SECONDS * 1000,
       haltOnOverAttribution: raw.RECONCILIATION_HALT_ON_OVER_ATTRIBUTION,
       toleranceLamports: raw.RECONCILIATION_TOLERANCE_LAMPORTS,
+    },
+    revenue: {
+      policy: policy!,
+      fundingDestinations: [...new Set(raw.LAST60_FUNDING_DESTINATIONS)],
+      forgePlatformLpBeneficiary: raw.FORGE_PLATFORM_LP_BENEFICIARY ?? null,
+      correlationMode: raw.FUNDING_CORRELATION_MODE,
     },
     terminal: { retentionDays: raw.TERMINAL_RETENTION_DAYS },
     public: { appName: raw.NEXT_PUBLIC_APP_NAME, explorer: raw.NEXT_PUBLIC_SOLANA_EXPLORER },
