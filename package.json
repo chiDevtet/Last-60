@@ -26,6 +26,8 @@
     "verify:allocation": "bun scripts/verify-allocation.ts",
     "verify:platform-config": "bun scripts/verify-launchlab-platform-config.ts",
     "verify:round": "bun scripts/verify-round.ts",
+    "report:revenue": "bun scripts/revenue-report.ts",
+    "fixtures:cpmm-fee-share": "bun scripts/fetch-cpmm-fee-share-fixtures.ts",
     "find:pool": "bun scripts/find-active-pool.ts",
     "screenshot": "bun scripts/screenshot.ts"
   },

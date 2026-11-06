@@ -231,6 +231,97 @@ export function decodeCpmmPoolFees(d: Buffer) {
   return { lpSupply: u64(d, 333), creatorFeeOn: d[389]!, enableCreatorFee: d[390]! === 1, creatorFeesToken0: u64(d, 397), creatorFeesToken1: u64(d, 405) };
 }
 
+/**
+ * CPMM `PoolState.creator_fee_on` (u8 at byte 389). Verified against raydium-cp-swap
+ * `states/pool.rs` (`CreatorFeeOn::from_u8` / `to_u8`, `is_creator_fee_on_input`) and the bundled IDL
+ * enum `CreatorFeeOn { BothToken, OnlyToken0, OnlyToken1 }`:
+ *   0 both_tokens   — the creator fee is taken from the swap's INPUT token, so it accrues in either mint;
+ *   1 only_token_0  — always in token_0 (on input for 0→1 swaps, on output for 1→0 swaps);
+ *   2 only_token_1  — always in token_1.
+ * Any other value is rejected by the program (`InvalidFeeModel`) and is treated here as unverifiable.
+ */
+export type CpmmCreatorFeeOn = "both_tokens" | "only_token_0" | "only_token_1";
+const CREATOR_FEE_ON: Record<number, CpmmCreatorFeeOn> = { 0: "both_tokens", 1: "only_token_0", 2: "only_token_1" };
+export function decodeCreatorFeeOn(raw: number | null | undefined): CpmmCreatorFeeOn | null {
+  return raw === null || raw === undefined ? null : (CREATOR_FEE_ON[raw] ?? null);
+}
+/** Mint(s) in which the CPMM creator fee accrues under a `creator_fee_on` mode. */
+export function creatorFeeMints(mode: CpmmCreatorFeeOn, token0Mint: string, token1Mint: string): string[] {
+  return mode === "only_token_0" ? [token0Mint] : mode === "only_token_1" ? [token1Mint] : [token0Mint, token1Mint];
+}
+
+/**
+ * Per-creator CPMM creator-fee share override (raydium-cp-swap `states/creator_fee_share.rs`):
+ *   PDA   = ["creator_fee_share", pool_creator, amm_config] under the CPMM program;
+ *   layout = 8 discriminator ("account:CreatorFeeShare") · bump u8 · creator Pubkey · amm_config Pubkey ·
+ *            share_rate u64 (millionths of the accrued creator fee kept by the protocol) · padding [u64; 8] = 145 bytes.
+ * Precedence (`resolve_creator_fee_share_rate`, called by BOTH collect_creator_fee instructions, which
+ * always pass the PDA): when the account is empty OR not owned by the CPMM program the AmmConfig
+ * `creator_fee_share_rate` applies; otherwise the override's `share_rate` (discriminator checked).
+ * The creator receives `accrued − ⌊accrued × share_rate / 1e6⌋` (`split_creator_fee_shared_amount`).
+ * Mainnet evidence: test/fixtures/mainnet/cpmm-creator-fee-share.json.
+ */
+export const CREATOR_FEE_SHARE_SEED = "creator_fee_share";
+export const CREATOR_FEE_SHARE_DISC = accountDiscOf("CreatorFeeShare");
+export const CREATOR_FEE_SHARE_SIZE = 145;
+function accountDiscOf(name: string) {
+  return Buffer.from(sha256(new TextEncoder().encode(`account:${name}`))).subarray(0, 8);
+}
+export function deriveCreatorFeeSharePda(poolCreator: string, ammConfig: string): string {
+  return PublicKey.findProgramAddressSync([Buffer.from(CREATOR_FEE_SHARE_SEED), new PublicKey(poolCreator).toBuffer(), new PublicKey(ammConfig).toBuffer()], new PublicKey(RAYDIUM_CPMM_PROGRAM_ID))[0].toBase58();
+}
+export function decodeCreatorFeeShare(d: Buffer): { bump: number; creator: string; ammConfig: string; shareRate: bigint } | null {
+  if (d.length !== CREATOR_FEE_SHARE_SIZE || !d.subarray(0, 8).equals(CREATOR_FEE_SHARE_DISC)) return null;
+  return { bump: d[8]!, creator: key(d, 9), ammConfig: key(d, 41), shareRate: u64(d, 73) };
+}
+
+export interface CreatorFeeShareResolution {
+  /** AmmConfig.creator_fee_share_rate (the default). */
+  ammConfigDefaultRate: string | null;
+  overridePda: string;
+  /** "absent": no account / not CPMM-owned → default applies. "present": decoded override. "invalid": CPMM-owned but undecodable. */
+  override: "absent" | "present" | "invalid";
+  overrideRate: string | null;
+  /** The rate the deployed program would apply at collection, or null when it cannot be established. */
+  effectiveRate: string | null;
+  source: "amm_config_default" | "creator_fee_share_override" | "unresolved";
+  /** Slot at which the PDA was read. */
+  verifiedAtSlot: number | null;
+  problems: string[];
+}
+
+/** Pure: the effective creator-fee share rate from the AmmConfig default and the PDA account as read. */
+export function resolveCreatorFeeShareRate(o: { poolCreator: string; ammConfig: string; ammConfigDefaultRate: bigint | null; pdaAccount: { owner: string; data: Buffer } | null; slot: number | null }): CreatorFeeShareResolution {
+  const overridePda = deriveCreatorFeeSharePda(o.poolCreator, o.ammConfig);
+  const base = { ammConfigDefaultRate: o.ammConfigDefaultRate?.toString() ?? null, overridePda, verifiedAtSlot: o.slot, problems: [] as string[] };
+  const acc = o.pdaAccount;
+  if (!acc || acc.data.length === 0 || acc.owner !== RAYDIUM_CPMM_PROGRAM_ID) {
+    if (o.ammConfigDefaultRate === null) return { ...base, override: "absent", overrideRate: null, effectiveRate: null, source: "unresolved", problems: ["AmmConfig creator_fee_share_rate could not be read"] };
+    if (o.ammConfigDefaultRate > RATE_DENOM) return { ...base, override: "absent", overrideRate: null, effectiveRate: null, source: "unresolved", problems: [`AmmConfig creator_fee_share_rate ${o.ammConfigDefaultRate} exceeds 1 000 000`] };
+    return { ...base, override: "absent", overrideRate: null, effectiveRate: o.ammConfigDefaultRate.toString(), source: "amm_config_default" };
+  }
+  const d = decodeCreatorFeeShare(acc.data);
+  if (!d) return { ...base, override: "invalid", overrideRate: null, effectiveRate: null, source: "unresolved", problems: [`CreatorFeeShare ${overridePda} is owned by the CPMM program but does not decode (size ${acc.data.length})`] };
+  if (d.creator !== o.poolCreator || d.ammConfig !== o.ammConfig) return { ...base, override: "invalid", overrideRate: null, effectiveRate: null, source: "unresolved", problems: [`CreatorFeeShare ${overridePda} names creator ${d.creator} / config ${d.ammConfig}, not ${o.poolCreator} / ${o.ammConfig}`] };
+  if (d.shareRate > RATE_DENOM) return { ...base, override: "invalid", overrideRate: d.shareRate.toString(), effectiveRate: null, source: "unresolved", problems: [`CreatorFeeShare share_rate ${d.shareRate} exceeds 1 000 000 (collection would fail)`] };
+  return { ...base, override: "present", overrideRate: d.shareRate.toString(), effectiveRate: d.shareRate.toString(), source: "creator_fee_share_override" };
+}
+const RATE_DENOM = 1_000_000n;
+
+/** Read the PDA (and nothing else) and resolve the effective share rate. Read-only. */
+export async function readCreatorFeeShare(rpc: Pick<ChainRpc, "getAccountInfo">, poolCreator: string, ammConfig: string, ammConfigDefaultRate: bigint | null): Promise<CreatorFeeShareResolution> {
+  const pda = deriveCreatorFeeSharePda(poolCreator, ammConfig);
+  const r = await rpc.getAccountInfo(pda);
+  return resolveCreatorFeeShareRate({ poolCreator, ammConfig, ammConfigDefaultRate, pdaAccount: r.value ? { owner: r.value.owner, data: r.value.data } : null, slot: r.slot ?? null });
+}
+
+/** Creator's net amount for an accrued CPMM creator fee at a share rate (program rounding: protocol share floors). */
+export function cpmmCreatorNetAmount(accrued: bigint, shareRate: bigint): { creator: bigint; protocol: bigint } {
+  if (shareRate < 0n || shareRate > RATE_DENOM) throw new Error("share rate out of range");
+  const protocol = (accrued * shareRate) / RATE_DENOM;
+  return { creator: accrued - protocol, protocol };
+}
+
 /** LP locks created by a LaunchLab → CPMM migration (Raydium LP-lock `lock_cp_liquidity` CPIs). */
 export interface MigrationLpLock {
   lockPda: string;
@@ -299,7 +390,12 @@ export interface VerifiedMigration extends MigrationRecord {
   cpmmLpMint: string | null;
   cpmmVaults: { token0: string; token1: string } | null;
   cpmmEnableCreatorFee: boolean | null;
+  /** CPMM `creator_fee_on` raw byte and its verified mode (null = not a known mode → fail closed). */
+  cpmmCreatorFeeOnRaw: number | null;
+  cpmmCreatorFeeOn: CpmmCreatorFeeOn | null;
   cpmmConfig: { creatorFeeRate: string; creatorFeeShareRate: string; tradeFeeRate: string } | null;
+  /** CPMM creator-fee share: AmmConfig default, per-creator CreatorFeeShare override, effective rate. */
+  cpmmFeeShare: CreatorFeeShareResolution | null;
   /** CPMM: LP locks created by the migration (fee-key NFTs). */
   locks: (MigrationLpLock & { holder: string | null })[];
   tokenAMint: string | null;
@@ -334,7 +430,7 @@ const REQUIRED: Record<MigrationKind, string[]> = {
  */
 export async function verifyMigration(rpc: ChainRpc, m: MigrationRecord, ctx: VerifyContext): Promise<VerifiedMigration> {
   const checks: Record<string, boolean> = {};
-  const out: VerifiedMigration = { ...m, supported: m.kind === "dbc_damm_v2" || m.kind === "launchlab_cpmm", checks, requiredChecks: REQUIRED[m.kind], failed: [], positionStates: [], cpmmPoolCreator: null, cpmmLpMint: null, cpmmVaults: null, cpmmEnableCreatorFee: null, cpmmConfig: null, locks: [], tokenAMint: null, tokenBMint: null, notes: [] };
+  const out: VerifiedMigration = { ...m, supported: m.kind === "dbc_damm_v2" || m.kind === "launchlab_cpmm", checks, requiredChecks: REQUIRED[m.kind], failed: [], positionStates: [], cpmmPoolCreator: null, cpmmLpMint: null, cpmmVaults: null, cpmmEnableCreatorFee: null, cpmmCreatorFeeOnRaw: null, cpmmCreatorFeeOn: null, cpmmConfig: null, cpmmFeeShare: null, locks: [], tokenAMint: null, tokenBMint: null, notes: [] };
   const finish = () => {
     out.failed = out.requiredChecks.filter((c) => checks[c] !== true);
     return out;
@@ -417,7 +513,11 @@ export async function verifyMigration(rpc: ChainRpc, m: MigrationRecord, ctx: Ve
     out.cpmmPoolCreator = p.poolCreator;
     out.cpmmLpMint = p.lpMint;
     out.cpmmVaults = { token0: p.token0Vault, token1: p.token1Vault };
-    out.cpmmEnableCreatorFee = decodeCpmmPoolFees(acc.data).enableCreatorFee;
+    const poolFees = decodeCpmmPoolFees(acc.data);
+    out.cpmmEnableCreatorFee = poolFees.enableCreatorFee;
+    out.cpmmCreatorFeeOnRaw = poolFees.creatorFeeOn;
+    out.cpmmCreatorFeeOn = decodeCreatorFeeOn(poolFees.creatorFeeOn);
+    if (!out.cpmmCreatorFeeOn) out.notes.push(`CPMM creator_fee_on byte ${poolFees.creatorFeeOn} is not a known mode (0 both / 1 token_0 / 2 token_1): the CPMM creator-fee basis is unresolved`);
     checks.mintsMatch = sameMints(p.token0Mint, p.token1Mint) && sameMints(m.baseMint, m.quoteMint);
     checks.configMatches = !!m.destinationConfig && p.ammConfig === m.destinationConfig && (!ctx.platform?.cpConfig || ctx.platform.cpConfig === p.ammConfig);
     const cfg = (await rpc.getAccountInfo(p.ammConfig)).value;
@@ -426,6 +526,10 @@ export async function verifyMigration(rpc: ChainRpc, m: MigrationRecord, ctx: Ve
       const c = decodeCpmmConfig(cfg!.data);
       out.cpmmConfig = { creatorFeeRate: c.creatorFeeRate.toString(), creatorFeeShareRate: c.creatorFeeShareRate.toString(), tradeFeeRate: c.tradeFeeRate.toString() };
     }
+    // The per-creator CreatorFeeShare override takes precedence over the AmmConfig default; it is read
+    // at verification (slot recorded). It can be created / closed by the CPMM admin later, so the
+    // observed net collection transfer remains the accounting authority; this is the validation basis.
+    out.cpmmFeeShare = await readCreatorFeeShare(rpc, p.poolCreator, p.ammConfig, checks.configOwnedByCpmm ? decodeCpmmConfig(cfg!.data).creatorFeeShareRate : null).catch((e) => ({ ammConfigDefaultRate: null, overridePda: deriveCreatorFeeSharePda(p.poolCreator, p.ammConfig), override: "absent" as const, overrideRate: null, effectiveRate: null, source: "unresolved" as const, verifiedAtSlot: null, problems: [`CreatorFeeShare read failed: ${String((e as Error)?.message ?? e)}`] }));
     const [t0, t1] = Buffer.compare(pk(ctx.base).toBuffer(), pk(ctx.quote).toBuffer()) < 0 ? [ctx.base, ctx.quote] : [ctx.quote, ctx.base];
     const pda = PublicKey.findProgramAddressSync([Buffer.from("pool"), pk(p.ammConfig).toBuffer(), pk(t0).toBuffer(), pk(t1).toBuffer()], pk(RAYDIUM_CPMM_PROGRAM_ID))[0].toBase58();
     checks.pdaDerivesFromConfigAndMints = pda === m.destinationPool && p.token0Mint === t0 && p.token1Mint === t1;

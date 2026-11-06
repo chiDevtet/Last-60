@@ -11,7 +11,7 @@ import { PublicKey } from "@solana/web3.js";
 import type { ChainRpc } from "../chain/rpc";
 import type { Models } from "../db/models";
 import { big, dec } from "../db/decimal";
-import { PAYABLE_STATUSES, SNAPSHOT_VERSION } from "../accounting/attribution";
+import { CPMM_BASIS_INCOMPLETE, CPMM_CREATOR_FEE_ON_MODES, PAYABLE_STATUSES, SNAPSHOT_VERSION } from "../accounting/attribution";
 
 export interface SelectionParams {
   /** The period's pool, or pools when the provider/pool was switched during the period. */
@@ -135,6 +135,17 @@ function ineligibleReasonExpr(statusField: "$feeStatus" | "$status", verifiedBas
         { case: { $eq: ["$payoutEligible", false] }, then: { $ifNull: ["$excludedReason", "unresolved"] } },
         { case: { $not: [{ $in: [{ $ifNull: [statusField, "observed"] }, [...PAYABLE_STATUSES]] }] }, then: { $concat: ["fee_status_", { $toString: statusField }] } },
         { case: { $ne: ["$basis.v", SNAPSHOT_VERSION] }, then: "legacy_record_without_allocation_snapshot" },
+        // CPMM creator-fee bases need a verified creator_fee_on mode and effective share rate (fail closed).
+        {
+          case: {
+            $and: [
+              { $eq: ["$basis.phase", "post_migration_trading"] },
+              { $eq: ["$basis.provider", "raydium_launchlab"] },
+              { $or: [{ $not: [{ $in: [{ $ifNull: ["$basis.params.creatorFeeOn", null] }, [...CPMM_CREATOR_FEE_ON_MODES]] }] }, { $ne: [{ $type: "$basis.params.effectiveCreatorFeeShareRate" }, "string"] }, { $eq: ["$basis.params.effectiveCreatorFeeShareRate", "unresolved"] }] },
+            ],
+          },
+          then: CPMM_BASIS_INCOMPLETE,
+        },
         {
           case: { $and: [{ $ne: ["$basis.verification", "verified"] }, { $not: [{ $in: ["$basisId", verifiedBasisIds] }] }] },
           then: { $concat: ["allocation_", { $ifNull: ["$basis.verification", "unknown"] }, "_not_verified"] },

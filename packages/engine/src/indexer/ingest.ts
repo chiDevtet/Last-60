@@ -11,6 +11,7 @@ import type { LaunchProvider } from "../providers/LaunchProvider";
 import { basesOf, snapshotOf, type AllocationSnapshot, type NormalizedAttribution } from "../accounting/attribution";
 import type { TerminalWriter } from "../terminal/terminal";
 import { rootLogger, type Logger } from "../util/logger";
+import { ingestRevenue, type RevenueRuntime } from "../revenue/ingest";
 
 export interface IngestContext {
   db: Models;
@@ -18,6 +19,8 @@ export interface IngestContext {
   terminal?: TerminalWriter;
   minBuyQuote: bigint;
   log?: Logger;
+  /** Phase-aware revenue configuration; when set, collections and funding inflows are recorded too. */
+  revenue?: RevenueRuntime | null;
 }
 
 export interface IngestResult {
@@ -26,6 +29,8 @@ export interface IngestResult {
   newSwaps: number;
   newClaims: number;
   newAttributions?: number;
+  newRevenueEvents?: number;
+  newFundingCredits?: number;
   anomalies: string[];
 }
 
@@ -226,6 +231,12 @@ export async function ingestRawTransaction(ctx: IngestContext, raw: any, opts: {
 
   if (parsed.attributions?.length) {
     result.newAttributions = await persistAttributions(ctx.db, parsed.attributions, info);
+  }
+
+  if (ctx.revenue) {
+    const rv = await ingestRevenue(ctx.db, tx, parsed, ctx.provider, ctx.revenue, { commitment: opts.commitment });
+    result.newRevenueEvents = rv.newEvents;
+    result.newFundingCredits = rv.newCredits;
   }
 
   if (parsed.anomalies.length) {

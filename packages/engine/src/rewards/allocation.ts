@@ -3,7 +3,11 @@
  *
  *   rewardShare = floor(fees × rewardBps / 10_000)
  *   retained    = fees − rewardShare                  (the project's share, e.g. 25%)
- *   pool        = rewardShare + rolloverIn
+ *   pool        = rewardShare + funding + rolloverIn
+ *
+ * `fees` are creator-allocated fees under the legacy policy (REWARD_PERCENTAGE applies to them).
+ * `funding` is the sum of verified, reconciled Last-60 contributions under the phase-aware policy
+ * (already the reward share by source-specific policy: REWARD_PERCENTAGE is NOT applied to it).
  *   per         = floor(pool / n)
  *   dust        = pool − per × n                      (deterministic, recorded, retained)
  *
@@ -11,10 +15,12 @@
  * rent-exempt minimum so a transfer to an empty wallet cannot fail), nothing is paid and the
  * pool is either rolled into the next round or retained, per policy.
  *
- * Invariant (tested): fees + rolloverIn = retained + dust + rolloverOut + retainedPool + per × n
+ * Invariant (tested): fees + funding + rolloverIn = retained + dust + rolloverOut + retainedPool + per × n
  */
 export interface AllocationInput {
   fees: bigint;
+  /** Verified Last-60 contributions (phase-aware policy); default 0. */
+  funding?: bigint;
   rolloverIn: bigint;
   rewardBps: number;
   recipients: string[];
@@ -24,6 +30,7 @@ export interface AllocationInput {
 
 export interface Allocation {
   fees: bigint;
+  funding: bigint;
   rewardShare: bigint;
   retained: bigint;
   pool: bigint;
@@ -38,15 +45,16 @@ export interface Allocation {
 }
 
 export function allocate(i: AllocationInput): Allocation {
-  if (i.fees < 0n || i.rolloverIn < 0n) throw new Error("allocate: negative input");
+  const funding = i.funding ?? 0n;
+  if (i.fees < 0n || i.rolloverIn < 0n || funding < 0n) throw new Error("allocate: negative input");
   if (!Number.isInteger(i.rewardBps) || i.rewardBps <= 0 || i.rewardBps > 10_000) throw new Error("allocate: rewardBps out of range");
   if (new Set(i.recipients).size !== i.recipients.length) throw new Error("allocate: duplicate recipient");
 
   const rewardShare = (i.fees * BigInt(i.rewardBps)) / 10_000n;
   const retained = i.fees - rewardShare;
-  const pool = rewardShare + i.rolloverIn;
+  const pool = rewardShare + funding + i.rolloverIn;
   const n = BigInt(i.recipients.length);
-  const base = { fees: i.fees, rewardShare, retained, pool, rolloverIn: i.rolloverIn };
+  const base = { fees: i.fees, funding, rewardShare, retained, pool, rolloverIn: i.rolloverIn };
 
   const skip = (outcome: Allocation["outcome"]): Allocation => ({
     ...base,

@@ -20,6 +20,7 @@ import { basesOf, roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
 import { rootLogger, type Logger } from "../util/logger";
+import { revenueRuntimeOf, revenueWatchAddresses } from "../revenue/ingest";
 import { sleep } from "../util/time";
 import { backoffDelay } from "../util/backoff";
 import { cursorId, ingestSignature, readCursor, syncAddress } from "./signatureSync";
@@ -64,7 +65,12 @@ export class Indexer {
   }
 
   private ctx() {
-    return { db: this.deps.db, provider: this.provider!, terminal: this.terminal, minBuyQuote: this.settings!.minBuyQuote, rpc: this.rpc!, log: this.log };
+    return { db: this.deps.db, provider: this.provider!, terminal: this.terminal, minBuyQuote: this.settings!.minBuyQuote, rpc: this.rpc!, log: this.log, revenue: revenueRuntimeOf(this.deps.cfg) };
+  }
+
+  /** Pool watch addresses plus the configured Last-60 funding destinations (funding inflows). */
+  private watchList(): string[] {
+    return [...new Set([...(this.pool?.watchAddresses ?? []), ...revenueWatchAddresses(this.deps.cfg.revenue)])];
   }
 
   /** Load settings and provider once (used by tests and by `run`). */
@@ -113,8 +119,8 @@ export class Indexer {
         this.wsQueue.add(sig);
       };
       this.ws = this.deps.wsFactory
-        ? this.deps.wsFactory(wsUrl, this.pool.watchAddresses, onLog)
-        : new LogsSubscriber(wsUrl, this.pool.watchAddresses, (n) => !n.err && onLog(n.signature), this.log);
+        ? this.deps.wsFactory(wsUrl, this.watchList(), onLog)
+        : new LogsSubscriber(wsUrl, this.watchList(), (n) => !n.err && onLog(n.signature), this.log);
       this.ws.start();
     }
   }
@@ -161,7 +167,7 @@ export class Indexer {
     if (!this.provider || !this.pool || !this.rpc || !this.settings) return 0;
     let total = 0;
     this.backlog = false;
-    for (const address of this.pool.watchAddresses) {
+    for (const address of this.watchList()) {
       const key = cursorId(this.pool.provider, this.pool.poolAddress, address);
       const existing = await readCursor(this.deps.db, key);
       const isBackfill = !existing;
@@ -387,7 +393,7 @@ export class Indexer {
       this.metrics.wsNotifications++;
       this.wsQueue.add(sig);
     };
-    this.ws = this.deps.wsFactory ? this.deps.wsFactory(wsUrl, this.pool.watchAddresses, onLog) : new LogsSubscriber(wsUrl, this.pool.watchAddresses, (n) => !n.err && onLog(n.signature), this.log);
+    this.ws = this.deps.wsFactory ? this.deps.wsFactory(wsUrl, this.watchList(), onLog) : new LogsSubscriber(wsUrl, this.watchList(), (n) => !n.err && onLog(n.signature), this.log);
     this.ws.start();
   }
 

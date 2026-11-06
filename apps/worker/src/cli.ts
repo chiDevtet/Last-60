@@ -7,10 +7,13 @@
  *   clear-halt <reason>        clear a reconciliation payout halt
  *   reconcile                  run reconciliation now and print the report
  *   round <n>                  print a round with its payouts and ledger entries
+ *   revenue [--json]           phase-aware revenue report: every stream, per fee mint (read-only)
+ *   revenue-reconcile          re-run claim ↔ transfer correlation and reconciliation now (idempotent;
+ *                              writes only derived reconciliation rows and new funding credits)
  *   gen-schedule-key           print a new SCHEDULE_ENCRYPTION_KEY
  */
 import { randomBytes } from "node:crypto";
-import { ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, type ProcessRole } from "@last60/engine";
+import { ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, buildRevenueReport, renderRevenueReport, reconcileFunding, revenueRuntimeOf, type ProcessRole } from "@last60/engine";
 
 const [cmd, ...args] = process.argv.slice(2);
 const print = (v: unknown) => console.log(JSON.stringify(jsonSafe(v), null, 2));
@@ -85,8 +88,26 @@ try {
       print({ round: await db.Round.findOne({ roundNumber: n }).lean(), payouts: await db.Payout.find({ roundNumber: n }).lean(), ledger: await db.LedgerEntry.find({ roundNumber: n }).lean() });
       break;
     }
+    case "revenue": {
+      const s = await settings.get(true);
+      const rpc = new RpcClient({ urls: s.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
+      const slot = await rpc.getSlot("confirmed").catch(() => null);
+      const report = await buildRevenueReport(db, { sourcePool: s.poolAddress, policy: cfg.revenue.policy, currentSlot: slot });
+      if (args.includes("--json")) print(report);
+      else console.log(renderRevenueReport(report));
+      break;
+    }
+    case "revenue-reconcile": {
+      const s = await settings.get(true);
+      const rpc = new RpcClient({ urls: s.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
+      const provider = createProvider(providerTargetFor(s, cfg), rpc);
+      const info = await provider.load();
+      await attachStoredMigration(db, provider);
+      print({ newCredits: await reconcileFunding(db, { sourcePool: info.poolAddress, quoteMint: info.quoteMint, provider: info.provider, tokenMint: info.tokenMint }, revenueRuntimeOf(cfg)!) });
+      break;
+    }
     default:
-      console.log("commands: status | check-config | pause <c> | resume <c> | requeue <id> | clear-halt <reason> | reconcile | round <n> | gen-schedule-key");
+      console.log("commands: status | check-config | pause <c> | resume <c> | requeue <id> | clear-halt <reason> | reconcile | round <n> | revenue [--json] | revenue-reconcile | gen-schedule-key");
   }
 } finally {
   await db.close();

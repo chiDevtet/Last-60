@@ -176,9 +176,26 @@ export function basesOf(info: { allocation?: AllocationBasis; destination?: { al
  * distributable. `not_declared` means "read from chain, never cross-checked" and is reported as such;
  * it is recorded, shown, and never paid (see rewards/selection.ts `periodFees`).
  */
-export function basisDistributable(b: Pick<AllocationBasis, "verification"> | null | undefined): boolean {
-  return b?.verification === "verified";
+export function basisDistributable(b: (Pick<AllocationBasis, "verification"> & Partial<Pick<AllocationBasis, "phase" | "provider" | "params">>) | null | undefined): boolean {
+  if (b?.verification !== "verified") return false;
+  return !cpmmCreatorFeeBasisIncomplete(b);
 }
+
+/** Valid CPMM `creator_fee_on` modes as persisted in a basis (see providers/migration.ts `decodeCreatorFeeOn`). */
+export const CPMM_CREATOR_FEE_ON_MODES = ["both_tokens", "only_token_0", "only_token_1"] as const;
+
+/**
+ * A LaunchLab → CPMM creator-fee basis must carry a VERIFIED creator_fee_on mode and an effective
+ * creator-fee share rate. Bases written before PR #6 (no mode persisted) and bases whose mode or rate
+ * could not be established are never distributable (fail closed), even if marked verified.
+ */
+export function cpmmCreatorFeeBasisIncomplete(b: Partial<Pick<AllocationBasis, "phase" | "provider" | "params">>): boolean {
+  if (b.phase !== "post_migration_trading" || b.provider !== "raydium_launchlab" || !b.params) return false;
+  const mode = b.params.creatorFeeOn;
+  const rate = b.params.effectiveCreatorFeeShareRate;
+  return !(CPMM_CREATOR_FEE_ON_MODES as readonly unknown[]).includes(mode) || typeof rate !== "string" || !/^\d+$/.test(rate);
+}
+export const CPMM_BASIS_INCOMPLETE = "cpmm_creator_fee_basis_unresolved";
 
 /** Fee evidence statuses whose amounts are final and may be distributed. */
 export const PAYABLE_STATUSES: readonly FeeEvidenceStatus[] = ["observed", "collected", "reconciled", "confirmed"];

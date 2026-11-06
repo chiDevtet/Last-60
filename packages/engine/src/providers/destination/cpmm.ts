@@ -23,7 +23,7 @@ import { instructionDiscriminator, toAddr, toBig } from "../../chain/anchorEvent
 import { programDataLogs, subtreeTransfers, tokenAccountInfo, type FlatInstruction, type NormalizedTx } from "../../chain/tx";
 import { basisPayable, EXCLUSION, type AllocationBasis, type NormalizedAttribution } from "../../accounting/attribution";
 import { resolveTrader, type NormalizedSwap, type ParsedTransaction } from "../LaunchProvider";
-import { COLLECT_CP_FEES_DISC, RAYDIUM_CP_LOCK_PROGRAM_ID, RAYDIUM_CPMM_PROGRAM_ID } from "../migration";
+import { COLLECT_CP_FEES_DISC, RAYDIUM_CP_LOCK_PROGRAM_ID, RAYDIUM_CPMM_PROGRAM_ID, type CpmmCreatorFeeOn } from "../migration";
 import type { DestinationAdapter, DestinationContext } from "./types";
 
 const idl = idlJson as unknown as Idl;
@@ -42,6 +42,16 @@ export interface CpmmPoolFacts {
   beneficiaryLocks: { lockPda: string; nftMint: string }[];
   /** Locks whose Fee Key was minted to the platform NFT wallet (platform-owned locked LP; absent on older specs). */
   platformLocks?: { lockPda: string; nftMint: string }[];
+  /** Verified CPMM `creator_fee_on` mode (absent on specs written before it was persisted → treated as unverified). */
+  creatorFeeOn?: CpmmCreatorFeeOn | null;
+  /** AmmConfig the pool was created with. */
+  ammConfig?: string | null;
+  /** Creator-fee share resolution at verification (AmmConfig default, CreatorFeeShare override, effective). */
+  feeShare?: { ammConfigDefaultRate: string | null; override: "absent" | "present" | "invalid"; overrideRate: string | null; effectiveRate: string | null; overridePda: string; verifiedAtSlot: number | null } | null;
+  /** PlatformConfig platform_nft_wallet at verification (the platform Fee Key owner). */
+  platformNftWallet?: string | null;
+  /** Every lock minted to platform_nft_wallet, whatever the configured beneficiary role. */
+  allPlatformLocks?: { lockPda: string; nftMint: string }[];
 }
 
 export class CpmmDestination implements DestinationAdapter {
@@ -51,7 +61,7 @@ export class CpmmDestination implements DestinationAdapter {
 
   constructor(
     readonly pool: string,
-    private readonly facts: CpmmPoolFacts,
+    readonly facts: CpmmPoolFacts,
     private readonly ctx: DestinationContext,
     /** Basis of the CPMM creator-fee entitlement (pool_creator == beneficiary). */
     readonly allocation: AllocationBasis,

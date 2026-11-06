@@ -368,6 +368,11 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
     return this.platform;
   }
 
+  /** Operator declarations this provider verifies against (read-only). */
+  expectedAllocation(): ExpectedAllocation | undefined {
+    return this.opts.expected;
+  }
+
   async load(): Promise<PoolInfo> {
     if (!this.rpc) throw new Error("RaydiumLaunchLabProvider.load requires an RPC client");
     const { slot, value } = await this.rpc.getAccountInfo(this.opts.poolAddress);

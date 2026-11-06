@@ -48,7 +48,7 @@ if (info.status === "migrated") {
     const spec = migrationVerified(v) ? specFor(provider, info, v) : null;
     provider.attach(spec);
     info = provider.info();
-    migration = { kind: m.kind, destination: m.destinationPool, signature: m.signature, slot: m.slot, supported: v.supported, verified: !!spec, failed: v.failed, notes: v.notes };
+    migration = { kind: m.kind, destination: m.destinationPool, signature: m.signature, slot: m.slot, supported: v.supported, verified: !!spec, failed: v.failed, notes: v.notes, ...(m.kind === "launchlab_cpmm" ? { cpmmCreatorFeeOn: v.cpmmCreatorFeeOn ?? `unverified (${v.cpmmCreatorFeeOnRaw ?? "?"})`, cpmmCreatorFeeShare: v.cpmmFeeShare ? { ammConfigDefaultRate: v.cpmmFeeShare.ammConfigDefaultRate, override: v.cpmmFeeShare.override, overrideRate: v.cpmmFeeShare.overrideRate, effectiveRate: v.cpmmFeeShare.effectiveRate, pda: v.cpmmFeeShare.overridePda, slot: v.cpmmFeeShare.verifiedAtSlot } : null } : {}) };
   } else migration = { found: false };
 }
 const report = buildAllocationReport(info, expected, inner.lpCheck);

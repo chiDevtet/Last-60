@@ -23,6 +23,8 @@ import type { TerminalWriter } from "../terminal/terminal";
 import { randomToken, seal, secureRandomInt, unseal } from "../util/crypto";
 import type { Clock } from "../util/time";
 import { rootLogger, type Logger } from "../util/logger";
+import { consumableFundingMatch, revenueRuntimeOf, revenueWatchAddresses } from "../revenue/ingest";
+import { phaseAwareInForce, policySnapshot } from "../accounting/revenueStreams";
 import { cursorId, readCursor, syncAddress } from "../indexer/signatureSync";
 import { allocate } from "./allocation";
 import { boundsOf, drawExecuteAt, roundIndexAt, type ScheduleParams } from "./roundMath";
@@ -290,8 +292,20 @@ export class RoundScheduler {
       const bases = [...basesOf(pool).values()];
       const verifiedBasisIds = bases.filter((b) => basisDistributable(b)).map((b) => b.id);
       const fees = await periodFees(this.d.db, period, settings.payoutAssetMint, { verifiedBasisIds });
+      // Reward-funding policy (docs/REWARD_FUNDING.md). Legacy: REWARD_PERCENTAGE of the period's
+      // verified creator-allocated fees, exactly as before. Phase-aware (snapshot after activation):
+      // creator-allocated fees count only up to the activation slot; after it the round is funded by
+      // verified, reconciled Last-60 contributions — the two never overlap, so nothing counts twice.
+      const policy = this.d.cfg.revenue?.policy ?? null;
+      const phaseAware = !!policy && phaseAwareInForce(policy, snapshotSlot);
+      const legacyCap = phaseAware ? policy!.activationSlot! : null;
+      let legacyFees = fees.payout;
+      if (legacyCap !== null) {
+        legacyFees = period.afterSlot !== null && period.afterSlot >= legacyCap ? 0n : (await periodFees(this.d.db, { ...period, snapshotSlot: Math.min(snapshotSlot, legacyCap) }, settings.payoutAssetMint, { verifiedBasisIds })).payout;
+      }
+      const funding = phaseAware ? await this.consumableFunding(policy!, snapshotSlot, settings.payoutAssetMint) : { credits: [], total: 0n, byStream: {}, pendingFinality: 0 };
       const rolloverIn = prev ? big(prev.rolloverOut) : 0n;
-      const a = allocate({ fees: fees.payout, rolloverIn, rewardBps: settings.rewardBps, recipients: selection.recipients.map((r) => r.wallet), minPayout: settings.minPayoutLamports, skippedRoundPolicy: settings.skippedRoundPolicy });
+      const a = allocate({ fees: legacyFees, funding: funding.total, rolloverIn, rewardBps: settings.rewardBps, recipients: selection.recipients.map((r) => r.wallet), minPayout: settings.minPayoutLamports, skippedRoundPolicy: settings.skippedRoundPolicy });
       const dryRun = settings.payoutMode !== "live";
       const mint = settings.payoutAssetMint;
 
@@ -325,6 +339,9 @@ export class RoundScheduler {
               nonPayoutAssetFees: fees.other.map((o) => ({ mint: o.mint, amount: dec(o.amount) })),
               ineligibleFees: fees.ineligible.map((o) => ({ mint: o.mint, amount: dec(o.amount), reason: o.reason.slice(0, 300) })),
               feeBreakdown: { byPhase: fees.byPhase, swaps: fees.swaps, attributions: fees.attributions, verifiedBasisIds, bases: bases.map((b) => ({ id: b.id, phase: b.phase, pool: b.pool, role: b.role, beneficiary: b.beneficiary, verification: b.verification })) },
+              fundingPolicy: policy ? { ...policySnapshot(policy), inForce: phaseAware ? "forge_phase_aware_v1" : "legacy_creator_fee_v1", legacyFeeSlotCap: legacyCap } : null,
+              funding: dec(funding.total),
+              fundingBreakdown: { byStream: Object.fromEntries(Object.entries(funding.byStream).map(([k, v]) => [k, (v as bigint).toString()])), credits: funding.credits.length, pendingFinality: funding.pendingFinality, creatorFeesRecordedNotDistributed: (fees.payout - legacyFees).toString() },
               reward: dec(a.pool),
               retained: dec(a.retained + a.retainedPool),
               rolloverIn: dec(a.rolloverIn),
@@ -346,6 +363,13 @@ export class RoundScheduler {
           { session },
         );
         if (!res.modifiedCount) throw new LostLockError();
+        if (funding.credits.length) {
+          // Consume each credit exactly once: the conditional update fails (and the whole round
+          // transaction aborts and is retried) if another execution consumed any of them.
+          const ids = funding.credits.map((c: any) => c._id);
+          const u = await this.d.db.RewardFunding.updateMany({ _id: { $in: ids }, roundNumber: null }, { $set: { roundNumber, consumedAt: new Date(this.d.clock.now()) } }, { session });
+          if (u.modifiedCount !== ids.length) throw new Error(`round #${roundNumber}: ${ids.length - u.modifiedCount} funding credit(s) were consumed concurrently; retrying`);
+        }
         if (a.payouts.length) {
           await this.d.db.Payout.insertMany(
             a.payouts.map((p) => ({ roundNumber, recipient: p.recipient, position: p.position, amount: dec(p.amount), mint, mode: dryRun ? "dry_run" : "live", state: "pending" })),
@@ -356,6 +380,7 @@ export class RoundScheduler {
         const entries = [
           L("FEE_ACCRUED", a.fees, { memo: `${fees.swaps} swaps + ${fees.attributions} attributions in slots (${period.afterSlot ?? "start"}, ${snapshotSlot}]; payout-eligible creator allocation only` }),
           L("REWARD_ALLOCATED", a.rewardShare),
+          ...Object.entries(funding.byStream).map(([stream, amount]) => L("FUNDING_CREDITED", amount as bigint, { k: stream, memo: `${funding.credits.filter((c: any) => c.stream === stream).length} verified ${stream} credit(s); REWARD_PERCENTAGE not applied` })),
           L("RETAINED", a.retained + a.retainedPool, { memo: a.retainedPool > 0n ? "includes skipped-round pool (retain policy)" : null }),
           ...(a.rolloverIn > 0n ? [L("ROLLOVER_IN", a.rolloverIn, { memo: `from round #${prev?.roundNumber}` })] : []),
           ...(a.rolloverOut > 0n ? [L("ROLLOVER_OUT", a.rolloverOut, { memo: a.outcome })] : []),
@@ -393,6 +418,35 @@ export class RoundScheduler {
   }
 
   /**
+   * Verified, reconciled Last-60 contribution credits this round may consume: payable, not yet
+   * consumed, in the payout asset, after the activation slot, at or before the snapshot — and whose
+   * transaction is FINALIZED (a confirmed-but-forked transfer can never fund a payout; such credits
+   * wait for a later round).
+   */
+  private async consumableFunding(policy: NonNullable<AppConfig["revenue"]>["policy"], snapshotSlot: number, payoutMint: string) {
+    const match = consumableFundingMatch(policy, snapshotSlot, payoutMint);
+    const candidates: any[] = match ? await this.d.db.RewardFunding.find(match).sort({ slot: 1, ordinal: 1 }).lean() : [];
+    const sigs = [...new Set(candidates.map((c) => c.signature))];
+    const finalized = new Set<string>();
+    for (let i = 0; i < sigs.length; i += 200) {
+      const chunk = sigs.slice(i, i + 200);
+      const st = await this.d.rpc.getSignatureStatuses(chunk, true);
+      chunk.forEach((sig, j) => {
+        if (st[j] && !st[j]!.err && st[j]!.confirmationStatus === "finalized") finalized.add(sig);
+      });
+    }
+    const credits = candidates.filter((c) => finalized.has(c.signature));
+    const byStream: Record<string, bigint> = {};
+    let total = 0n;
+    for (const c of credits) {
+      const v = big(c.creditableAmount);
+      total += v;
+      byStream[c.stream] = (byStream[c.stream] ?? 0n) + v;
+    }
+    return { credits, total, byStream, pendingFinality: candidates.length - credits.length };
+  }
+
+  /**
    * Ingest everything up to the snapshot slot. Read-only w.r.t. the indexer's cursor; idempotent.
    * Throws (round retried) rather than snapshotting incomplete data.
    */
@@ -400,14 +454,14 @@ export class RoundScheduler {
     const provider = this.d.provider();
     const pool = provider.info();
     const settings = await this.d.settings.get();
-    for (const address of pool.watchAddresses) {
+    for (const address of [...new Set([...pool.watchAddresses, ...revenueWatchAddresses(this.d.cfg.revenue)])]) {
       const key = cursorId(pool.provider, pool.poolAddress, address);
       const cursor = await readCursor(this.d.db, key);
       // Bounded: from the indexer's cursor if it has one, never further back than the period.
       // `minContextSlot`: the node must have processed the snapshot slot before answering, so a
       // lagging backend cannot silently omit transactions at or below it.
       const r = await syncAddress(
-        { db: this.d.db, provider, terminal: this.d.terminal, minBuyQuote: settings.minBuyQuote, rpc: this.d.rpc, log: this.log },
+        { db: this.d.db, provider, terminal: this.d.terminal, minBuyQuote: settings.minBuyQuote, rpc: this.d.rpc, log: this.log, revenue: revenueRuntimeOf(this.d.cfg) },
         address,
         { untilSignature: cursor?.lastSignature ?? null, source: "catchup", cap: this.d.catchUpCap ?? 20_000, concurrency: 4, bounds, minContextSlot: snapshotSlot },
       );

@@ -286,7 +286,8 @@ describe("round lifecycle (live mode)", () => {
     const evs = await r.db.TerminalEvent.countDocuments({ type: "WARN", message: /insufficient/ });
     expect(evs).toBe(1);
     r.chain.setBalance(r.payer.publicKey.toBase58(), 10n * SOL);
-    r.clock.set(r.clock.now() + 16_000);
+    // The shortfall retry is jittered to 5–20 s (payouts.ts); step past the maximum so the test is deterministic.
+    r.clock.set(r.clock.now() + 20_001);
     await r.worker.payouts.processDue();
     r.chain.advance(40);
     await r.worker.payouts.processDue();
