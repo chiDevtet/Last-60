@@ -150,6 +150,16 @@ targets are now the decoded on-chain values, never derived from the DBC split.
 | H6 | Credits did not record the claim signature, collected amount, expected allocation, source / destination wallets, creator or policy version | Added (immutable) to `reward_funding` |
 | H7 | `forge_phase_aware_v1` did not require `FORGE_PLATFORM_LP_BENEFICIARY` | Required under v2; v1 is retired (config error), its credits are never consumable and are never rewritten |
 
+### Round 7 — Forge's existing post-migration creator distribution (PR #8, each with regression tests)
+
+| # | Finding | Fix (PR #8) |
+|---|---|---|
+| I1 | Forge's live post-migration collector pays the creator's 50 % to the **creator's wallet**, in a separate memo-less transaction; PR #7 could never credit it (it required a Last-60 destination and a memo, i.e. a Forgepad change) | New route `forge_creator_distribution` and payable method `forge_distribution_sequence`; Forgepad unchanged |
+| I2 | Without a claim-naming field, a payout could be matched to the wrong harvest (identical amounts, one creator with many launches, other streams paid by the same wallet) | Launch anchor (token-mint leg), complete-index coverage, single latest harvest, exclusivity and alternation checks; amounts only bound; any ambiguity → recorded `unresolved`, never payable |
+| I3 | Out-of-order ingestion (websocket before poll) could link a payout to an older harvest | Attribution waits (`pending`) until the destination pool's and Forge's token account's cursors prove coverage through the payout slot (`syncedThroughSlot`) |
+| I4 | Forge's SOL basis is the Raydium API estimate; distributor mode is 25 / 50 / 25; non-SOL quotes are swapped | Excess SOL legs never payable; distributor mode and converted legs recorded, never credited |
+| I5 | Re-evaluating unresolved transfers on every pass does not scale with many launches | Bounded, indexed `funding_attributions` queue; decided rows never re-evaluated |
+
 Confirmed correct in PR #6 (kept): the seven separated streams; floor rounding with the residual to the
 retaining party; CPMM creator fees never candidates; recipient = claim beneficiary for correlation;
 unique key per inflow; conditional single consumption; legacy fees capped at the activation slot and
@@ -258,10 +268,11 @@ live round across a real graduation, and a real `collect_cp_fees` from a creator
     not distributable, and a worker refuses to attach if such records cannot be matched to a current
     basis id. Plan an operator review (or a new pool) before upgrading any instance that has history.
 11. **Partner / platform roles** have no declarable allocation and are therefore never distributed.
-12. **Phase-aware funding** (PR #6): requires the Forgepad-side changes in REWARD_FUNDING.md §11
-    (destination, same-transaction or memo correlation, exact same-mint amounts, a bonding 75 %
-    mechanism, a deployed LP claimer). Keep `REWARD_FUNDING_POLICY=legacy_creator_fee_v1` until
-    `bun run cli revenue` shows reconciled claims and linked inflows on real Forge transactions.
+12. **Phase-aware funding** (PR #6–#8): the post-migration LP stream needs no Forgepad change
+    (REWARD_FUNDING.md §4a, §11); the bonding 75 % still needs the creator's transfer. Keep
+    `REWARD_FUNDING_POLICY=legacy_creator_fee_v1` until `bun run cli revenue` shows reconciled claims
+    and linked Forge creator distributions on **real** Forge transactions (only synthetic ones are
+    tested so far).
 
 ## 8. Documentation vs. code discrepancies
 

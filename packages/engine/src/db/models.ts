@@ -7,6 +7,7 @@
  *   revenue_events   (key), (signature, ordinal, stream, feeMint) — phase-aware collections / funding inflows
  *   reward_funding   (key = funding inflow) — one credit per transfer, consumed by one round
  *   revenue_reconciliations (key = collection) — derived per-claim reconciliation
+ *   funding_attributions (key = funding inflow) — attribution work queue / audit of Forge creator distributions
  *   rounds           (roundNumber), (roundIndex)
  *   payouts          (roundNumber, recipient), confirmedSignature
  *   ledger_entries   (key)  — idempotency key per economic fact
@@ -276,6 +277,12 @@ const revenueEventSchema = new Schema(
     payoutEligible: { type: Boolean, default: false },
     excludedReason: { type: String, default: null },
     memoClaimSignature: { type: String, default: null },
+    /**
+     * Funding inflows: "last60_destination" (into a configured funding destination) or
+     * "forge_creator_distribution" (Forge's existing post-migration payout to the launch creator).
+     * Null on collections and on inflows recorded before this field existed (= last60_destination).
+     */
+    route: { type: String, default: null },
     evidence: { type: Schema.Types.Mixed, default: null },
     snapshot: { type: Schema.Types.Mixed, required: true },
     commitment: { type: String, enum: ["confirmed", "finalized"], required: true },
@@ -287,7 +294,9 @@ revenueEventSchema.index({ signature: 1, ordinal: 1, stream: 1, feeMint: 1 }, { 
 revenueEventSchema.index({ sourcePool: 1, kind: 1, slot: 1 });
 revenueEventSchema.index({ kind: 1, sourceOwner: 1, asset: 1, slot: 1 });
 revenueEventSchema.index({ stream: 1, slot: 1 });
-guardImmutable(revenueEventSchema, ["key", "kind", "stream", "provider", "launchPhase", "tokenMint", "sourcePool", "pool", "signature", "instructionIndex", "innerInstructionIndex", "ordinal", "slot", "feeMint", "asset", "grossAmount", "netAmount", "sourceAccount", "destinationAccount", "sourceOwner", "destinationOwner", "beneficiary", "status", "payoutEligible", "excludedReason", "memoClaimSignature", "evidence", "snapshot"]);
+revenueEventSchema.index({ sourcePool: 1, stream: 1, slot: -1 });
+revenueEventSchema.index({ sourcePool: 1, route: 1, slot: 1 });
+guardImmutable(revenueEventSchema, ["key", "kind", "stream", "provider", "launchPhase", "tokenMint", "sourcePool", "pool", "signature", "instructionIndex", "innerInstructionIndex", "ordinal", "slot", "feeMint", "asset", "grossAmount", "netAmount", "sourceAccount", "destinationAccount", "sourceOwner", "destinationOwner", "beneficiary", "status", "payoutEligible", "excludedReason", "memoClaimSignature", "route", "evidence", "snapshot"]);
 
 /**
  * Reward-funding credits: one per funding inflow correlated to a collection (unique `key` = the
@@ -300,7 +309,14 @@ const rewardFundingSchema = new Schema(
     key: { type: String, required: true, unique: true },
     stream: { type: String, enum: ["bonding_curve_last60_reward_contribution", "forge_platform_lp_last60_contribution"], required: true },
     collectionKey: { type: String, required: true },
-    correlationMethod: { type: String, enum: ["same_transaction", "memo", "exclusive_window"], required: true },
+    correlationMethod: { type: String, enum: ["same_transaction", "memo", "exclusive_window", "forge_distribution_sequence"], required: true },
+    /** How the funds reached Last-60 (null on credits written before this field = last60_destination). */
+    route: { type: String, default: null },
+    /**
+     * Attribution evidence of a forge_distribution_sequence credit (harvest, previous harvest, anchor
+     * mint, indexing coverage, …). Written once; null for same_transaction / memo credits.
+     */
+    attribution: { type: Schema.Types.Mixed, default: null },
     provider: { type: String, required: true },
     tokenMint: { type: String, required: true },
     sourcePool: { type: String, required: true },
@@ -350,7 +366,46 @@ const rewardFundingSchema = new Schema(
 rewardFundingSchema.index({ collectionKey: 1, slot: 1 });
 rewardFundingSchema.index({ roundNumber: 1, fundingMint: 1 });
 rewardFundingSchema.index({ payoutEligible: 1, roundNumber: 1, fundingMint: 1, slot: 1 });
-guardImmutable(rewardFundingSchema, ["key", "stream", "collectionKey", "correlationMethod", "provider", "tokenMint", "sourcePool", "pool", "signature", "ordinal", "slot", "collectionSlot", "fundingMint", "launchPhase", "collectionSignature", "collectedAmount", "expectedAllocation", "sourceWallet", "destinationWallet", "creator", "allocationOwner", "policyVersion", "observedAmount", "creditableAmount", "excessAmount", "status", "payoutEligible", "ineligibleReason", "policy", "snapshot"]);
+guardImmutable(rewardFundingSchema, ["key", "stream", "collectionKey", "correlationMethod", "provider", "tokenMint", "sourcePool", "pool", "signature", "ordinal", "slot", "collectionSlot", "fundingMint", "launchPhase", "collectionSignature", "collectedAmount", "expectedAllocation", "sourceWallet", "destinationWallet", "creator", "allocationOwner", "policyVersion", "observedAmount", "creditableAmount", "excessAmount", "status", "payoutEligible", "ineligibleReason", "policy", "snapshot", "route", "attribution"]);
+
+/**
+ * Attribution of Forge creator distributions (route forge_creator_distribution): one row per funding
+ * inflow leg, created "pending" when the leg is first ingested. It is the bounded work queue of the
+ * attribution pass (indexed by launch + status; reconciliation never rescans history) and the audit
+ * trail of every decision. Transitions only pending → linked | unresolved (conditional on "pending");
+ * a linked or unresolved row is never re-evaluated. The economic facts live on the immutable
+ * revenue event and reward-funding credit; this row only explains the decision.
+ */
+export const FUNDING_ATTRIBUTION_STATUSES = ["pending", "linked", "unresolved"] as const;
+const fundingAttributionSchema = new Schema(
+  {
+    key: { type: String, required: true, unique: true }, // = funding inflow event key
+    route: { type: String, required: true },
+    sourcePool: { type: String, required: true },
+    tokenMint: { type: String, required: true },
+    signature: { type: String, required: true },
+    slot: { type: Number, required: true },
+    ordinal: { type: Number, required: true },
+    asset: { type: String, required: true },
+    amount: { type: D, required: true },
+    sourceOwner: { type: String, default: null },
+    destinationOwner: { type: String, default: null },
+    status: { type: String, enum: FUNDING_ATTRIBUTION_STATUSES, required: true },
+    payoutEligible: { type: Boolean, default: false },
+    reasons: { type: [String], default: [] },
+    candidates: { type: [String], default: [] },
+    collectionKey: { type: String, default: null },
+    collectionSignature: { type: String, default: null },
+    correlationMethod: { type: String, default: null },
+    evidence: { type: Schema.Types.Mixed, default: null },
+    evaluations: { type: Number, default: 0 },
+    createdAt: { type: Date, default: Date.now },
+    evaluatedAt: { type: Date, default: null },
+  },
+  { collection: "funding_attributions", versionKey: false },
+);
+fundingAttributionSchema.index({ sourcePool: 1, status: 1, slot: 1 });
+fundingAttributionSchema.index({ signature: 1 });
 
 /**
  * Per-collection reconciliation (durable claim record). DERIVED: recomputed idempotently from the
@@ -621,6 +676,12 @@ const workerStateSchema = new Schema(
     instance: String,
     metrics: { type: Schema.Types.Mixed, default: {} },
     cursor: { type: Schema.Types.Mixed, default: null },
+    /**
+     * Signature cursors only: every transaction of the address at or below this slot is ingested
+     * (recorded by a COMPLETE poll pass anchored with minContextSlot = this slot). Lets the Forge
+     * creator-distribution attribution prove that no harvest / payout of the window is missing.
+     */
+    syncedThroughSlot: { type: Number, default: null },
   },
   { collection: "worker_state", versionKey: false, minimize: false },
 );
@@ -659,6 +720,7 @@ export const schemas = {
   RevenueEvent: revenueEventSchema,
   RewardFunding: rewardFundingSchema,
   RevenueReconciliation: revenueReconciliationSchema,
+  FundingAttribution: fundingAttributionSchema,
   BuyerActivity: buyerActivitySchema,
   Round: roundSchema,
   Payout: payoutSchema,

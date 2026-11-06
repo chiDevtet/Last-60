@@ -173,7 +173,7 @@ export function phaseAwareInForce(policy: FundingPolicy, snapshotSlot: number): 
  * links by position, not by evidence naming the claim: it is recorded for reconciliation but never
  * payable (a Forge wallet that also pays out other streams could otherwise be credited for them).
  */
-export const PAYABLE_CORRELATION_METHODS: readonly CorrelationMethod[] = ["same_transaction", "memo"];
+export const PAYABLE_CORRELATION_METHODS: readonly CorrelationMethod[] = ["same_transaction", "memo", "forge_distribution_sequence"];
 
 // ── deterministic split ─────────────────────────────────────────────────────────────────────
 
@@ -258,7 +258,15 @@ export interface TransferFact {
   memoClaimSignature: string | null;
 }
 
-export type CorrelationMethod = "same_transaction" | "memo" | "exclusive_window";
+/**
+ * same_transaction / memo — the transfer names its claim (same transaction, or `last60:v1:` memo).
+ * exclusive_window       — positional, opt-in, recorded but never payable.
+ * forge_distribution_sequence — Forge's EXISTING post-migration payout (a separate, memo-less
+ *                          transaction from the platform Fee Key holder to the launch creator) proven
+ *                          to settle exactly one harvest by structural, launch-scoped, complete-index
+ *                          evidence (see `attributeForgeDistribution`). Never by amount.
+ */
+export type CorrelationMethod = "same_transaction" | "memo" | "exclusive_window" | "forge_distribution_sequence";
 export type FundingCorrelationMode = "strict" | "exclusive_window";
 
 export type CorrelationResult =
@@ -309,6 +317,140 @@ export function correlateTransfer(t: TransferFact, collections: CollectionFact[]
   if (open.length !== 1 || open[0]!.key !== latest.key) return { linked: false, reason: open.length > 1 ? "ambiguous_window_multiple_open_claims" : "window_latest_claim_not_open" };
   if (t.amount > (latest.expectedLast60 ?? 0n) - latest.linked) return { linked: false, reason: "window_transfer_exceeds_remaining_expected" };
   return { linked: true, collectionKey: latest.key, method: "exclusive_window" };
+}
+
+// ── Forge's existing post-migration creator distribution ────────────────────────────────────
+
+/**
+ * Route of a funding inflow:
+ *   last60_destination        — into a configured LAST60_FUNDING_DESTINATIONS wallet (PR #6 / #7);
+ *   forge_creator_distribution — Forge's EXISTING post-migration payout: the platform Fee Key holder
+ *                                pays the launch creator its 50 % of a harvest, in a separate
+ *                                transaction, without a memo (Forgepad `scripts/Raypostmigration.js`,
+ *                                `sendPayouts`). The creator's 50 % is dedicated to Last-60 buyer rewards.
+ */
+export type FundingRoute = "last60_destination" | "forge_creator_distribution";
+export const FORGE_CREATOR_DISTRIBUTION: FundingRoute = "forge_creator_distribution";
+
+/** One Forge platform LP harvest transaction of a launch (its per-mint collection legs). */
+export interface ForgeHarvestTx {
+  signature: string;
+  slot: number;
+  legs: CollectionFact[];
+}
+
+/** One Forge → creator distribution transaction of a launch, as decoded (revenue/decode.ts). */
+export interface ForgeDistributionTx {
+  signature: string;
+  slot: number;
+  /** Contains a transfer of THIS launch's token mint from the Forge wallet to the launch creator. */
+  anchored: boolean;
+  /** Shape problems found by the decoder (non-creator outflows, foreign mints, other programs, …). */
+  problems: string[];
+  /** Transfers from the Forge wallet in this transaction (only the creator's are ever creditable). */
+  legs: TransferFact[];
+}
+
+export interface ForgeLegDecision {
+  transferKey: string;
+  /** Collection leg (same accounting asset) of the attributed harvest; null = no such leg. */
+  collectionKey: string | null;
+  /** Portion that may be credited (≤ remaining expected allocation of the collection leg). */
+  creditable: bigint;
+  /** Portion above the remaining expected allocation (recorded, never payable). */
+  excess: bigint;
+  reasons: string[];
+}
+
+export type ForgeAttribution =
+  /** Evidence not complete yet (e.g. indexing has not covered the slot): re-evaluated next pass. */
+  | { outcome: "pending"; reasons: string[] }
+  /** Recorded, never payable, never re-evaluated: the evidence does not prove a single harvest. */
+  | { outcome: "unresolved"; reasons: string[]; candidates: string[] }
+  | { outcome: "linked"; harvest: string; harvestSlot: number; previousHarvest: string | null; legs: ForgeLegDecision[] };
+
+export interface ForgeAttributionContext {
+  /** This launch's harvests with slot ≤ the distribution slot (newest first is fine; any order). */
+  harvests: ForgeHarvestTx[];
+  /** This launch's other Forge → creator distributions in the window [previous harvest slot, distribution slot]. */
+  distributions: ForgeDistributionTx[];
+  /** Every transaction of the launch's coverage addresses at or below this slot is indexed (null: unknown). */
+  coveredThroughSlot: number | null;
+  /** The bounded candidate queries hit their limit (the window cannot be proven complete). */
+  windowTruncated: boolean;
+  /** This launch's token mint (accounting asset of the anchor leg). */
+  tokenAsset: string;
+  /** Credits already linked to each collection leg by OTHER transfers (never this distribution's own). */
+  linkedElsewhere: Map<string, bigint>;
+}
+
+/**
+ * Pure: attribute one of Forge's existing creator distributions to the ONE harvest it settles, or
+ * refuse. Forgepad's collector (`Raypostmigration.js`) processes a lock as harvest → (swap) → ONE
+ * payout transaction, and never re-pays a harvest; this function does not ASSUME that order, it
+ * checks that the indexed chain history is consistent with it and fails closed otherwise:
+ *
+ *   0. shape      — the decoder found no problem: fee payer and every outflow are Forge's wallet →
+ *                   launch creator, only transfer programs, at most one transfer per asset, and an
+ *                   ANCHOR leg in this launch's token mint (launch identity; a SOL amount alone never
+ *                   identifies a launch, one creator can have many launches);
+ *   1. coverage   — every transaction of the launch's pool and of Forge's token account for this mint
+ *                   is indexed through the distribution slot (else pending — a harvest or competing
+ *                   payout may not be ingested yet; out-of-order ingestion can never misattribute);
+ *   2. ordering   — no harvest in the distribution's slot (intra-slot order is unknowable);
+ *   3. harvest    — H = the latest harvest strictly before it, alone in its slot;
+ *   4. exclusivity— no other anchored distribution of this launch in [slot(H), slot(D)]: D is the
+ *                   first and only payout after H;
+ *   5. alternation— the harvest before H (if any) was itself followed by a payout before H, so D
+ *                   cannot be a late payout of an earlier, unpaid harvest;
+ *   6. amounts    — per accounting asset, against H's leg in the SAME asset only (no conversion):
+ *                   the anchor leg must exist in H and must not exceed H's remaining 50 %; a SOL leg
+ *                   of a non-SOL-quoted pool (Forge swapped the quote via Jupiter) has no leg and is
+ *                   recorded but never credited; a SOL leg above the remaining 50 % is excess (never
+ *                   payable). Partial amounts are credited as observed.
+ * Amounts are bounds and consistency checks, never the link itself.
+ */
+export function attributeForgeDistribution(d: ForgeDistributionTx, ctx: ForgeAttributionContext): ForgeAttribution {
+  if (d.problems.length) return { outcome: "unresolved", reasons: [...d.problems], candidates: [] };
+  if (!d.anchored) return { outcome: "unresolved", reasons: ["no_launch_anchor"], candidates: [] };
+  if (ctx.coveredThroughSlot === null || ctx.coveredThroughSlot < d.slot) return { outcome: "pending", reasons: [`indexing_not_complete_through_slot_${d.slot}: covered through ${ctx.coveredThroughSlot ?? "unknown"}`] };
+  if (ctx.windowTruncated) return { outcome: "unresolved", reasons: ["candidate_window_too_large: too many harvests or distributions to prove a single candidate"], candidates: [] };
+  const harvests = ctx.harvests.filter((h) => h.signature !== d.signature);
+  const sameSlot = harvests.filter((h) => h.slot === d.slot);
+  if (sameSlot.length) return { outcome: "unresolved", reasons: ["harvest_in_same_slot_as_distribution: intra-slot order unknown"], candidates: sameSlot.map((h) => h.signature) };
+  const before = harvests.filter((h) => h.slot < d.slot);
+  if (!before.length) return { outcome: "unresolved", reasons: ["no_preceding_harvest"], candidates: [] };
+  const hSlot = Math.max(...before.map((h) => h.slot));
+  const atH = before.filter((h) => h.slot === hSlot);
+  if (atH.length > 1) return { outcome: "unresolved", reasons: ["multiple_harvests_in_candidate_slot"], candidates: atH.map((h) => h.signature) };
+  const H = atH[0]!;
+  const competing = ctx.distributions.filter((x) => x.signature !== d.signature && x.anchored && x.slot >= H.slot && x.slot <= d.slot);
+  if (competing.length) return { outcome: "unresolved", reasons: ["competing_distribution_since_harvest: another payout of this launch follows the same harvest"], candidates: [H.signature, ...competing.map((x) => x.signature)] };
+  const earlier = before.filter((h) => h.slot < H.slot);
+  const prev = earlier.length ? earlier.reduce((a, b) => (b.slot > a.slot ? b : a)) : null;
+  if (prev && !ctx.distributions.some((x) => x.anchored && x.slot > prev.slot && x.slot < H.slot)) {
+    return { outcome: "unresolved", reasons: ["previous_harvest_has_no_distribution: the transfer could settle an earlier, unpaid harvest"], candidates: [H.signature, prev.signature] };
+  }
+  const legs: ForgeLegDecision[] = [];
+  for (const t of d.legs) {
+    const col = H.legs.filter((c) => c.asset === t.asset && c.expectedLast60 !== null);
+    if (col.length !== 1) {
+      if (t.asset === ctx.tokenAsset) return { outcome: "unresolved", reasons: [col.length ? "harvest_has_multiple_legs_in_anchor_asset" : "anchor_leg_not_collected_by_harvest: the token paid is not explained by the harvest"], candidates: [H.signature] };
+      legs.push({ transferKey: t.key, collectionKey: null, creditable: 0n, excess: 0n, reasons: [col.length ? "harvest_has_multiple_legs_in_asset" : `asset_not_collected_by_harvest: ${t.asset} (the harvest's quote leg was converted or paid in another asset; never credited)`] });
+      continue;
+    }
+    const c = col[0]!;
+    const expected = c.expectedLast60 ?? 0n;
+    const already = ctx.linkedElsewhere.get(c.key) ?? 0n;
+    const remaining = expected > already ? expected - already : 0n;
+    if (t.amount > remaining) {
+      if (t.asset === ctx.tokenAsset) return { outcome: "unresolved", reasons: [`anchor_leg_exceeds_allocation: ${t.amount} > remaining ${remaining} of ${expected} (the harvest does not explain the payout)`], candidates: [H.signature] };
+      legs.push({ transferKey: t.key, collectionKey: c.key, creditable: 0n, excess: t.amount - remaining, reasons: [`exceeds_expected_allocation: ${t.amount} > remaining ${remaining} of ${expected}; never payable`] });
+      continue;
+    }
+    legs.push({ transferKey: t.key, collectionKey: c.key, creditable: t.amount, excess: 0n, reasons: [] });
+  }
+  return { outcome: "linked", harvest: H.signature, harvestSlot: H.slot, previousHarvest: prev?.signature ?? null, legs };
 }
 
 // ── reconciliation of one collection ────────────────────────────────────────────────────────

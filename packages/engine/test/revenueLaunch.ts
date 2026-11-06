@@ -17,11 +17,11 @@ import { fixtureRpc, loadFixture } from "./fixtureRpc";
 import { addr, buildTx, opaque, splTransfer } from "./revenueTx";
 
 export const llFx = loadFixture("migration-launchlab-cpmm.json");
-const cFx = loadFixture("destination-cpmm.json");
+export const cFx = loadFixture("destination-cpmm.json");
 export const lM = parseMigration(normalizeTransaction(llFx.tx), "raydium_launchlab", llFx.bondingPool)!;
-const llBonding = decodeLaunchLabPool(Buffer.from(llFx.accounts[llFx.bondingPool].data, "base64"));
-const llPlatform = decodeLaunchLabPlatformConfig(Buffer.from(llFx.accounts[llBonding.platformConfig].data, "base64"));
-const TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+export const llBonding = decodeLaunchLabPool(Buffer.from(llFx.accounts[llFx.bondingPool].data, "base64"));
+export const llPlatform = decodeLaunchLabPlatformConfig(Buffer.from(llFx.accounts[llBonding.platformConfig].data, "base64"));
+export const TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 export const CREATOR = llBonding.creator;
 /** The PlatformConfig platform NFT wallet: owner of Forge's platform Fee Key. */
 export const FORGE = llPlatform.platformLockNftWallet!;
@@ -36,7 +36,7 @@ export async function baseSpec(): Promise<DestinationSpec> {
   spec = destinationSpec(launch().info, v, launch().ll.lpCheck, { platformNftWallet: FORGE, creatorScale: "0", platformScale: "1000000" })!;
   return spec;
 }
-function launch(o: { verified?: boolean } = {}) {
+export function launch(o: { verified?: boolean } = {}) {
   const expected = { dbcCreatorTradingFeePercentage: null, dbcCreatorLpPercentage: null, launchlabCreatorFeeRate: o.verified === false ? null : Number(llPlatform.creatorFeeRate), launchlabCreatorLpScale: null, launchlabPlatformConfig: o.verified === false ? null : llBonding.platformConfig };
   const ll = new RaydiumLaunchLabProvider(null, { poolAddress: llFx.bondingPool, tokenMint: lM.baseMint, role: "creator", expected });
   const info = ll.hydrate(llBonding, llPlatform, { baseTokenProgram: TOKEN, quoteTokenProgram: TOKEN });

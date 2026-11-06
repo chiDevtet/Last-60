@@ -9,6 +9,7 @@
 import type { ChainRpc, SignatureInfo } from "../chain/rpc";
 import type { Models } from "../db/models";
 import { ingestRawTransaction, type IngestContext } from "./ingest";
+import { cursorId, recordSyncedThrough } from "./cursor";
 
 export interface Cursor {
   lastSignature: string | null;
@@ -17,9 +18,7 @@ export interface Cursor {
   updatedAt?: Date;
 }
 
-export function cursorId(provider: string, pool: string, address: string) {
-  return `cursor:${provider}:${pool}:${address}`;
-}
+export { cursorId };
 
 export async function readCursor(db: Models, id: string): Promise<Cursor | null> {
   const doc: any = await db.WorkerState.findById(id).lean();
@@ -111,11 +110,24 @@ export interface SyncStats {
 export async function syncAddress(
   ctx: IngestContext & { rpc: ChainRpc },
   address: string,
-  o: { cursorKey?: string; untilSignature?: string | null; source: "indexer" | "catchup" | "backfill"; cap: number; concurrency: number; maxSlot?: number; bounds?: FetchBounds; maxPerPass?: number; signal?: AbortSignal; minContextSlot?: number },
+  o: { cursorKey?: string; untilSignature?: string | null; source: "indexer" | "catchup" | "backfill"; cap: number; concurrency: number; maxSlot?: number; bounds?: FetchBounds; maxPerPass?: number; signal?: AbortSignal; minContextSlot?: number; coverageSlot?: number },
+): Promise<SyncStats & { more: boolean; truncated: boolean }> {
+  const res = await syncAddressPass(ctx, address, o);
+  // Coverage: a COMPLETE pass whose signature reads were anchored at `coverageSlot` (minContextSlot)
+  // has ingested every transaction of the address up to that slot. Only recorded for cursored passes.
+  if (o.cursorKey && o.coverageSlot !== undefined && o.maxSlot === undefined && !res.more && !o.signal?.aborted) await recordSyncedThrough(ctx.db, o.cursorKey, o.coverageSlot);
+  return res;
+}
+
+async function syncAddressPass(
+  ctx: IngestContext & { rpc: ChainRpc },
+  address: string,
+  o: { cursorKey?: string; untilSignature?: string | null; source: "indexer" | "catchup" | "backfill"; cap: number; concurrency: number; maxSlot?: number; bounds?: FetchBounds; maxPerPass?: number; signal?: AbortSignal; minContextSlot?: number; coverageSlot?: number },
 ): Promise<SyncStats & { more: boolean; truncated: boolean }> {
   const cursor = o.cursorKey ? await readCursor(ctx.db, o.cursorKey) : null;
   const until = o.untilSignature !== undefined ? o.untilSignature : (cursor?.lastSignature ?? null);
-  const { sigs: all, truncated } = await fetchSignaturesSince(ctx.rpc, address, until, o.cap, o.bounds, { minContextSlot: o.minContextSlot });
+  const minContextSlot = o.coverageSlot !== undefined ? Math.max(o.coverageSlot, o.minContextSlot ?? 0) : o.minContextSlot;
+  const { sigs: all, truncated } = await fetchSignaturesSince(ctx.rpc, address, until, o.cap, o.bounds, { minContextSlot });
   // Bounded pass (oldest first); the cursor makes the next pass continue exactly here. An
   // anchored truncated fetch also means "more": the newest signatures were not returned yet.
   const anchored = until !== null || o.bounds?.afterSlot != null || o.bounds?.sinceTime != null;

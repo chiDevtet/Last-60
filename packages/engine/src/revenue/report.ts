@@ -26,6 +26,12 @@ export interface RevenueReport {
     remainingAvailable: PerMint<string>;
     ineligibleCredits: { count: number; byReason: Record<string, number> };
     unlinkedFundingInflows: { count: number; byMint: PerMint<string> };
+    /**
+     * Forge's existing post-migration creator payouts (route forge_creator_distribution), by
+     * attribution status: linked (credit written; payable or not), pending (evidence not complete
+     * yet, e.g. indexing behind) and unresolved (recorded, never payable, with the reasons).
+     */
+    forgeCreatorDistributions: { linked: number; linkedPayable: number; pending: number; unresolved: number; unresolvedByReason: Record<string, number>; unresolvedByMint: PerMint<string> };
     duplicateEventsRejected: number;
     reconciliationDiscrepancies: { key: string; stream: string; status: string; discrepancies: string[] }[];
   };
@@ -43,6 +49,20 @@ export async function buildRevenueReport(db: Models, opts: { sourcePool?: string
     { $group: { _id: "$asset", n: { $sum: 1 }, t: { $sum: "$netAmount" } } },
   ]);
   const dup: any = await db.SystemState.findById("revenue_duplicates_rejected").lean();
+  const attributions: any[] = await db.FundingAttribution.find(scope, { status: 1, payoutEligible: 1, reasons: 1, asset: 1, amount: 1 }).lean();
+  const fcd: RevenueReport["buyerRewards"]["forgeCreatorDistributions"] = { linked: 0, linkedPayable: 0, pending: 0, unresolved: 0, unresolvedByReason: {}, unresolvedByMint: {} };
+  for (const a of attributions) {
+    if (a.status === "linked") {
+      fcd.linked++;
+      if (a.payoutEligible) fcd.linkedPayable++;
+    } else if (a.status === "pending") fcd.pending++;
+    else {
+      fcd.unresolved++;
+      const reason = String(a.reasons?.[0] ?? "unknown").split(":")[0]!;
+      fcd.unresolvedByReason[reason] = (fcd.unresolvedByReason[reason] ?? 0) + 1;
+      fcd.unresolvedByMint[a.asset] = (big(fcd.unresolvedByMint[a.asset] ?? "0") + big(a.amount)).toString();
+    }
+  }
 
   const bonding: RevenueReport["bondingCurve"] = {};
   const forge: RevenueReport["postMigration"]["forgePlatformLp"] = {};
@@ -120,6 +140,7 @@ export async function buildRevenueReport(db: Models, opts: { sourcePool?: string
       remainingAvailable: remaining,
       ineligibleCredits: { count: ineligible, byReason },
       unlinkedFundingInflows: { count: unlinked.reduce((a, x) => a + x.n, 0), byMint: Object.fromEntries(unlinked.map((x) => [x._id, s(big(x.t))])) },
+      forgeCreatorDistributions: fcd,
       duplicateEventsRejected: Number(dup?.value?.events ?? 0),
       reconciliationDiscrepancies: recs.filter((r) => r.discrepancies?.length || ["partial", "excess", "unresolved", "awaiting_distribution"].includes(r.status)).slice(0, 100).map((r) => ({ key: r.key, stream: r.stream, status: r.status, discrepancies: r.discrepancies ?? [] })),
     },
@@ -164,6 +185,8 @@ export function renderRevenueReport(r: RevenueReport): string {
   L.push(`  eligible / consumed / remaining  ${JSON.stringify(b.eligibleBalanceByMint)} / ${JSON.stringify(b.consumedByRounds)} / ${JSON.stringify(b.remainingAvailable)}`);
   L.push(`  ineligible credits               ${b.ineligibleCredits.count} ${JSON.stringify(b.ineligibleCredits.byReason)}`);
   L.push(`  unlinked funding inflows         ${b.unlinkedFundingInflows.count} ${JSON.stringify(b.unlinkedFundingInflows.byMint)}`);
+  const f = b.forgeCreatorDistributions;
+  L.push(`  Forge creator distributions      linked ${f.linked} (payable ${f.linkedPayable}) / pending ${f.pending} / unresolved ${f.unresolved} ${JSON.stringify(f.unresolvedByReason)} ${JSON.stringify(f.unresolvedByMint)}`);
   L.push(`  duplicate events rejected        ${b.duplicateEventsRejected}`);
   L.push(`  reconciliation discrepancies     ${b.reconciliationDiscrepancies.length}`);
   for (const d of b.reconciliationDiscrepancies.slice(0, 20)) L.push(`    ${d.stream} ${d.key.slice(0, 60)}… ${d.status} ${d.discrepancies.join("; ")}`);
