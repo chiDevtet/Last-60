@@ -1,10 +1,13 @@
-# Phase-aware revenue attribution and Last-60 reward funding (PR #6, corrected in PR #7)
+# Phase-aware revenue attribution and Last-60 reward funding (PR #6, corrected in PR #7, Forge creator distributions in PR #8)
 
 This document describes how LAST60 attributes Forge's revenue across the two launch phases, which
-streams may fund Last-60 buyer rewards, what evidence is required, and what Forgepad must change
-before the model can fund rewards in production. Code: `packages/engine/src/accounting/revenueStreams.ts`
-(pure model), `src/revenue/decode.ts` (transaction decoding), `src/revenue/ingest.ts` (persistence,
-correlation, reconciliation), `src/revenue/report.ts` (reporting), `src/rewards/scheduler.ts` (rounds).
+streams may fund Last-60 buyer rewards, what evidence is required, and how Last-60 recognises Forge's
+**existing** post-migration LP distribution without any change to Forgepad's platform-wide fee claimer
+(§4a). Code: `packages/engine/src/accounting/revenueStreams.ts` (pure model, incl.
+`attributeForgeDistribution`), `src/revenue/decode.ts` (transaction decoding, incl.
+`forgeCreatorDistribution`), `src/revenue/ingest.ts` (persistence, correlation, attribution,
+reconciliation), `src/indexer/cursor.ts` (indexing coverage), `src/revenue/report.ts` (reporting),
+`src/rewards/scheduler.ts` (rounds).
 
 ## 1. The approved business model in one page
 
@@ -36,12 +39,23 @@ entitlement (see `docs/FEE_ACCOUNTING.md` §2). In the code this is `forge_platf
 with `allocationOwner: "creator"`, `custodian: "forge"` — PR #6 described it as a "Forge-funded
 contribution", which PR #7 corrects.
 
-**Transfer path for the creator's LP allocation.** Because Forge's Fee Key holder receives the claimed
-fees, the allocation must be paid **directly from the Fee Key holder to the Last-60 funding
-destination**. A transfer from the creator's wallet never satisfies a Forge LP claim: it cannot be told
-apart from the creator's own (bonding or CPMM) revenue, and would depend on the creator forwarding
-Forge-custodied funds. Last-60 enforces this (the source of a credited transfer must be the claim's
-recipient).
+**Transfer path for the creator's LP allocation.** Forge's Fee Key holder receives the claimed fees, so
+the allocation is credited only when it leaves **the Fee Key holder** (the claim's recipient). Two
+routes are recognised:
+
+1. **Forge's existing creator distribution** (`forge_creator_distribution`, §4a) — what Forgepad's
+   collector already does today: a separate, memo-less transaction from the Fee Key holder to the
+   **launch creator's wallet** paying the creator's 50 %. The creator wallet is where this stream's
+   Last-60 funds land; they are the creator's allocation dedicated to Last-60 buyer rewards, **not**
+   personal developer revenue and **not** CPMM creator trading revenue.
+2. **Into a Last-60 funding destination** (`last60_destination`, PR #6 / #7) — a transfer from the Fee
+   Key holder to a `LAST60_FUNDING_DESTINATIONS` wallet in the claim's transaction or with a
+   `last60:v1:<claim>` memo. Still supported; not required.
+
+A transfer **from** the creator's wallet never satisfies a Forge LP claim (it cannot be told apart from
+the creator's own bonding or CPMM revenue): the source of a credited transfer must be the claim's
+recipient. Funds credited to rounds must end up in the payout wallet: use the creator wallet as the
+payout wallet or sweep it (rounds wait in `awaiting_funds` otherwise).
 
 ## 2. Streams
 
@@ -64,6 +78,7 @@ Storage (all with unique keys, `$setOnInsert` writes and model-level immutabilit
 | `revenue_events` | collection or funding inflow — `(stream, signature, instruction ordinal, mint)`, also unique on `(signature, ordinal, stream, feeMint)` | everything | cluster, chain, token mint, pool / source pool, provider, launch phase, signature, instruction indices, slot, block time, fee mint, accounting asset, decimals, gross / net amount, source / destination account and owner, beneficiary, evidence status, v1 snapshot (stream, phase, provider, pools, fee mint, beneficiaries incl. creator, **policy snapshot**, effective fee configuration, verification, problems) |
 | `reward_funding` | funding inflow linked to a collection (key = the inflow) — the **funding contribution record** (§5) | amounts, eligibility, policy, attribution, snapshot | `roundNumber` / `consumedAt` written once, conditionally, inside the round transaction |
 | `revenue_reconciliations` | collection (key = correlation id = collection key) | derived, recomputed idempotently | expected / actual / creditable / excess / untransferred / implied retained, status, discrepancies, linked distributions |
+| `funding_attributions` | Forge creator-distribution leg (key = the inflow) | decided once (`pending` → `linked` / `unresolved`, conditional on `pending`) | the bounded attribution work queue and audit trail: status, reasons, candidate harvests, evidence (harvest, previous harvest, anchor mint, coverage); economic facts stay on the immutable event / credit |
 
 ## 3. Evidence: what is observed and how it is verified
 
@@ -86,6 +101,12 @@ balance deltas), in integer base units of the fee mint.
 * **CPMM creator-fee collection.** The `collect_creator_fee(_permissionless)` transfers to the
   `pool_creator`. Only the **net** amount is observable (the accrued amount and the protocol share are
   not in the transaction). Recorded with the effective fee configuration (§6); never shared.
+* **Forge creator distribution** (route `forge_creator_distribution`, §4a). A transaction in which the
+  declared Forge wallet pays the launch creator (System `transfer` and/or SPL `TransferChecked` from
+  its token account), or pays this launch's token to anyone in a transfer-only transaction. Every Forge
+  outflow of it is recorded as a leg with the transaction's **shape** (fee payer, programs, recipients,
+  mints, anchor). A payout that carries another token and not this launch's belongs to that launch and
+  is not recorded here.
 * **Funding inflow.** A System Program `Transfer` (native SOL) or SPL Token / Token-2022 `Transfer` /
   `TransferChecked` into a configured `LAST60_FUNDING_DESTINATIONS` wallet (SPL: a token account whose
   owner — from the transaction's token-balance metadata — is that wallet; a `TransferChecked` mint must
@@ -111,8 +132,97 @@ A funding inflow is linked to at most one collection (unique credit key) and **n
    but never payable**: a positional link does not name its claim, and Forge's platform wallet also
    pays out other streams (e.g. bonding-curve platform fees) that must never be credited.
 
+4. **forge_distribution_sequence** — Forge's existing, memo-less creator payout, attributed by the
+   structural evidence of §4a. Payable. Never by amount.
+
 Otherwise the inflow stays **unlinked** (reported) and is retried on every reconciliation pass, so a
 transfer indexed before its claim is linked once the claim arrives.
+
+## 4a. Forge's existing post-migration creator distribution
+
+### The flow Forge actually runs (Forgepad `new-ui` @ 5acce50, read-only inspection)
+
+`templates/fun-launch/scripts/Raypostmigration.js` (PM2 `forgeRaydiumPostMigrationCollector`, live,
+60 s cycle) with `scripts/quote-mints/postmig-split.js`, for every Fee Key the platform wallet holds
+(one lock = one migrated pool = one token), **one lock at a time**:
+
+| Step | Transaction | What moves |
+|---|---|---|
+| 1. harvest | `raydium.cpmm.harvestLockLp({ closeWsol: true })` — LP-lock `collect_cp_fees`, signed and paid by the Fee Key holder | both fee legs from the CPMM vaults to the holder: the token leg into its **associated token account** (SDK `associatedOnly: true`), the WSOL leg into a temporary account closed in the same transaction |
+| 2. swap (non-SOL quote only) | Jupiter, separate transaction | the quote leg (e.g. USD1, ai16z) → SOL; the creator's SOL basis is Jupiter's `otherAmountThreshold`, not a measured amount |
+| 3. payout | `sendPayouts`, a **separate legacy transaction**, fee payer = holder, **no memo** | `SystemProgram.transfer(holder → creator, ⌊basis × 50 %⌋)` · `createAssociatedTokenAccountIdempotent` · `TransferChecked(holder ATA → creator ATA, token, ⌊token leg × 50 %⌋)` — when the token has **no** Forge rewards distributor and the Fee Key is post-2026-08-17 (combined) |
+| — | (distributor mode) | the same transaction also pays the token's Forge rewards distributor 50 % and the creator only **25 %** (25 / 50 / 25) — not the approved model |
+| 4. writeback | MongoDB `raydium_postmig_lockfee_claims`, `raydium_launches.last_postmigration_creator_payout_tx` | Forge's own records (`harvestTx`, `distTx`) — **not** an existing Last-60 data source; not used |
+
+The creator is `LaunchpadPool.creator` (Forge reads it on-chain; Last-60 reads the same field). The SOL
+basis of a SOL-quoted pool is the Raydium API's UI estimate of the unclaimed fee (`toRaw(uiAmount)`),
+not the measured claim; the token leg is measured (wallet balance delta) and therefore exactly
+`⌊claimed token × 50 %⌋`. A failed payout is logged and **not retried** (the next cycle harvests again).
+
+### What Last-60 observes and how it correlates
+
+There is no field in the payout that names its harvest (no memo, no shared transaction). Last-60
+therefore proves the relationship from launch-scoped, complete-index chain evidence, and refuses when
+it cannot (`attributeForgeDistribution`, pure):
+
+| # | Check | Evidence | Failure → |
+|---|---|---|---|
+| 0 | **shape** | fee payer = declared Forge wallet (= PlatformConfig `platform_nft_wallet`); only System / SPL Token / Token-2022 / ATA / ComputeBudget / Memo programs; every Forge outflow goes to the launch creator; at most one transfer per asset; no foreign mint; an **anchor** leg in this launch's token mint | `unresolved` (`fee_payer_not_forge_platform_wallet`, `unexpected_programs`, `forge_outflow_to_non_creator`, `foreign_mint_leg`, `multiple_transfers_in_one_asset`, `no_launch_anchor`, `recipient_not_launch_creator`) |
+| 1 | **coverage** | the destination pool's and Forge's launch-token account's signature cursors prove every transaction up to the payout slot is ingested (`cursor.lastSlot − 1`, or `syncedThroughSlot` recorded by a complete poll pass anchored with `minContextSlot`) | `pending` (re-evaluated every pass) |
+| 2 | **ordering** | no harvest of the launch in the payout's slot (intra-slot order is unknowable) | `unresolved` `harvest_in_same_slot_as_distribution` |
+| 3 | **harvest** | H = the latest harvest strictly before the payout, alone in its slot | `unresolved` `no_preceding_harvest` / `multiple_harvests_in_candidate_slot` |
+| 4 | **exclusivity** | no other anchored payout of the launch in [slot(H), slot(payout)] | `unresolved` `competing_distribution_since_harvest` |
+| 5 | **alternation** | the harvest before H, if any, was followed by a payout before H — so the payout cannot be a late payment of an earlier, unpaid harvest | `unresolved` `previous_harvest_has_no_distribution` |
+| 6 | **amounts** (per accounting asset, against H's leg in the same asset only) | anchor (token) leg present in H and ≤ H's remaining 50 %; SOL leg ≤ H's remaining 50 % of the WSOL leg | anchor leg missing / above → whole payout `unresolved`; SOL leg above → that leg never payable (`exceeds_expected_allocation`, excess recorded); SOL of a non-SOL-quoted pool → that leg `unresolved` (`asset_not_collected_by_harvest`) |
+
+Then the ordinary credit rules of §5 apply to every linked leg (verified harvest, activation slot,
+creator attribution, source = claim recipient, …).
+
+**Why the anchor.** One creator can have many launches and Forge's platform wallet pays many streams
+(bonding platform fees to rewards distributors, `recoverRaydiumFeePayout.js`, the post-migration
+collector for every token). A SOL amount carries no launch identity; the token leg — Forge sends it in
+kind by default (`POSTMIG_SWAP_TOKEN_LEG` unset) — does. A payout without it is recorded and never
+credited.
+
+**Why amount-only matching is forbidden.** Two claims can have identical or similar amounts (same
+token, consecutive harvests; or two launches of one creator); Forge's SOL basis is an estimate, so it
+does not even equal the claimed half exactly. Amounts are only bounds and consistency checks here; the
+link is the sequence of indexed, launch-scoped transactions.
+
+**Multiple candidate claims.** Any situation in which the indexed history admits more than one harvest
+for a payout — two harvests in one slot, a harvest in the payout's slot, a second payout after the same
+harvest, an unpaid earlier harvest, a window too large to prove (> 24 harvest rows / 64 payouts) — is
+recorded `unresolved` with the candidate harvests and is never payable. Decided rows are never
+re-evaluated, so a later ingestion can never flip an unresolved payout to payable.
+
+**Unresolved and excess.** Unresolved legs are revenue events (`route: forge_creator_distribution`)
+with a `funding_attributions` row (`unresolved`, reasons, candidates); no credit is written unless a
+single harvest is proven. Linked legs above the remaining allocation are credits with
+`payoutEligible=false` and the excess recorded (the claim's reconciliation shows `excess`).
+
+**High volume.** The indexer watches, per Last-60 launch, only Forge's associated token account for
+that launch's token (from the migration slot) — never the platform wallet's whole multi-launch
+history. The attribution pass reads only `pending` queue rows of the launch (indexed
+`(sourcePool, status, slot)`) and, per payout, the launch's latest ≤ 24 harvest rows at or before it and
+its anchored payouts in [previous harvest, payout] (indexed `(sourcePool, stream, slot)` /
+`(sourcePool, kind, slot)`). Other launches and creators are never candidates. Decisions depend only on
+indexed events (never on credits already written), credits are `$setOnInsert` on the inflow key and the
+queue transition is conditional on `pending`: concurrent, repeated or restarted passes reach the same
+result and credit each leg at most once. Several outstanding claims of one launch, several fee mints,
+many creators and many launches in one database are independent.
+
+**Limits of attribution (fail closed).**
+
+* Forge's **distributor mode** (25 / 50 / 25): recorded, never credited (not the approved model).
+* **Non-SOL quote** (USD1, ai16z, …): the SOL payout is a Jupiter conversion of the quote leg — never
+  credited; the token leg is credited per mint (recorded; rounds pay only in the payout asset).
+* **SOL estimate above the measured half**: that SOL leg is never payable. Because Forge's SOL basis
+  is the Raydium API's estimate, a SOL payout can exceed ⌊claimed × 50 %⌋ by a small amount when
+  reserves move between Forge's read and its harvest; such legs stay unpaid in Last-60.
+* **Unpaid harvest** (Forge payout error, never retried): the next harvest's payout is unresolved too.
+* **`POSTMIG_SWAP_TOKEN_LEG=true`** or a zero token leg: no anchor → recorded, never credited.
+* Coverage requires the indexer's cursors for the destination pool and Forge's launch-token account;
+  without the indexer (or with `FORGE_PLATFORM_LP_BENEFICIARY` unset) payouts stay `pending`.
 
 ## 5. Reconciliation and credits
 
@@ -130,18 +240,26 @@ Statuses: `awaiting_distribution` (nothing transferred; full untransferred balan
 (gross − observed contribution); they are never presented as independently observed.
 
 A credit is payable only if **all** hold: the policy is `forge_phase_aware_v2`; the collection is
-verified (source, beneficiary, final status); both the collection and the transfer are after the
-activation slot; the link is `same_transaction` or `memo`; the transfer left the wallet that received
-the claim (creator for bonding fees, Forge's Fee Key holder for LP fees); the credit names the launch
-creator; the inflow itself is clean; and there is a supported (≤ expected) amount. Otherwise it is
-stored with `payoutEligible=false` and every reason.
+verified (source, beneficiary, final status — for Forge LP claims: verified migration, platform Fee Key
+minted to `platform_nft_wallet` = `FORGE_PLATFORM_LP_BENEFICIARY`, fees paid to it); both the collection
+and the transfer are after the activation slot; the link is `same_transaction`, `memo` or
+`forge_distribution_sequence` (§4a: the payout is linked to exactly one harvest); the transfer left the
+wallet that received the claim (creator for bonding fees, Forge's Fee Key holder for LP fees); the
+credit names the launch creator (on the Forge creator route the funds reached exactly that wallet, and
+only a Forge LP claim can be settled); the inflow itself is clean (shape problems make it
+`unresolved`); the asset is the claim leg's own asset; and there is a supported (≤ expected) amount.
+Round consumption additionally requires both transactions to be **finalized and successful** (§8).
+Otherwise it is stored with `payoutEligible=false` and every reason.
 
 **Funding contribution record** (`reward_funding`, written once, immutable): token mint, source pool,
 launch phase, stream, original claim signature (`collectionSignature`, `collectionKey`), amount actually
 collected (`collectedAmount`), expected allocation (`expectedAllocation`), actual transferred amount
 (`observedAmount`), creditable / excess split, source and destination wallets, transfer signature and
 slot, creator attribution (`creator`, `allocationOwner`), funding policy version and snapshot,
-correlation method and reconciliation status. Expected allocations and observed payments are kept side
+correlation method and reconciliation status; since PR #8 also the `route` (`last60_destination` /
+`forge_creator_distribution`) and, for `forge_distribution_sequence`, the immutable `attribution`
+evidence (harvest and previous harvest signatures, payout signature, anchor mint, Forge wallet,
+creator, indexing coverage slot). Expected allocations and observed payments are kept side
 by side and never merged; "retained" amounts are implied, never presented as observed.
 
 **Pre-activation accruals.** Bonding-curve creator fees that accrued at or before the activation slot
@@ -194,7 +312,7 @@ Ownership is always read from the actual migration transaction's lock records �
 | | `legacy_creator_fee_v1` (default) | `forge_phase_aware_v2` (snapshot slot > activation slot) |
 |---|---|---|
 | Creator-allocated fees | `REWARD_PERCENTAGE` of the period's verified fees (unchanged) | counted only up to the activation slot (the round's `legacyFeeSlotCap`); later ones are recorded and reported (`creatorFeesRecordedNotDistributed`), never distributed |
-| Contributions | recorded, reported, never consumed | payable v2 credits in the payout asset, not yet consumed, linked by same transaction or memo, whose **transfer and original claim transactions are both finalized and successful**, within the **per-claim cap** → 100 % to the reward pool (`REWARD_PERCENTAGE` is not applied: they already are the reward share) |
+| Contributions | recorded, reported, never consumed | payable v2 credits in the payout asset, not yet consumed, linked by same transaction, memo or `forge_distribution_sequence`, whose **transfer and original claim transactions are both finalized and successful**, within the **per-claim cap** → 100 % to the reward pool (`REWARD_PERCENTAGE` is not applied: they already are the reward share) |
 
 `forge_phase_aware_v1` (PR #6) is retired: it is rejected by configuration, a v1 policy object is never
 "in force", and credits stored under it keep their snapshot and are never consumed or rewritten.
@@ -220,14 +338,18 @@ recorded and reported, never converted).
 | `REWARD_FUNDING_POLICY` | `legacy_creator_fee_v1` (default) or `forge_phase_aware_v2` (approved model); `forge_phase_aware_v1` is rejected |
 | `REWARD_FUNDING_POLICY_ACTIVATION_SLOT` | required for v2; set it to a slot **at or after** the deployment that enables it (credits recorded before activation are permanently ineligible — fail closed) |
 | `LAST60_FUNDING_DESTINATIONS` | Last-60 funding wallets (comma separated); required for v2; also watched by the indexer. Funds credited to rounds must end up in the payout wallet (use it as the destination, or sweep) |
-| `FORGE_PLATFORM_LP_BENEFICIARY` | Forge's platform Fee Key owner; must equal PlatformConfig `platform_nft_wallet` (Forgepad `8KXqQwtr…`); **required** for v2 |
+| `FORGE_PLATFORM_LP_BENEFICIARY` | Forge's platform Fee Key owner; must equal PlatformConfig `platform_nft_wallet` (Forgepad `8KXqQwtr…`); **required** for v2. Also the source wallet of Forge's creator distributions (§4a): once a LaunchLab → CPMM migration is verified, the indexer watches this wallet's associated token account for the launch token from the migration slot |
 | `BONDING_CREATOR_FEE_LAST60_PERCENTAGE` | must be 75 (approved model; any other value is a config error) |
 | `FORGE_PLATFORM_LP_LAST60_PERCENTAGE` | must be 50 (approved model; any other value is a config error) |
 | `FUNDING_CORRELATION_MODE` | `strict` (default: same tx or memo) or `exclusive_window` (extra links recorded, never payable) |
 | `EXPECTED_CPMM_CREATOR_FEE_RATE` | AmmConfig `creator_fee_rate` the migrated pool must use (Forgepad 500) |
 | `EXPECTED_LAUNCHLAB_PLATFORM_CONFIG` | existing; required (with the rate) for a verified bonding basis |
 
-## 10. What Forgepad actually does today (inspected: chiDevtet/Forgepad-Newest default branch `new-ui` @ 5acce50, 2026-11-06)
+PR #8 adds **no** environment variable: the Forge creator route needs only `FORGE_PLATFORM_LP_BENEFICIARY`
+(already required for v2) and on-chain facts (pool creator, token mint and token program, verified
+migration). Nothing about the creator, the token or a creator-to-token mapping is configured.
+
+## 10. What Forgepad actually does today (inspected read-only: chiDevtet/Forgepad-Newest default branch `new-ui` @ 5acce50, 2026-11-06; re-inspected for PR #8 at the same commit)
 
 PR #6 inspected `93a2cff`; ten commits landed on the default branch afterwards, several of them on
 exactly this flow (44941d0, 7801001, d01e541, 252002f, 5acce50). The repository's `main` branch is a
@@ -243,17 +365,17 @@ not the running servers.
 
 Findings against the approved model:
 
-1. **Post-migration LP split does not match.** The approved model is *creator's 50 % allocation →
-   Last-60, Forge 50 %*. Today the creator's wallet receives 25 % (or 50 %) as personal revenue and a
-   per-token rewards distributor receives 50 %. Neither is a Last-60 funding destination, so under
-   `forge_phase_aware_v2` Last-60 records each harvest as `awaiting_distribution` and funds nothing from
-   it. A creator-wallet payout is exactly the flow the approved model excludes ("not additional personal
-   developer revenue").
+1. **Post-migration LP split.** For a token without a Forge rewards distributor Forge pays the creator's
+   wallet exactly the approved 50 % and keeps 50 %. Since PR #8 Last-60 recognises that existing payout
+   as the creator's allocation dedicated to Last-60 (§4a); PR #7's statement that a creator-wallet payout
+   is excluded is superseded — what is excluded is a transfer *from* the creator's wallet, and Forge's
+   distributor mode (creator 25 %, distributor 50 %), which is recorded but never credited.
 2. **No 75 % bonding contribution exists.** The creator claims 100 % to their own wallet. Last-60 records
    the collection and the full untransferred 75 %, and funds nothing.
-3. **No correlation evidence.** Distributions are separate transactions without a `last60:v1:<claim>`
-   memo, and the platform wallet that pays them also pays bonding platform-fee distributions — so only
-   memo / same-transaction links can be trusted (PR #7 makes `exclusive_window` non-payable).
+3. **No explicit correlation field.** Distributions are separate transactions without a memo, and the
+   platform wallet that pays them also pays bonding platform-fee distributions. PR #7 therefore made
+   positional `exclusive_window` links non-payable; PR #8 adds the launch-anchored, complete-index
+   sequence attribution of §4a instead (still never by amount, still failing closed).
 4. **Conversions.** Non-SOL quote legs are swapped before payout; a converted amount never satisfies a
    claim in Last-60 (per-mint accounting).
 5. **Measured amounts and idempotency.** The SOL payout basis is an estimate, and payouts have no
@@ -262,28 +384,22 @@ Findings against the approved model:
 6. **CPMM creator fee** is left to each creator (`platformCpCreator` default) — consistent with the
    approved model (Forge never touches it).
 
-## 11. What Forgepad must do for contributions to count (Forgepad-side; not part of this repository)
+## 11. Forgepad changes: none required for the post-migration LP stream
 
-These are the conditions Last-60 verifies; how Forgepad meets them is the Forgepad team's decision.
+A normal Forge launch keeps using Forgepad's existing platform-wide collector unchanged: no
+Last-60-specific memo, destination, percentage, worker or per-token configuration. Last-60 adapts to
+the money movements Forge already makes (§4a). This repository never modifies Forgepad.
 
-1. **Post-migration LP.** Of each claimed Fee Key harvest, per claimed mint: transfer
-   ⌊claimed × 50 %⌋ (the creator's allocation) from the Fee Key holder (`platform_nft_wallet`) to the
-   token's Last-60 funding destination; Forge keeps the rest. No creator-wallet payout and no rewards
-   distributor payout from this stream. Pay in the **claimed mint** (no swap); amounts measured from
-   the claim transaction itself.
-2. **Correlation.** Same transaction as the claim, or a separate transaction carrying the SPL Memo
-   `last60:v1:<claim transaction signature>`. Distribute only after the claim is finalized (Last-60
-   never funds from a claim that does not finalize).
-3. **Bonding curve.** Of each collected creator fee: ⌊collected × 75 %⌋ from the creator (the claim's
-   recipient) to the destination, ideally appended to the creator's claim transaction built by
-   Forgepad (same-transaction correlation). Caveat: the LaunchLab creator fee vault is shared by all of
-   a creator's pools with the same quote mint; Last-60 marks claims mixed with other pools as
-   unverified (they cannot be apportioned).
-4. **Idempotency.** Persist each contribution (keyed by claim signature) before broadcasting so a
-   retry never pays twice; Last-60 caps credits at the expected allocation regardless and records any
-   excess as never payable.
-5. **Platform wallet.** Keep `platform_nft_wallet` = `FORGE_PLATFORM_LP_BENEFICIARY`; declare any change
-   before it is used.
+What remains outside this stream:
+
+1. **Bonding curve (75 %).** The creator claims 100 % of bonding creator fees to their own wallet; the
+   75 % Last-60 contribution is a transfer the **creator** makes (same transaction as the claim, or
+   with a `last60:v1:<claim>` memo) into a Last-60 funding destination. Until then those collections
+   reconcile as `awaiting_distribution`. (Not part of Forge's claimer.)
+2. **Optional, never required** — things on Forge's side that would let Last-60 credit more of what it
+   already pays: a SOL basis measured from the harvest transaction instead of the API estimate (the
+   SOL leg would then never exceed the half), and paying in the claimed mint instead of swapping a
+   non-SOL quote. Without them those legs stay recorded and unpaid; nothing is misattributed.
 
 ## 12. Operator runbook
 
@@ -296,14 +412,21 @@ bun run verify:allocation         # now also prints creator_fee_on and the Creat
 bun run fixtures:cpmm-fee-share   # refresh the CreatorFeeShare mainnet evidence (read-only)
 ```
 
+Forge creator distributions (§4a): the report's `Forge creator distributions` line counts `linked`
+(payable), `pending` and `unresolved` legs by reason and mint; `funding_attributions` holds each
+decision (`db.funding_attributions.find({ status: "unresolved" })`). `pending` that does not clear means
+the indexer's coverage of the destination pool or of Forge's launch-token account is behind (check
+`worker_state` cursors / `syncedThroughSlot`).
+
 Rollout:
 
 1. Deploy with the default legacy policy; set `LAST60_FUNDING_DESTINATIONS`,
-   `FORGE_PLATFORM_LP_BENEFICIARY`, `EXPECTED_CPMM_CREATOR_FEE_RATE`. Revenue events, reconciliations
-   and (ineligible) links are recorded; rounds are unchanged.
-2. Ship the Forgepad changes (§11). Confirm with `bun run cli revenue` that collections reconcile and
-   inflows link (`same_transaction` / `memo`), with no `excess` or `unresolved` rows, and that LP
-   credits name the creator (`allocationOwner: creator`) and come from the Fee Key holder.
+   `FORGE_PLATFORM_LP_BENEFICIARY`, `EXPECTED_CPMM_CREATOR_FEE_RATE`. Revenue events, reconciliations,
+   Forge creator-distribution attributions and (ineligible) links are recorded; rounds are unchanged.
+2. Confirm with `bun run cli revenue` on real Forge harvests that LP claims reconcile, Forge's creator
+   payouts link (`forge_distribution_sequence`) with credits naming the creator
+   (`allocationOwner: creator`, source = the Fee Key holder, destination = the creator), and review every
+   `unresolved` reason. Make the creator wallet the payout wallet, or sweep it into the payout wallet.
 3. Choose an activation slot at or after the switch-over and set `REWARD_FUNDING_POLICY=forge_phase_aware_v2`
    with `REWARD_FUNDING_POLICY_ACTIVATION_SLOT` on **both** workers (and the CLI). Rounds whose
    snapshot is after it are funded by verified contributions only.
@@ -311,16 +434,26 @@ Rollout:
 
 ## 13. Known limitations
 
-* No Forgepad LaunchLab launch has graduated yet: Forge LP claim and distribution transactions are
-  tested on synthetic transactions over the real migration fixture, not on a real Forge claim.
+* No Forgepad LaunchLab launch had a live post-migration harvest and payout at the time of writing:
+  Forge LP claims and Forge's creator payouts are tested on **synthetic** transactions that mirror
+  `harvestLockLp` / `sendPayouts` instruction for instruction, over the real migration fixture — **not**
+  on real Forge transactions. No production transaction has been verified.
+* The Forge creator route credits only Forge's no-distributor mode, the token leg of non-SOL-quoted
+  pools and SOL legs not above the measured half (§4a, limits); everything else is recorded, unpaid.
+* Forge's own MongoDB records (`raydium_postmig_lockfee_claims.harvestTx/distTx`) would name the pair
+  explicitly but are not an existing Last-60 data source and are not used.
 * The `exclusive_window` scan looks at the latest 200 collections of a source; older open claims beyond
   that window are not considered (use memo or same-transaction correlation in production).
 * Bonding-curve creator-fee claims are parsed only for `FEE_BENEFICIARY_ROLE=creator`.
 * The CPMM accrued (pre-share) amount is not observable from a collection transaction; only the net is
   reported.
 * `closeAccount`-based lamport inflows into a destination are not recognised as contributions.
+* `revenue_events` keys are global (signature, instruction, stream, mint): in a database shared by
+  several launches, a transaction relevant to two of them is recorded once; Forge payouts are
+  recorded only under the launch whose token they carry, so this never affects attribution.
 * Funding destinations are indexed like pool addresses (cursor per address, `INDEXER_BACKFILL` applies).
   Prefer a **dedicated** funding wallet: using a wallet with a long unrelated history makes the first
   backfill read that history (outflows and unrelated inflows are ignored, but still fetched).
-* Reconciliation passes are per launch and scan that launch's unlinked inflows / unreconciled claims
-  (bounded to 500 per pass); at very high claim counts consider archiving fully reconciled claims.
+* Reconciliation passes for `last60_destination` inflows are per launch and scan that launch's unlinked
+  inflows / unreconciled claims (bounded to 500 per pass); the Forge creator route uses its own indexed
+  queue (§4a). At very high claim counts consider archiving fully reconciled claims.

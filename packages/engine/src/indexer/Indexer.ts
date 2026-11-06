@@ -20,7 +20,7 @@ import { basesOf, roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
 import { rootLogger, type Logger } from "../util/logger";
-import { revenueRuntimeOf, revenueWatchAddresses } from "../revenue/ingest";
+import { forgeDistributionWatch, revenueRuntimeOf, revenueWatchAddresses } from "../revenue/ingest";
 import { sleep } from "../util/time";
 import { backoffDelay } from "../util/backoff";
 import { cursorId, ingestSignature, readCursor, syncAddress } from "./signatureSync";
@@ -68,9 +68,32 @@ export class Indexer {
     return { db: this.deps.db, provider: this.provider!, terminal: this.terminal, minBuyQuote: this.settings!.minBuyQuote, rpc: this.rpc!, log: this.log, revenue: revenueRuntimeOf(this.deps.cfg) };
   }
 
-  /** Pool watch addresses plus the configured Last-60 funding destinations (funding inflows). */
+  /**
+   * Pool watch addresses plus the configured Last-60 funding destinations (funding inflows) and, after a
+   * verified LaunchLab → CPMM migration, Forge's token account for the launch token (its harvests and
+   * its existing creator payouts — docs/REWARD_FUNDING.md §4).
+   */
   private watchList(): string[] {
-    return [...new Set([...(this.pool?.watchAddresses ?? []), ...revenueWatchAddresses(this.deps.cfg.revenue)])];
+    return [...new Set([...(this.pool?.watchAddresses ?? []), ...revenueWatchAddresses(this.deps.cfg.revenue, this.pool)])];
+  }
+
+  /** Addresses that must be indexed from the migration slot, with that slot. */
+  private fromSlotOf(address: string): number | undefined {
+    const p = this.pool;
+    if (!p) return undefined;
+    return p.watchFromSlot?.[address] ?? forgeDistributionWatch(p, this.deps.cfg.revenue).find((w) => w.address === address)?.fromSlot;
+  }
+
+  /**
+   * Addresses whose indexing coverage the Forge creator-distribution attribution relies on (the
+   * destination pool and Forge's token account for the launch token). A complete pass over them is
+   * anchored at a fresh confirmed slot and records it (`syncedThroughSlot`).
+   */
+  private coverageAddresses(): Set<string> {
+    const p = this.pool;
+    const forge = p ? forgeDistributionWatch(p, this.deps.cfg.revenue) : [];
+    if (!p || !forge.length || !p.destination) return new Set();
+    return new Set([p.destination.pool, ...forge.map((w) => w.address)]);
   }
 
   /** Load settings and provider once (used by tests and by `run`). */
@@ -167,15 +190,20 @@ export class Indexer {
     if (!this.provider || !this.pool || !this.rpc || !this.settings) return 0;
     let total = 0;
     this.backlog = false;
+    const coverage = this.coverageAddresses();
+    // One fresh confirmed slot per pass anchors the coverage of the attribution addresses (a failed
+    // read just skips recording coverage this pass — attribution then waits; it never over-claims).
+    const coverageSlot = coverage.size ? await this.rpc.getSlot("confirmed").catch(() => undefined) : undefined;
     for (const address of this.watchList()) {
       const key = cursorId(this.pool.provider, this.pool.poolAddress, address);
       const existing = await readCursor(this.deps.db, key);
       const isBackfill = !existing;
-      const fromSlot = this.pool.watchFromSlot?.[address];
+      const fromSlot = this.fromSlotOf(address);
+      const cov = coverage.has(address) && coverageSlot !== undefined ? { coverageSlot } : {};
       if (isBackfill && fromSlot !== undefined) {
-        // A verified destination pool: index its whole history from the migration slot (it cannot
-        // have activity before it was created), independent of INDEXER_BACKFILL.
-        const stats = await syncAddress(this.ctx(), address, { cursorKey: key, source: "backfill", cap: this.deps.cfg.indexer.backfillMaxSignatures, concurrency: this.deps.cfg.indexer.fetchConcurrency, bounds: { afterSlot: fromSlot - 1 }, maxPerPass: 400, signal });
+        // A verified destination pool (or Forge's token account for the launch token): index its whole
+        // history from the migration slot (no relevant activity before it), independent of INDEXER_BACKFILL.
+        const stats = await syncAddress(this.ctx(), address, { cursorKey: key, source: "backfill", cap: this.deps.cfg.indexer.backfillMaxSignatures, concurrency: this.deps.cfg.indexer.fetchConcurrency, bounds: { afterSlot: fromSlot - 1 }, maxPerPass: 400, signal, ...cov });
         this.backlog = this.backlog || stats.more;
         total += stats.newSwaps;
         this.metrics.swapsIngested += stats.newSwaps;
@@ -197,6 +225,7 @@ export class Indexer {
         concurrency: this.deps.cfg.indexer.fetchConcurrency,
         maxPerPass: 400,
         signal,
+        ...cov,
       });
       this.backlog = this.backlog || stats.more;
       if (isBackfill && stats.fetched) {

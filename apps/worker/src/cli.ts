@@ -13,7 +13,7 @@
  *   gen-schedule-key           print a new SCHEDULE_ENCRYPTION_KEY
  */
 import { randomBytes } from "node:crypto";
-import { ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, buildRevenueReport, renderRevenueReport, reconcileFunding, revenueRuntimeOf, type ProcessRole } from "@last60/engine";
+import { ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, buildRevenueReport, renderRevenueReport, reconcileFunding, forgeLaunchContextOf, revenueRuntimeOf, type ProcessRole } from "@last60/engine";
 
 const [cmd, ...args] = process.argv.slice(2);
 const print = (v: unknown) => console.log(JSON.stringify(jsonSafe(v), null, 2));
@@ -103,7 +103,8 @@ try {
       const provider = createProvider(providerTargetFor(s, cfg), rpc);
       const info = await provider.load();
       await attachStoredMigration(db, provider);
-      print({ newCredits: await reconcileFunding(db, { sourcePool: info.poolAddress, quoteMint: info.quoteMint, provider: info.provider, tokenMint: info.tokenMint }, revenueRuntimeOf(cfg)!) });
+      const rr = revenueRuntimeOf(cfg)!;
+      print({ newCredits: await reconcileFunding(db, { sourcePool: info.poolAddress, quoteMint: info.quoteMint, provider: info.provider, tokenMint: info.tokenMint, forge: forgeLaunchContextOf(provider, rr) }, rr) });
       break;
     }
     default:

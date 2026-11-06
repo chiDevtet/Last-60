@@ -469,7 +469,7 @@ export class RoundScheduler {
     const provider = this.d.provider();
     const pool = provider.info();
     const settings = await this.d.settings.get();
-    for (const address of [...new Set([...pool.watchAddresses, ...revenueWatchAddresses(this.d.cfg.revenue)])]) {
+    for (const address of [...new Set([...pool.watchAddresses, ...revenueWatchAddresses(this.d.cfg.revenue, pool)])]) {
       const key = cursorId(pool.provider, pool.poolAddress, address);
       const cursor = await readCursor(this.d.db, key);
       // Bounded: from the indexer's cursor if it has one, never further back than the period.

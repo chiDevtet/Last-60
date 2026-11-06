@@ -14,13 +14,21 @@
  * platform NFT wallet). Anything else reaching the destination is not revenue of this launch.
  */
 import type { FlatInstruction, NormalizedTx } from "../chain/tx";
-import { decodeTokenTransfer, subtreeTransfers, tokenAccountInfo } from "../chain/tx";
+import { decodeTokenTransfer, SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID, subtreeTransfers, tokenAccountInfo } from "../chain/tx";
 import { COLLECT_CP_FEES_DISC, RAYDIUM_CP_LOCK_PROGRAM_ID } from "../providers/migration";
 import type { ParsedTransaction } from "../providers/LaunchProvider";
-import { assetOf, NATIVE_SOL, parseFundingMemo, type CollectionStream, type LaunchPhase } from "../accounting/revenueStreams";
+import { assetOf, FORGE_CREATOR_DISTRIBUTION, NATIVE_SOL, parseFundingMemo, type CollectionStream, type FundingRoute, type LaunchPhase } from "../accounting/revenueStreams";
 
 export const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
 export const MEMO_PROGRAM_IDS = new Set(["MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", "Memo1UhkJRfHyvLMcVucJwxXeuD728EQVDDwQDxFMNo"]);
+export const ATA_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+export const COMPUTE_BUDGET_PROGRAM_ID = "ComputeBudget111111111111111111111111111111";
+/**
+ * Programs a Forge creator-distribution transaction may contain. Forgepad's `sendPayouts` builds
+ * System `transfer`s, an idempotent ATA create and an SPL `TransferChecked` (plus the compute budget a
+ * wallet adds). Anything else (an LP harvest, a Jupiter swap, an unknown program) is not that payout.
+ */
+export const FORGE_DISTRIBUTION_PROGRAMS = new Set([SYSTEM_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID, ATA_PROGRAM_ID, COMPUTE_BUDGET_PROGRAM_ID, ...MEMO_PROGRAM_IDS]);
 
 /** Facts about the launch needed to classify revenue (built from the loaded provider and config). */
 export interface RevenueLaunchFacts {
@@ -74,6 +82,8 @@ export interface RevenueDraft {
   destinationOwner: string | null;
   beneficiary: string | null;
   memoClaimSignature: string | null;
+  /** Funding inflows only: how the funds reached Last-60 (null for collections). */
+  route: FundingRoute | null;
   evidence: Record<string, string | number | boolean | null>;
 }
 
@@ -112,7 +122,7 @@ export function extractRevenue(tx: NormalizedTx, parsed: ParsedTransaction, f: R
     const ix = byOrdinal.get(ordinal);
     return { instructionIndex: ix?.topIndex ?? -1, innerInstructionIndex: ix?.innerIndex ?? null, ordinal };
   };
-  const common = (pool: string) => ({ pool, signature: tx.signature, slot: tx.slot, blockTime: tx.blockTime, memoClaimSignature: null as string | null });
+  const common = (pool: string) => ({ pool, signature: tx.signature, slot: tx.slot, blockTime: tx.blockTime, memoClaimSignature: null as string | null, route: null as FundingRoute | null });
 
   // 1. Bonding-curve creator-fee collections (only the configured creator role parses them).
   if (f.role === "creator" && f.creatorClaimVaults.length) {
@@ -216,13 +226,19 @@ export function extractRevenue(tx: NormalizedTx, parsed: ParsedTransaction, f: R
     }
   }
 
-  // 4. Funding inflows into configured Last-60 destinations.
+  // 4. Forge's existing post-migration creator distributions (route forge_creator_distribution).
+  const forge = forgeCreatorDistribution(tx, f);
+  const forgeLegs = new Set(forge.map((x) => x.ordinal));
+  out.push(...forge);
+
+  // 5. Funding inflows into configured Last-60 destinations.
   const destinations = new Set(f.fundingDestinations);
   if (destinations.size) {
     const sources = new Set([f.creator, f.forgePlatformLpBeneficiary, f.destination?.platformNftWallet].filter((x): x is string => !!x));
     const memo = fundingMemoOf(tx);
     const memoSig = memo === "ambiguous" ? null : memo;
     for (const ix of tx.instructions) {
+      if (forgeLegs.has(ix.ordinal)) continue; // already recorded as a Forge creator distribution leg
       const sys = decodeSystemTransfer(ix);
       if (sys) {
         if (!destinations.has(sys.to) || destinations.has(sys.from) || !sources.has(sys.from) || sys.lamports === 0n) continue;
@@ -233,6 +249,7 @@ export function extractRevenue(tx: NormalizedTx, parsed: ParsedTransaction, f: R
           ...common(f.sourcePool),
           ...pos(ix.ordinal),
           memoClaimSignature: memoSig,
+          route: "last60_destination",
           feeMint: NATIVE_SOL,
           asset: assetOf(NATIVE_SOL),
           decimals: 9,
@@ -264,6 +281,7 @@ export function extractRevenue(tx: NormalizedTx, parsed: ParsedTransaction, f: R
         ...common(f.sourcePool),
         ...pos(ix.ordinal),
         memoClaimSignature: memoSig,
+        route: "last60_destination",
         feeMint: dst.mint,
         asset: assetOf(dst.mint),
         decimals: decimalsOf(tx, t.destination),
@@ -279,4 +297,121 @@ export function extractRevenue(tx: NormalizedTx, parsed: ParsedTransaction, f: R
     }
   }
   return out;
+}
+
+/**
+ * Forge's EXISTING post-migration creator payout (Forgepad `scripts/Raypostmigration.js`,
+ * `sendPayouts`, on `new-ui` @ 5acce50), observed as is — Last-60 requires no Forgepad change:
+ *
+ *   harvest tx  : LP-lock `collect_cp_fees` on the platform Fee Key → fees into the Forge wallet
+ *                 (token leg into its associated token account; WSOL leg unwrapped to native SOL);
+ *   payout tx   : a SEPARATE transaction, fee payer and signer = the Forge wallet, no memo:
+ *                   System transfer        Forge → creator   ⌊SOL basis × 50 %⌋   (no rewards distributor)
+ *                   ATA create (idempotent) + TransferChecked Forge → creator, launch token, ⌊token leg × 50 %⌋
+ *                 With a Forge rewards distributor the same transaction also pays the distributor and
+ *                 the creator gets 25 % — not the approved model; recorded, never credited.
+ *
+ * A transaction is a candidate when the Forge wallet pays the launch creator, or pays THIS launch's
+ * token to anyone in a transfer-only transaction. Every Forge outflow of a candidate is recorded as a
+ * leg (route forge_creator_distribution); the shape is checked here and the result stored as evidence:
+ * fee payer, programs, one transfer per asset, every outflow to the creator, no foreign mint, and the
+ * anchor (a leg in this launch's token mint — the launch identity). Attribution to a harvest happens
+ * in revenue/ingest.ts (never by amount).
+ */
+export function forgeCreatorDistribution(tx: NormalizedTx, f: RevenueLaunchFacts): RevenueDraft[] {
+  const W = f.forgePlatformLpBeneficiary;
+  const C = f.creator;
+  const d = f.destination;
+  if (tx.err || !W || !C || C === W || !d || d.kind !== "launchlab_cpmm" || tx.slot <= d.migrationSlot) return [];
+  type Leg = { ordinal: number; mint: string; to: string | null; toAccount: string; fromAccount: string; amount: bigint; decimals: number | null; program: string; mintMismatch: boolean };
+  const legs: Leg[] = [];
+  const topProgram = new Map(tx.instructions.filter((ix) => ix.innerIndex === null).map((ix) => [ix.topIndex, ix.programId]));
+  for (const ix of tx.instructions) {
+    const sys = decodeSystemTransfer(ix);
+    // The ATA program tops up rent with an inner System transfer when the address was pre-funded:
+    // account creation, not a payout.
+    if (sys && ix.innerIndex !== null && topProgram.get(ix.topIndex) === ATA_PROGRAM_ID) continue;
+    if (sys) {
+      if (sys.from === W && sys.to !== W && sys.lamports > 0n) legs.push({ ordinal: ix.ordinal, mint: NATIVE_SOL, to: sys.to, toAccount: sys.to, fromAccount: sys.from, amount: sys.lamports, decimals: 9, program: "system", mintMismatch: false });
+      continue;
+    }
+    const t = decodeTokenTransfer(ix);
+    if (!t || t.amount === 0n) continue;
+    const src = tokenAccountInfo(tx, t.source);
+    if ((src?.owner ?? t.authority) !== W) continue;
+    const dst = tokenAccountInfo(tx, t.destination);
+    if (dst?.owner === W) continue; // internal move between Forge's own accounts
+    const mint = dst?.mint ?? src?.mint ?? t.mint;
+    if (!mint) continue;
+    legs.push({ ordinal: ix.ordinal, mint, to: dst?.owner ?? null, toAccount: t.destination, fromAccount: t.source, amount: t.amount, decimals: decimalsOf(tx, t.destination), program: t.program === SPL_TOKEN_2022_PROGRAM_ID ? "token-2022" : "token", mintMismatch: !!t.mint && (t.mint !== mint || (!!src && src.mint !== mint)) });
+  }
+  const programs = [...new Set(tx.instructions.map((ix) => ix.programId))];
+  const transferOnly = programs.every((p) => FORGE_DISTRIBUTION_PROGRAMS.has(p));
+  const toCreator = legs.filter((l) => l.to === C);
+  const anchorLegs = toCreator.filter((l) => l.mint === f.tokenMint);
+  // Transfers into a configured Last-60 funding destination keep their own route (PR #6 / #7: same
+  // transaction or memo); they still count as non-creator outflows for the shape of this transaction.
+  const destinations = new Set(f.fundingDestinations);
+  // (A leg to the launch creator always takes this route, even if the creator wallet is also listed
+  // as a funding destination: this route tries the same-transaction / memo evidence first.)
+  const recorded = legs.filter((l) => l.to === C || !(l.to && destinations.has(l.to)));
+  const candidate = toCreator.length > 0 || (transferOnly && recorded.some((l) => l.mint === f.tokenMint));
+  if (!candidate) return [];
+  // A payout that carries ANOTHER token (and not this launch's) belongs to that launch — e.g. the same
+  // creator's other Forge launch. It is that launch's revenue (recorded by its own indexer, if Last-60
+  // indexes it), never this launch's: not recorded here, so it can never be attributed here.
+  if (!anchorLegs.length && toCreator.some((l) => l.mint !== NATIVE_SOL && l.mint !== f.tokenMint)) return [];
+  const problems: string[] = [];
+  if (tx.feePayer !== W) problems.push(`fee_payer_not_forge_platform_wallet: ${tx.feePayer}`);
+  if (d.platformNftWallet && d.platformNftWallet !== W) problems.push(`forge_wallet_${W}_is_not_the_platform_nft_wallet_${d.platformNftWallet}`);
+  if (!transferOnly) problems.push(`unexpected_programs: ${programs.filter((p) => !FORGE_DISTRIBUTION_PROGRAMS.has(p)).join(",")}`);
+  const others = [...new Set(legs.filter((l) => l.to !== C).map((l) => l.to ?? `unknown-owner:${l.toAccount}`))];
+  if (others.length) problems.push(`forge_outflow_to_non_creator: ${others.join(",")} (not the approved creator-50 % payout, e.g. Forge's rewards-distributor 25/50/25 split)`);
+  const foreign = [...new Set(toCreator.filter((l) => l.mint !== NATIVE_SOL && l.mint !== f.tokenMint).map((l) => l.mint))];
+  if (foreign.length) problems.push(`foreign_mint_leg: ${foreign.join(",")} (not this launch's token)`);
+  const perAsset = new Map<string, number>();
+  for (const l of toCreator) perAsset.set(assetOf(l.mint), (perAsset.get(assetOf(l.mint)) ?? 0) + 1);
+  const dupAssets = [...perAsset].filter(([, n]) => n > 1).map(([a]) => a);
+  if (dupAssets.length) problems.push(`multiple_transfers_in_one_asset: ${dupAssets.join(",")}`);
+  if (legs.some((l) => l.mintMismatch)) problems.push("transfer_checked_mint_mismatch");
+  if (!anchorLegs.length) problems.push(`no_launch_anchor: no ${f.tokenMint} leg from the Forge wallet to the creator (a SOL transfer alone never identifies the launch)`);
+  const memo = fundingMemoOf(tx);
+  if (memo === "ambiguous") problems.push("multiple_distinct_last60_memos");
+  return recorded.map((l) => ({
+    kind: "funding_inflow" as const,
+    stream: "last60_funding_inflow" as const,
+    launchPhase: null,
+    pool: f.sourcePool,
+    signature: tx.signature,
+    slot: tx.slot,
+    blockTime: tx.blockTime,
+    instructionIndex: tx.instructions.find((ix) => ix.ordinal === l.ordinal)?.topIndex ?? -1,
+    innerInstructionIndex: tx.instructions.find((ix) => ix.ordinal === l.ordinal)?.innerIndex ?? null,
+    ordinal: l.ordinal,
+    feeMint: l.mint,
+    asset: assetOf(l.mint),
+    decimals: l.decimals,
+    grossAmount: l.amount,
+    netAmount: l.amount,
+    sourceAccount: l.fromAccount,
+    destinationAccount: l.toAccount,
+    sourceOwner: W,
+    destinationOwner: l.to,
+    beneficiary: l.to,
+    memoClaimSignature: memo === "ambiguous" ? null : memo,
+    route: FORGE_CREATOR_DISTRIBUTION,
+    evidence: {
+      program: l.program,
+      route: FORGE_CREATOR_DISTRIBUTION,
+      // A leg of THIS launch's token from Forge to the creator: evidence of a Forge post-migration
+      // payout of this launch (also when other shape problems make it unpayable).
+      anchored: anchorLegs.length > 0,
+      anchorMint: f.tokenMint,
+      toCreator: l.to === C,
+      feePayer: tx.feePayer,
+      legs: legs.length,
+      problems: problems.join(" | ") || null,
+      memo: memo === "ambiguous" ? "ambiguous" : memo,
+    },
+  }));
 }

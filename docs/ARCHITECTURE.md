@@ -224,6 +224,13 @@ See `docs/FEE_ACCOUNTING.md` for the full ledger specification. Summary:
   correlated to claims (same transaction, `last60:v1:` memo, or opt-in exclusive window), producing
   one `reward_funding` credit per inflow and derived `revenue_reconciliations` per claim. Seven
   streams are reported separately; only the two Last-60 contributions can fund rounds.
+* **Forge's existing creator distribution (PR #8):** after a verified LaunchLab → CPMM migration the
+  indexer also watches Forge's associated token account for the launch token (from the migration
+  slot) and records, for the destination pool and that account, `syncedThroughSlot` after each
+  complete poll pass anchored at a fresh confirmed slot. Forge's memo-less payouts to the launch
+  creator are decoded as `forge_creator_distribution` legs, queued in `funding_attributions`, and
+  attributed by `attributeForgeDistribution` (anchor mint, indexing coverage, single latest harvest,
+  no competing payout, previous harvest paid, per-mint bounds) — or left `unresolved`, never payable.
 
 ## 8. Privacy of scheduling information
 
