@@ -54,7 +54,7 @@ export class CpmmDestination implements DestinationAdapter {
     /** Basis of the CPMM creator-fee entitlement (pool_creator == beneficiary). */
     readonly allocation: AllocationBasis,
     /** Basis of the locked-LP entitlement (creator_scale lock). */
-    private readonly lpAllocation: AllocationBasis,
+    readonly lpAllocation: AllocationBasis,
   ) {}
 
   get migrationSlot() {

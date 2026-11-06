@@ -10,6 +10,7 @@ import { PublicKey, TransactionInstruction, type PublicKey as PK } from "@solana
 import { WSOL_MINT } from "@last60/shared";
 import type { NormalizedTx } from "../../chain/tx";
 import type { ClaimPlan, FeeSourceState, LaunchProvider, ParsedTransaction, PoolInfo } from "../LaunchProvider";
+import { makeBasis } from "../../accounting/attribution";
 
 export const MOCK_PROGRAM_ID = new PublicKey(Buffer.alloc(32, 0x4d)).toBase58();
 export const MOCK_POOL = new PublicKey(Buffer.alloc(32, 0x50)).toBase58();
@@ -52,6 +53,9 @@ export class MockProvider implements LaunchProvider {
       accounts: {},
       watchAddresses: [poolAddress],
       slot: 0,
+      // Synthetic allocation, "verified" by construction: the mock's instruction data IS the
+      // declaration (local testing only; the mock provider is refused outside local clusters).
+      allocation: makeBasis({ provider: "mock", pool: poolAddress, phase: "bonding_curve", role: "creator", beneficiary: opts.beneficiary ?? MOCK_CREATOR, params: { eligibleFee: "instruction data" }, source: "mock instruction data", verification: "verified", problems: [] }),
     };
   }
 

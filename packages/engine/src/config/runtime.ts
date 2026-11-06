@@ -108,6 +108,7 @@ export function resolveSettings(cfg: AppConfig, overrides: RuntimeOverrides, ver
 export function validateEffective(cfg: AppConfig, s: EffectiveSettings): string[] {
   const p: string[] = [];
   if (s.launchProvider !== "mock" && (!s.tokenMint || !s.poolAddress)) p.push("tokenMint and poolAddress are required for this provider");
+  if (s.launchProvider === "mock" && cfg.solana.cluster === "mainnet-beta") p.push("the mock provider (synthetic data) is refused on mainnet-beta");
   if (s.launchProvider === "meteora_dbc" && s.feeBeneficiaryRole === "platform") p.push('Meteora DBC supports roles "creator" or "partner"');
   if (s.launchProvider === "raydium_launchlab" && s.feeBeneficiaryRole === "partner") p.push('Raydium LaunchLab supports roles "creator" or "platform"');
   if (s.payoutMode === "live" && cfg.solana.cluster === "mainnet-beta" && !cfg.payout.allowMainnet) p.push("live payouts on mainnet-beta require ALLOW_MAINNET_PAYOUTS=true in the environment");
@@ -171,8 +172,10 @@ export class SettingsStore {
     const effective = resolveSettings(this.cfg, parsed.data, current.version + 1);
     const problems = validateEffective(this.cfg, effective);
     const before = resolveSettings(this.cfg, RuntimeOverridesSchema.safeParse(current.overrides).data ?? {}, current.version);
-    if (effective.feeBeneficiaryRole !== before.feeBeneficiaryRole) {
-      const blocked = await roleChangeBlockReason(this.db, effective.poolAddress, effective.feeBeneficiaryRole);
+    // U1: any change of who/what fees are attributed to — role, pool or provider — is checked against
+    // the target pool's history in BOTH collections (swaps and non-swap fee attributions).
+    if (effective.feeBeneficiaryRole !== before.feeBeneficiaryRole || effective.poolAddress !== before.poolAddress || effective.launchProvider !== before.launchProvider) {
+      const blocked = await roleChangeBlockReason(this.db, effective.poolAddress, effective.feeBeneficiaryRole, { provider: effective.launchProvider });
       if (blocked) problems.push(`feeBeneficiaryRole: ${blocked}`);
     }
     if (problems.length) throw new SettingsValidationError(problems);

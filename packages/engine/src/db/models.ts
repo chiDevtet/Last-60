@@ -133,6 +133,26 @@ swapSchema.index({ pool: 1, status: 1, slot: 1 });
 swapSchema.index({ trader: 1, slot: -1 });
 swapSchema.index({ commitment: 1, status: 1, slot: 1 });
 swapSchema.index({ pool: 1, basisId: 1 });
+swapSchema.index({ sourcePool: 1, slot: 1 });
+
+/**
+ * Fee records are append-only for everything that decided their accounting: amounts, eligibility,
+ * status and the allocation basis. Only bookkeeping fields (round assignment, finality / drop state,
+ * block position) may change after insert. Inserts go through `$setOnInsert` upserts, which these
+ * guards allow; any `$set` / `$unset` / `$inc` of a protected field throws.
+ */
+function guardImmutable(schema: Schema, protectedFields: string[]) {
+  const isProtected = (k: string) => protectedFields.some((f) => k === f || k.startsWith(`${f}.`));
+  const check = function (this: any) {
+    const u = this.getUpdate?.() ?? {};
+    for (const op of ["$set", "$unset", "$inc", "$rename", "$push", "$pull", "$min", "$max", "$mul"]) {
+      for (const k of Object.keys(u[op] ?? {})) if (isProtected(k)) throw new Error(`immutable fee record field "${k}" cannot be updated (${op})`);
+    }
+    for (const k of Object.keys(u)) if (!k.startsWith("$") && isProtected(k)) throw new Error(`immutable fee record field "${k}" cannot be replaced`);
+  };
+  for (const hook of ["updateOne", "updateMany", "findOneAndUpdate", "replaceOne"] as const) schema.pre(hook, check);
+}
+guardImmutable(swapSchema, ["basis", "basisId", "eligibleFee", "eligibleFeeMint", "totalFee", "excludedFee", "excludedReason", "feeStatus", "payoutEligible", "feePhase", "beneficiary", "pool", "sourcePool", "provider", "estimatedCreatorFee", "evidence"]);
 
 // ─── fee claims ─────────────────────────────────────────────────────────────────
 const feeClaimSchema = new Schema(
@@ -189,6 +209,12 @@ const feeAttributionSchema = new Schema(
     status: { type: String, enum: FEE_STATUSES, required: true },
     payoutEligible: { type: Boolean, required: true },
     basisId: { type: String, default: null },
+    /**
+     * Immutable allocation-basis snapshot (accounting/attribution.ts `AllocationSnapshot`): provider,
+     * source/destination pool, phase, role, beneficiary, on-chain parameters, source accounts,
+     * verification and problems. Written once at insert; never rewritten. Null on legacy records.
+     */
+    basis: { type: Schema.Types.Mixed, default: null },
     /** Cumulative counter value for checkpoint records (position fee growth), as a decimal string. */
     cumulative: { type: String, default: null },
     checkpointKey: { type: String, default: null },
@@ -198,7 +224,9 @@ const feeAttributionSchema = new Schema(
   { collection: "fee_attributions", versionKey: false },
 );
 feeAttributionSchema.index({ pool: 1, slot: 1 });
+feeAttributionSchema.index({ sourcePool: 1, slot: 1 });
 feeAttributionSchema.index({ checkpointKey: 1, slot: -1 });
+guardImmutable(feeAttributionSchema, ["basis", "basisId", "creatorAmount", "excludedAmount", "grossAmount", "excludedReason", "status", "payoutEligible", "phase", "beneficiary", "pool", "sourcePool", "destinationPool", "provider", "feeMint", "kind", "cumulative", "evidence"]);
 
 // ─── unique buyer activity ──────────────────────────────────────────────────────
 const buyerActivitySchema = new Schema(

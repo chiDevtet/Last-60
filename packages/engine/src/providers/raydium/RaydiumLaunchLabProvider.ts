@@ -15,9 +15,10 @@
  *     the token transfers OUT OF the fee vault executed by that claim instruction (instruction-scoped,
  *     so a trade or a second claim in the same transaction is never mixed in).
  *   - `creator_fee_rate` (PlatformConfig, millionths) is a FEE RATE on the trade value that is added
- *     to the total fee rate — e.g. 5000 = 0.5% of the trade — not a percentage of the other fees.
- *     The program charges total_fee = ceil(amount × Σrates / 1e6) and splits it pro rata to the
- *     rates; TradeEvent.creator_fee is that exact split (Raydium SDK curve.ts splitFee).
+ *     to the total fee rate — e.g. 5000 = 0.5% of the trade (the program's MAX_CREATOR_FEE_RATE) —
+ *     not a percentage of the other fees. The program charges total_fee = ceil(amount × Σrates / 1e6)
+ *     and splits it pro rata to the rates (protocol takes the rounding remainder); TradeEvent.creator_fee
+ *     is that exact split — see `launchLabFeeSplit`, reproduced bit-exactly on a mainnet trade.
  *   - At migration the LP is distributed by `platform_scale` / `creator_scale` / `burn_scale`
  *     (millionths); the platform's and creator's parts are locked in the Raydium LP-lock program and
  *     their LP fees are paid to the holder of the corresponding fee-key NFT.
@@ -63,6 +64,38 @@ const CLAIM_CREATOR_IX = instructionDiscriminator("claim_creator_fee");
 const CLAIM_PLATFORM_VAULT_IX = instructionDiscriminator("claim_platform_fee_from_vault");
 export const POOL_STATE_DISC = Buffer.from([247, 237, 227, 245, 215, 195, 222, 70]);
 export const PLATFORM_CONFIG_DISC = Buffer.from([160, 78, 128, 0, 248, 83, 230, 160]);
+
+/** LaunchLab fee-rate denominator (GlobalConfig / PlatformConfig rates are millionths of trade value). */
+export const LAUNCHLAB_RATE_DENOMINATOR = 1_000_000n;
+
+/**
+ * The LaunchLab program's fee split, as published in the Raydium SDK (curve.ts `calculateFee` +
+ * `splitFee`) and reproduced exactly by mainnet TradeEvents (test/attribution.test.ts):
+ *
+ *   Σ           = protocol_rate (GlobalConfig.trade_fee_rate) + platform_rate (PlatformConfig.fee_rate)
+ *                 + creator_rate (PlatformConfig.creator_fee_rate) + share_rate (instruction argument)
+ *   total_fee   = ceil(amount × Σ / 1 000 000)          (buy: quote in; sell: gross quote out)
+ *   platform_fee = floor(total_fee × platform_rate / Σ)
+ *   share_fee    = floor(total_fee × share_rate / Σ)
+ *   creator_fee  = floor(total_fee × creator_rate / Σ)
+ *   protocol_fee = total_fee − platform − share − creator   (receives the rounding remainder)
+ *
+ * So `creator_fee_rate = 5000` is ≈ 0.5% OF TRADE VALUE (the program maximum, MAX_CREATOR_FEE_RATE),
+ * not 0.5% of the other fees. Accounting never uses this function: the per-trade TradeEvent.creator_fee
+ * (cross-checked against the creator-vault transfer) is the source of truth. It exists to verify
+ * the semantics.
+ */
+export function launchLabFeeSplit(amount: bigint, rates: { protocol: bigint; platform: bigint; creator: bigint; share?: bigint }) {
+  const share = rates.share ?? 0n;
+  const sum = rates.protocol + rates.platform + rates.creator + share;
+  if (sum > LAUNCHLAB_RATE_DENOMINATOR) throw new Error("total fee rate exceeds 1 000 000");
+  const total = (amount * sum + LAUNCHLAB_RATE_DENOMINATOR - 1n) / LAUNCHLAB_RATE_DENOMINATOR;
+  const part = (r: bigint) => (sum === 0n ? 0n : (total * r) / sum);
+  const platformFee = part(rates.platform);
+  const shareFee = part(share);
+  const creatorFee = part(rates.creator);
+  return { total, platformFee, shareFee, creatorFee, protocolFee: total - platformFee - shareFee - creatorFee };
+}
 
 export function creatorFeeVault(creator: PublicKey, quoteMint: PublicKey): PublicKey {
   return PublicKey.findProgramAddressSync([creator.toBuffer(), quoteMint.toBuffer()], PROGRAM)[0];
@@ -124,9 +157,11 @@ export interface LaunchLabPlatformConfig {
 }
 
 /**
- * Byte offsets follow the Raydium SDK `PlatformConfig` layout (verified on a mainnet account:
- * fee_rate 7500, creator_fee_rate 5000, platform_scale 1 000 000, cp_config = the CPMM config used
- * by that platform's migrations).
+ * Byte offsets follow the Raydium SDK `PlatformConfig` layout. Verified on the mainnet account in
+ * test/fixtures/mainnet/launchlab-accounts.json (4Bu96XjU…): fee_rate 7500, creator_fee_rate 500
+ * (0.05% of trade value), platform_scale 0, creator_scale 100 000, burn_scale 900 000, cp_config =
+ * the CPMM config used by that platform's migrations. (An earlier comment here said
+ * creator_fee_rate 5000 / platform_scale 1 000 000; that does not match the fixture.)
  */
 export function decodeLaunchLabPlatformConfig(data: Buffer): LaunchLabPlatformConfig {
   if (!data.subarray(0, 8).equals(PLATFORM_CONFIG_DISC)) throw new ProviderValidationError("account is not a LaunchLab PlatformConfig");
@@ -187,7 +222,10 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
     const warnings: string[] = creatorRole && platform.creatorFeeRate === 0n ? ["this LaunchLab platform's creator_fee_rate is 0: the creator earns no bonding-curve fees"] : !creatorRole && platform.feeRate === 0n ? ["this LaunchLab platform's fee_rate is 0: the platform earns no bonding-curve fees"] : [];
     for (const p of check.problems) warnings.push(`ALLOCATION MISMATCH: ${p}; bonding-curve fees are recorded but NOT eligible for payout`);
     for (const p of lpCheck.problems) warnings.push(`ALLOCATION MISMATCH: ${p}; migrated LP fees will NOT be eligible for payout`);
-    if (creatorRole && check.verification === "not_declared") warnings.push("creator fee rate not declared (EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE); the on-chain value is used as read");
+    if (creatorRole && check.verification === "not_declared") warnings.push("NOT DECLARED: creator fee rate (EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE) — fees are recorded with the on-chain value but are NOT distributed until it is declared and verified");
+    if (creatorRole && lpCheck.verification === "not_declared") warnings.push("NOT DECLARED: creator LP scale (EXPECTED_LAUNCHLAB_CREATOR_LP_SCALE) — migrated LP fees will be recorded but NOT distributed until declared and verified");
+    if (creatorRole && (platform.creatorScale ?? 0n) > 0n) warnings.push(`creator_scale is ${platform.creatorScale} on this PlatformConfig, but since the 2026-08-17 LaunchLab upgrade migrations assign creator_scale to the platform's Fee Key: the creator receives a migrated-LP Fee Key only if the migration transaction actually mints one`);
+    if (!creatorRole) warnings.push('the "platform" role has no declarable allocation: its fees are recorded but never distributed');
     if (creatorRole) warnings.push("the creator fee vault is shared by every pool of this creator and quote mint: other pools' deposits are tracked and excluded, never attributed to this pool");
     this.cached = {
       provider: this.id,
@@ -298,7 +336,8 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
               evidence: { vault, otherPool: evPool, instruction: parent.ordinal, event: "TradeEvent" },
               status: "observed",
               payoutEligible: false,
-              basisId: null,
+              // The basis of the vault this inflow was excluded from (its snapshot explains why).
+              basisId: basis.id,
             });
           }
         }

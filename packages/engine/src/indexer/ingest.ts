@@ -8,7 +8,7 @@ import type { Models } from "../db/models";
 import { dec } from "../db/decimal";
 import { normalizeTransaction } from "../chain/tx";
 import type { LaunchProvider } from "../providers/LaunchProvider";
-import type { NormalizedAttribution } from "../accounting/attribution";
+import { basesOf, snapshotOf, type AllocationSnapshot, type NormalizedAttribution } from "../accounting/attribution";
 import type { TerminalWriter } from "../terminal/terminal";
 import { rootLogger, type Logger } from "../util/logger";
 
@@ -29,21 +29,35 @@ export interface IngestResult {
   anomalies: string[];
 }
 
-/** Snapshot of the allocation basis stored with each fee record (bounded, no secrets). */
-function basisSnapshot(info: ReturnType<LaunchProvider["info"]>, s: { feePhase?: string; basisId?: string | null }) {
-  const b = s.feePhase && s.feePhase !== "bonding_curve" ? info.destination?.allocation : info.allocation;
-  if (!b) return { role: info.feeBeneficiaryRole, beneficiary: info.beneficiary, params: info.feeParams };
-  return { id: b.id, phase: b.phase, role: b.role, beneficiary: b.beneficiary, params: b.params, source: b.source, verification: b.verification };
+type BasisSource = Pick<ReturnType<LaunchProvider["info"]>, "allocation" | "destination" | "poolAddress">;
+
+/** Reason recorded when a record names a basis the loaded provider cannot produce (fail closed). */
+export const SNAPSHOT_UNAVAILABLE = "allocation_basis_snapshot_unavailable";
+
+/**
+ * The immutable allocation snapshot of a fee record: the full basis it was attributed under,
+ * resolved from the loaded provider's bases by id. Null when the record names no basis or a basis
+ * the provider does not have — such a record is stored as not payout-eligible.
+ */
+export function snapshotFor(info: BasisSource, basisId: string | null | undefined): AllocationSnapshot | null {
+  if (!basisId) return null;
+  const b = basesOf(info).get(basisId);
+  return b ? snapshotOf(b, info.poolAddress) : null;
 }
 
 /**
  * Idempotently persist non-swap fee records (keyed). Existing records are never rewritten: the
- * first observation wins, so re-processing cannot double count or reinterpret history.
+ * first observation wins, so re-processing cannot double count or reinterpret history. Each new
+ * record stores the immutable snapshot of the basis it was attributed under (`info` supplies the
+ * bases); a record whose basis cannot be resolved is stored but never payable.
  */
-export async function persistAttributions(db: Models, records: NormalizedAttribution[], extra: Record<string, unknown> = {}): Promise<number> {
+export async function persistAttributions(db: Models, records: NormalizedAttribution[], info: BasisSource | null, extra: Record<string, unknown> = {}): Promise<number> {
   if (!records.length) return 0;
   const res = await db.FeeAttribution.bulkWrite(
-    records.map((a) => ({
+    records.map((a) => {
+      const basis = info ? snapshotFor(info, a.basisId) : null;
+      const missing = !basis && a.payoutEligible;
+      return {
       updateOne: {
         filter: { key: a.key },
         update: {
@@ -60,15 +74,16 @@ export async function persistAttributions(db: Models, records: NormalizedAttribu
             grossAmount: a.grossAmount === null ? null : dec(a.grossAmount),
             creatorAmount: dec(a.creatorAmount),
             excludedAmount: dec(a.excludedAmount),
-            excludedReason: a.excludedReason,
+            excludedReason: missing ? SNAPSHOT_UNAVAILABLE : a.excludedReason,
             signature: a.signature,
             slot: a.slot,
             observedSlot: a.observedSlot ?? null,
             blockTime: a.blockTime ? new Date(a.blockTime * 1000) : null,
             evidence: a.evidence,
-            status: a.status,
-            payoutEligible: a.payoutEligible,
+            status: missing ? "unresolved" : a.status,
+            payoutEligible: a.payoutEligible && !missing,
             basisId: a.basisId,
+            basis,
             cumulative: (a.evidence?.cumulative as string | undefined) ?? null,
             checkpointKey: (a.evidence?.checkpointKey as string | undefined) ?? null,
             createdAt: new Date(),
@@ -77,7 +92,8 @@ export async function persistAttributions(db: Models, records: NormalizedAttribu
         },
         upsert: true,
       },
-    })),
+    };
+    }),
     { ordered: false },
   );
   return res.upsertedCount ?? 0;
@@ -95,7 +111,13 @@ export async function ingestRawTransaction(ctx: IngestContext, raw: any, opts: {
   const blockTime = tx.blockTime ? new Date(tx.blockTime * 1000) : null;
 
   if (parsed.swaps.length) {
-    const ops = parsed.swaps.map((s) => ({
+    const ops = parsed.swaps.map((s) => {
+      const basisId = s.basisId ?? info.allocation?.id ?? null;
+      const basis = snapshotFor(info, basisId);
+      // A swap whose basis cannot be resolved is recorded (buyer tracking still works) but its fee
+      // is never payable: without the basis there is no evidence of why it would be the creator's.
+      const missing = !basis && (s.payoutEligible ?? true) && s.eligibleFee > 0n;
+      return {
       updateOne: {
         filter: { signature: s.signature, eventIndex: s.eventIndex },
         update: {
@@ -119,11 +141,11 @@ export async function ingestRawTransaction(ctx: IngestContext, raw: any, opts: {
             // never reinterpret a historical record.
             feePhase: s.feePhase ?? "bonding_curve",
             excludedFee: dec(s.excludedFee ?? s.totalFee - s.eligibleFee),
-            excludedReason: s.excludedReason ?? null,
-            feeStatus: s.feeStatus ?? "observed",
-            payoutEligible: s.payoutEligible ?? true,
-            basisId: s.basisId ?? info.allocation?.id ?? null,
-            basis: basisSnapshot(info, s),
+            excludedReason: missing ? SNAPSHOT_UNAVAILABLE : (s.excludedReason ?? null),
+            feeStatus: missing ? "unresolved" : (s.feeStatus ?? "observed"),
+            payoutEligible: missing ? false : (s.payoutEligible ?? true),
+            basisId,
+            basis,
             beneficiary: info.beneficiary,
             evidence: s.evidence ?? null,
             estimatedCreatorFee: s.estimatedCreatorFee != null ? dec(s.estimatedCreatorFee) : null,
@@ -139,7 +161,8 @@ export async function ingestRawTransaction(ctx: IngestContext, raw: any, opts: {
         },
         upsert: true,
       },
-    }));
+    };
+    });
     const res = await ctx.db.Swap.bulkWrite(ops, { ordered: false });
     const inserted = new Set(Object.keys(res.upsertedIds ?? {}).map(Number));
     result.newSwaps = inserted.size;
@@ -202,7 +225,7 @@ export async function ingestRawTransaction(ctx: IngestContext, raw: any, opts: {
   }
 
   if (parsed.attributions?.length) {
-    result.newAttributions = await persistAttributions(ctx.db, parsed.attributions);
+    result.newAttributions = await persistAttributions(ctx.db, parsed.attributions, info);
   }
 
   if (parsed.anomalies.length) {

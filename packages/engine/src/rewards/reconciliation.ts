@@ -173,7 +173,8 @@ export class Reconciler {
     for (const r of rounds.slice(0, 50)) {
       if (r.snapshotSlot == null || !r.config?.pool || !r.config?.payoutMint) continue;
       const pool = r.config.pools?.length ? r.config.pools : r.config.previousPool ? [r.config.previousPool, r.config.pool] : r.config.pool;
-      const now = await periodFees(this.d.db, { pool, afterSlot: r.prevSnapshotSlot ?? null, periodStartAt: r.periodStartAt ?? null, snapshotSlot: r.snapshotSlot }, r.config.payoutMint);
+      // Same distributable-basis set as the round used (rounds written before it was stored: none).
+      const now = await periodFees(this.d.db, { pool, afterSlot: r.prevSnapshotSlot ?? null, periodStartAt: r.periodStartAt ?? null, snapshotSlot: r.snapshotSlot }, r.config.payoutMint, { verifiedBasisIds: r.feeBreakdown?.verifiedBasisIds ?? [] });
       if (now.payout !== big(r.fees)) problems.push(`round #${r.roundNumber}: period fees are now ${now.payout} but ${big(r.fees)} were distributed (${now.payout > big(r.fees) ? "transactions ingested after the snapshot" : "counted transactions later dropped"})`);
     }
     const status = problems.length ? "mismatch" : "ok";

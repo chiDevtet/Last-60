@@ -13,3 +13,6 @@ coverage/
 secrets/
 *.keypair.json
 apps/web/next-env.d.ts
+
+# CI / local MongoDB binary cache
+.cache/

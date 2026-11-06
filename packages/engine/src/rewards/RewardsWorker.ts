@@ -8,7 +8,7 @@ import type { EffectiveSettings, SettingsStore } from "../config/runtime";
 import { RpcClient, type ChainRpc } from "../chain/rpc";
 import type { Models } from "../db/models";
 import { attachStoredMigration, createProvider, type LaunchProvider } from "../providers";
-import { roleChangeBlockReason } from "../accounting/attribution";
+import { basesOf, roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
 import { rootLogger, type Logger } from "../util/logger";
@@ -86,10 +86,11 @@ export class RewardsWorker {
     }
     if (this.rpc instanceof RpcClient) this.rpc.setUrls(s.rpcUrls);
     const p = createProvider({ id: s.launchProvider, poolAddress: s.poolAddress, tokenMint: s.tokenMint, role: s.feeBeneficiaryRole, payoutMint: s.payoutAssetMint, expected: this.d.cfg.provider.expected }, this.rpc);
-    const info = await p.load();
-    const blocked = await roleChangeBlockReason(this.d.db, info.poolAddress, info.feeBeneficiaryRole);
-    if (blocked) throw new Error(blocked);
+    await p.load();
     await attachStoredMigration(this.d.db, p);
+    const info = p.info();
+    const blocked = await roleChangeBlockReason(this.d.db, info.poolAddress, info.feeBeneficiaryRole, { provider: info.provider, beneficiary: info.beneficiary, currentBasisIds: new Set(basesOf(info).keys()) });
+    if (blocked) throw new Error(blocked);
     this.lastAttachCheck = this.clock.now();
     this.provider = p;
     this.providerKey = key;

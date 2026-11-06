@@ -70,17 +70,28 @@ export function destinationSpec(info: PoolInfo, v: VerifiedMigration, lpCheck: {
       phase: "post_migration_trading",
       params: { cpmmPoolCreator: v.cpmmPoolCreator ?? "?", enableCreatorFee: v.cpmmEnableCreatorFee ?? false, creatorFeeRate: v.cpmmConfig?.creatorFeeRate ?? "?", creatorFeeShareRate: v.cpmmConfig?.creatorFeeShareRate ?? "?", creatorFeeIsBeneficiary },
       source: `CPMM pool ${v.destinationPool} pool_creator / enable_creator_fee; AmmConfig ${v.destinationConfig}`,
-      verification: "not_declared",
-      problems: [],
+      // There is no separate operator declaration for the CPMM creator fee: it is the continuation of
+      // the LaunchLab creator allocation. It is "verified" only when (a) the pool facts prove the
+      // beneficiary is the CPMM pool_creator with the creator fee enabled AND (b) the bonding-curve
+      // allocation itself was verified against the declaration. Otherwise it is never distributable.
+      verification: !creatorFeeIsBeneficiary ? "unverifiable" : (info.allocation?.verification ?? "not_declared"),
+      problems: !creatorFeeIsBeneficiary ? [`CPMM pool_creator ${v.cpmmPoolCreator ?? "?"} is not the beneficiary ${info.beneficiary} or the creator fee is disabled`] : [...(info.allocation?.problems ?? [])],
     });
     // The lock set must agree with the platform's creator_scale: a positive scale without a lock
     // minted to the creator (or the reverse) is not provable → unverifiable, never paid.
     const scale = sourceFacts.creatorScale ? BigInt(sourceFacts.creatorScale) : null;
     const lpProblems = [...lpCheck.problems];
     let lpVerification = lpCheck.verification;
+    // Since the 2026-08-17 LaunchLab upgrade, migrations fold creator_scale into ONE platform-owned
+    // Fee Key (Raydium docs: products/launchlab/creator-fees) — a positive creator_scale no longer
+    // implies a creator lock. The lock records of the migration transaction are the evidence.
     if (scale !== null && info.feeBeneficiaryRole === "creator" && (scale > 0n) !== beneficiaryLocks.length > 0) {
-      lpVerification = "unverifiable";
-      lpProblems.push(`creator_scale is ${scale} but ${beneficiaryLocks.length} LP lock(s) were minted to the creator at migration`);
+      lpVerification = lpVerification === "verified" ? "mismatch" : "unverifiable";
+      lpProblems.push(
+        scale > 0n
+          ? `creator_scale is ${scale} but no LP lock (Fee Key) was minted to the creator by migration tx ${v.signature} — consistent with the 2026-08-17 LaunchLab upgrade, which assigns creator_scale to the platform's Fee Key; the creator has no migrated-LP entitlement here`
+          : `creator_scale is 0 but ${beneficiaryLocks.length} LP lock(s) were minted to the creator at migration`,
+      );
     }
     const lpAllocation = makeBasis({
       ...common,

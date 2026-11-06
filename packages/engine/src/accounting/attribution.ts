@@ -113,16 +113,176 @@ export const EXCLUSION = {
 } as const;
 
 /**
- * U1 guard. Historical fee records keep the basis they were generated under; a different
- * beneficiary role on the same pool would make one reward period mix entitlements and make
- * reconciliation compare mismatched bases. Correct re-attribution of history is not provable in
- * general, so the change is refused while the pool has activity indexed under another role (or
- * legacy rows without a stored basis). Returns a human-readable reason, or null when allowed.
+ * Immutable allocation-basis snapshot stored with EVERY fee record (swaps and non-swap attributions),
+ * so that each record can be explained on its own — why its amount was considered creator-allocated
+ * and payable, or excluded — without consulting any configuration that may have changed since.
+ * Written once with the record ($setOnInsert) and never rewritten (see db/models.ts update guards).
  */
-export async function roleChangeBlockReason(db: { Swap: any; FeeAttribution: any }, pool: string | null, role: string): Promise<string | null> {
+export interface AllocationSnapshot {
+  /** Snapshot schema version (records without it are "legacy"). */
+  v: 1;
+  /** Stable basis id (sha256 of provider/pool/phase/role/beneficiary/params). */
+  id: string;
+  provider: string;
+  /** Bonding-curve pool of the launch. */
+  sourcePool: string;
+  /** Post-graduation pool the basis applies to, when it is a destination basis. */
+  destinationPool: string | null;
+  /** Pool named by the basis itself (bonding pool, or destination pool). */
+  pool: string;
+  phase: FeePhase;
+  role: string;
+  beneficiary: string;
+  params: Record<string, string | number | boolean>;
+  source: string;
+  verification: AllocationVerification;
+  problems: string[];
+}
+
+export const SNAPSHOT_VERSION = 1 as const;
+
+export function snapshotOf(b: AllocationBasis, sourcePool: string): AllocationSnapshot {
+  return {
+    v: SNAPSHOT_VERSION,
+    id: b.id,
+    provider: b.provider,
+    sourcePool,
+    destinationPool: b.pool === sourcePool ? null : b.pool,
+    pool: b.pool,
+    phase: b.phase,
+    role: b.role,
+    beneficiary: b.beneficiary,
+    params: { ...b.params },
+    source: b.source,
+    verification: b.verification,
+    problems: [...b.problems],
+  };
+}
+
+/**
+ * Every allocation basis a loaded provider can attribute fees under, by id: the bonding-curve basis
+ * and, once a migration is verified, the destination's trading and migrated-LP bases.
+ */
+export function basesOf(info: { allocation?: AllocationBasis; destination?: { allocation?: AllocationBasis; lpAllocation?: AllocationBasis } | null }): Map<string, AllocationBasis> {
+  const out = new Map<string, AllocationBasis>();
+  for (const b of [info.allocation, info.destination?.allocation, info.destination?.lpAllocation]) if (b) out.set(b.id, b);
+  return out;
+}
+
+/**
+ * Whether a basis may be distributed by a reward round. Stricter than `basisPayable`: only an
+ * allocation whose on-chain parameters were compared with an operator declaration and MATCHED is
+ * distributable. `not_declared` means "read from chain, never cross-checked" and is reported as such;
+ * it is recorded, shown, and never paid (see rewards/selection.ts `periodFees`).
+ */
+export function basisDistributable(b: Pick<AllocationBasis, "verification"> | null | undefined): boolean {
+  return b?.verification === "verified";
+}
+
+/** Fee evidence statuses whose amounts are final and may be distributed. */
+export const PAYABLE_STATUSES: readonly FeeEvidenceStatus[] = ["observed", "collected", "reconciled", "confirmed"];
+
+/** What a historical record is compared against before a beneficiary role / pool / provider change. */
+export interface BasisExpectation {
+  /** Provider id, when known (always known to workers and to the settings store). */
+  provider?: string | null;
+  role: string;
+  /** Beneficiary wallet, when known (workers know it after loading the pool; the API does not). */
+  beneficiary?: string | null;
+  /**
+   * Ids of the bases the loaded provider would attribute under. A record without a full snapshot
+   * (legacy) is accepted only if its basisId is one of these — the id hashes provider, pool, phase,
+   * role, beneficiary and parameters, so a match proves the same basis.
+   */
+  currentBasisIds?: Set<string>;
+}
+
+export interface HistoricalConflict {
+  collection: "swaps" | "fee_attributions";
+  ref: string;
+  slot: number;
+  reason: string;
+}
+
+/**
+ * Pure: why a historical fee record is incompatible with the expected basis (null when compatible).
+ * Checks role, provider, beneficiary, snapshot completeness and internal consistency (the snapshot's
+ * phase / pools must describe the record it is attached to).
+ */
+export function historicalRecordConflict(rec: any, exp: BasisExpectation, kind: "swaps" | "fee_attributions"): string | null {
+  const snap = rec.basis ?? null;
+  const recPhase = kind === "swaps" ? (rec.feePhase ?? "bonding_curve") : rec.phase;
+  if (exp.provider && rec.provider && rec.provider !== exp.provider) return `recorded under provider "${rec.provider}", not "${exp.provider}"`;
+  const full = snap && snap.v === SNAPSHOT_VERSION;
+  if (!snap || !snap.role) {
+    if (rec.basisId && exp.currentBasisIds?.has(rec.basisId)) return null;
+    return `legacy record without a stored allocation basis snapshot${rec.basisId ? ` (basisId ${rec.basisId} is not a current basis)` : ""}`;
+  }
+  if (snap.role !== exp.role) return `attributed under role "${snap.role}", not "${exp.role}"`;
+  if (exp.provider && snap.provider && snap.provider !== exp.provider) return `basis provider "${snap.provider}" ≠ "${exp.provider}"`;
+  const beneficiary = snap.beneficiary ?? rec.beneficiary ?? null;
+  if (exp.beneficiary && beneficiary && beneficiary !== exp.beneficiary) return `beneficiary ${beneficiary} ≠ current beneficiary ${exp.beneficiary}`;
+  if (rec.beneficiary && snap.beneficiary && rec.beneficiary !== snap.beneficiary) return `record beneficiary ${rec.beneficiary} ≠ its basis beneficiary ${snap.beneficiary}`;
+  if (snap.id && rec.basisId && snap.id !== rec.basisId) return `basisId ${rec.basisId} ≠ snapshot id ${snap.id}`;
+  if (full) {
+    if (snap.phase !== recPhase && !(kind === "swaps" && recPhase === "post_migration_trading" && snap.phase === "migrated_lp")) return `snapshot phase "${snap.phase}" ≠ record phase "${recPhase}"`;
+    const recPool = kind === "swaps" ? rec.pool : (rec.destinationPool ?? rec.sourcePool);
+    if (snap.pool !== recPool) return `snapshot pool ${snap.pool} ≠ record pool ${recPool}`;
+    if (rec.sourcePool && snap.sourcePool !== rec.sourcePool) return `snapshot source pool ${snap.sourcePool} ≠ record source pool ${rec.sourcePool}`;
+  } else if (!exp.currentBasisIds || !rec.basisId || !exp.currentBasisIds.has(rec.basisId)) {
+    // Partial (pre-snapshot-v1) basis: role/beneficiary agree, but provider/pool/phase were not
+    // stored. Accept only when its id proves it is one of the current bases.
+    return `record carries a partial (pre-v1) basis snapshot that cannot be matched to a current basis`;
+  }
+  return null;
+}
+
+/**
+ * U1 guard (both collections). Historical fee records keep the basis they were generated under; a
+ * different beneficiary role / beneficiary / provider on the same launch would make one reward
+ * period mix entitlements and make reconciliation compare mismatched bases. Correct re-attribution
+ * of history is not provable in general, so the change is refused while the launch (bonding pool
+ * and its destination) has any record under another basis, any legacy record without a provable
+ * basis, or any internally inconsistent snapshot. Returns up to `limit` conflicts.
+ */
+export async function historicalBasisConflicts(db: { Swap: any; FeeAttribution: any }, pools: string[], exp: BasisExpectation, limit = 5): Promise<HistoricalConflict[]> {
+  const ps = [...new Set(pools.filter(Boolean))];
+  if (!ps.length) return [];
+  const out: HistoricalConflict[] = [];
+  const scope = { $or: [{ pool: { $in: ps } }, { sourcePool: { $in: ps } }, { destinationPool: { $in: ps } }] };
+  for (const [kind, model] of [["swaps", db.Swap], ["fee_attributions", db.FeeAttribution]] as const) {
+    // Candidates: anything that is not a full, matching v1 snapshot (cheap index-friendly filter),
+    // then the exact pure check. Matching v1 records are skipped by the query.
+    const mismatch: any[] = [{ "basis.v": { $ne: SNAPSHOT_VERSION } }, { "basis.role": { $ne: exp.role } }];
+    if (exp.provider) mismatch.push({ provider: { $ne: exp.provider } });
+    if (exp.beneficiary) mismatch.push({ "basis.beneficiary": { $ne: exp.beneficiary } });
+    const cursor = model.find({ $and: [scope, { $or: mismatch }] }, { basis: 1, basisId: 1, provider: 1, beneficiary: 1, pool: 1, sourcePool: 1, destinationPool: 1, feePhase: 1, phase: 1, signature: 1, key: 1, slot: 1 }).sort({ slot: 1 }).limit(200).lean();
+    for (const rec of await cursor) {
+      const reason = historicalRecordConflict(rec, exp, kind);
+      if (reason) out.push({ collection: kind, ref: kind === "swaps" ? String(rec.signature) : String(rec.key), slot: rec.slot, reason });
+      if (out.length >= limit) return out;
+    }
+    // Full v1 snapshots that match role/provider/beneficiary can still be internally inconsistent.
+    const sample = await model.find({ $and: [scope, { "basis.v": SNAPSHOT_VERSION, "basis.role": exp.role }] }, { basis: 1, basisId: 1, provider: 1, beneficiary: 1, pool: 1, sourcePool: 1, destinationPool: 1, feePhase: 1, phase: 1, signature: 1, key: 1, slot: 1 }).limit(500).lean();
+    for (const rec of sample) {
+      const reason = historicalRecordConflict(rec, exp, kind);
+      if (reason) out.push({ collection: kind, ref: kind === "swaps" ? String(rec.signature) : String(rec.key), slot: rec.slot, reason });
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
+/**
+ * Human-readable reason a worker / admin change must be refused, or null when allowed. Used by every
+ * code path that can change the beneficiary role, pool or provider: the settings store (admin API),
+ * indexer attachment, rewards-worker provider (re)load and any runtime provider change.
+ */
+export async function roleChangeBlockReason(db: { Swap: any; FeeAttribution: any }, pool: string | null, role: string, exp: Omit<BasisExpectation, "role"> = {}): Promise<string | null> {
   if (!pool) return null;
-  const conflicting = await db.Swap.findOne({ pool, "basis.role": { $ne: role } }, { "basis.role": 1, signature: 1, slot: 1 }).lean();
-  if (!conflicting) return null;
-  const prev = conflicting.basis?.role ?? "unknown (legacy record without a stored basis)";
-  return `pool ${pool} already has fee records attributed under role "${prev}" (e.g. ${String(conflicting.signature).slice(0, 12)}… at slot ${conflicting.slot}); changing the fee beneficiary role to "${role}" would mix allocation bases. Keep the role, or use a new pool; historical records are never re-attributed implicitly`;
+  const provider = exp.provider ?? null;
+  const conflicts = await historicalBasisConflicts(db, [pool], { ...exp, role }, 3);
+  if (!conflicts.length) return null;
+  const list = conflicts.map((c) => `${c.collection} ${c.ref.slice(0, 16)}… (slot ${c.slot}): ${c.reason}`).join("; ");
+  return `pool ${pool} already has fee records whose allocation basis is incompatible with role "${role}"${exp.beneficiary ? ` / beneficiary ${exp.beneficiary}` : ""}${provider ? ` / provider ${provider}` : ""} — ${list}. Changing it would mix allocation bases. Keep the configuration, or use a new pool; historical records are never re-attributed implicitly`;
 }

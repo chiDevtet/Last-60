@@ -51,7 +51,7 @@ export interface PoolInfo {
    */
   accountingPools?: string[];
   /** Verified graduation destination, when attached. */
-  destination?: { kind: string; program: string; pool: string; migrationSlot: number; migrationSignature: string; supported: boolean; allocation?: AllocationBasis } | null;
+  destination?: { kind: string; program: string; pool: string; migrationSlot: number; migrationSignature: string; supported: boolean; allocation?: AllocationBasis; lpAllocation?: AllocationBasis } | null;
   /** Per watch address: never index below this slot (destination pools start at the migration slot). */
   watchFromSlot?: Record<string, number>;
 }

@@ -11,6 +11,7 @@ import { PublicKey } from "@solana/web3.js";
 import type { ChainRpc } from "../chain/rpc";
 import type { Models } from "../db/models";
 import { big, dec } from "../db/decimal";
+import { PAYABLE_STATUSES, SNAPSHOT_VERSION } from "../accounting/attribution";
 
 export interface SelectionParams {
   /** The period's pool, or pools when the provider/pool was switched during the period. */
@@ -118,20 +119,50 @@ export interface PeriodFees {
 }
 
 /**
- * Σ creator-allocated fees in the period. Only records that are payout-eligible count towards the
- * distributable amount; gross pool fees are never used (only `eligibleFee` / `creatorAmount`).
- * Legacy swap rows written before attribution fields existed have no `payoutEligible` and count as
- * eligible (they were attributed with the same program formula).
+ * Why a fee record is not distributable, as a MongoDB expression evaluated per record (null =
+ * distributable). Order matters: the first failing rule names the reason.
+ *   1. `payoutEligible = false` (decided at ingestion: unproven, mismatching, not the beneficiary's);
+ *   2. evidence status not final (`estimated`, `unresolved` are never paid);
+ *   3. no immutable v1 allocation snapshot (legacy rows cannot prove why they were eligible);
+ *   4. allocation basis not VERIFIED against an operator declaration — unless its id is one of the
+ *      bases the loaded provider verifies now (the id hashes provider/pool/phase/role/beneficiary and
+ *      every on-chain parameter, so the same id is the same basis, now cross-checked).
  */
-export async function periodFees(db: Models, p: Pick<SelectionParams, "pool" | "afterSlot" | "periodStartAt" | "snapshotSlot">, payoutMint: string): Promise<PeriodFees> {
+function ineligibleReasonExpr(statusField: "$feeStatus" | "$status", verifiedBasisIds: string[]) {
+  return {
+    $switch: {
+      branches: [
+        { case: { $eq: ["$payoutEligible", false] }, then: { $ifNull: ["$excludedReason", "unresolved"] } },
+        { case: { $not: [{ $in: [{ $ifNull: [statusField, "observed"] }, [...PAYABLE_STATUSES]] }] }, then: { $concat: ["fee_status_", { $toString: statusField }] } },
+        { case: { $ne: ["$basis.v", SNAPSHOT_VERSION] }, then: "legacy_record_without_allocation_snapshot" },
+        {
+          case: { $and: [{ $ne: ["$basis.verification", "verified"] }, { $not: [{ $in: ["$basisId", verifiedBasisIds] }] }] },
+          then: { $concat: ["allocation_", { $ifNull: ["$basis.verification", "unknown"] }, "_not_verified"] },
+        },
+      ],
+      default: null,
+    },
+  };
+}
+
+/**
+ * Σ creator-allocated fees in the period. Only distributable records count towards the payout
+ * amount (see `ineligibleReasonExpr`); everything else is reported per mint and reason. Gross pool
+ * fees are never used (only `eligibleFee` / `creatorAmount`), and estimated amounts (e.g. CPMM
+ * per-swap creator-fee accruals) are never summed.
+ */
+export async function periodFees(db: Models, p: Pick<SelectionParams, "pool" | "afterSlot" | "periodStartAt" | "snapshotSlot">, payoutMint: string, opts: { verifiedBasisIds?: Iterable<string> } = {}): Promise<PeriodFees> {
+  const verified = [...new Set(opts.verifiedBasisIds ?? [])].sort();
   const [swapRows, attrRows]: [any[], any[]] = await Promise.all([
     db.Swap.aggregate([
       { $match: periodMatch(p) },
-      { $group: { _id: { mint: "$eligibleFeeMint", eligible: { $ne: ["$payoutEligible", false] }, phase: { $ifNull: ["$feePhase", "bonding_curve"] }, reason: { $cond: [{ $eq: ["$payoutEligible", false] }, "$excludedReason", null] } }, total: { $sum: "$eligibleFee" }, n: { $sum: 1 } } },
+      { $addFields: { _reason: ineligibleReasonExpr("$feeStatus", verified) } },
+      { $group: { _id: { mint: "$eligibleFeeMint", eligible: { $eq: ["$_reason", null] }, phase: { $ifNull: ["$feePhase", "bonding_curve"] }, reason: "$_reason" }, total: { $sum: "$eligibleFee" }, n: { $sum: 1 } } },
     ]),
     db.FeeAttribution.aggregate([
       { $match: attributionPeriodMatch(p) },
-      { $group: { _id: { mint: "$feeMint", eligible: "$payoutEligible", phase: "$phase", reason: { $cond: ["$payoutEligible", null, "$excludedReason"] } }, total: { $sum: "$creatorAmount" }, n: { $sum: 1 } } },
+      { $addFields: { _reason: ineligibleReasonExpr("$status", verified) } },
+      { $group: { _id: { mint: "$feeMint", eligible: { $eq: ["$_reason", null] }, phase: "$phase", reason: "$_reason" }, total: { $sum: "$creatorAmount" }, n: { $sum: 1 } } },
     ]),
   ]);
   let payout = 0n;

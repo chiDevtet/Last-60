@@ -14,7 +14,8 @@ import { Indexer } from "../src/indexer/Indexer";
 import { SettingsValidationError } from "../src/config/runtime";
 import { PublicData } from "../src/public/publicData";
 import { TerminalWriter } from "../src/terminal/terminal";
-import type { NormalizedAttribution } from "../src/accounting/attribution";
+import { makeBasis, snapshotOf, type NormalizedAttribution } from "../src/accounting/attribution";
+import { MOCK_CREATOR } from "../src/providers/mock/MockProvider";
 import { rig, SOL, startDb, stopDb, T0, wallet, type Rig } from "./harness";
 
 beforeAll(startDb, 120_000);
@@ -22,6 +23,11 @@ afterAll(stopDb);
 
 const WSOL = "So11111111111111111111111111111111111111112";
 const DEST = Keypair.generate().publicKey.toBase58();
+/** The mock pool's bonding basis (verified by construction) and a verified destination LP basis. */
+const BOND = makeBasis({ provider: "mock", pool: MOCK_POOL, phase: "bonding_curve", role: "creator", beneficiary: MOCK_CREATOR, params: { eligibleFee: "instruction data" }, source: "mock instruction data", verification: "verified", problems: [] });
+const LP = makeBasis({ provider: "meteora_dbc", pool: DEST, phase: "migrated_lp", role: "creator", beneficiary: MOCK_CREATOR, params: { positions: "pos" }, source: "test", verification: "verified", problems: [] });
+/** What persistAttributions resolves snapshots from. */
+const INFO: any = { poolAddress: MOCK_POOL, allocation: BOND, destination: { allocation: LP } };
 
 function attribution(o: Partial<NormalizedAttribution> & { key: string; slot: number; creatorAmount: bigint }): NormalizedAttribution {
   return {
@@ -30,7 +36,7 @@ function attribution(o: Partial<NormalizedAttribution> & { key: string; slot: nu
     provider: "meteora_dbc",
     sourcePool: MOCK_POOL,
     destinationPool: DEST,
-    beneficiary: wallet(),
+    beneficiary: MOCK_CREATOR,
     feeMint: WSOL,
     grossAmount: o.creatorAmount,
     excludedAmount: 0n,
@@ -40,7 +46,7 @@ function attribution(o: Partial<NormalizedAttribution> & { key: string; slot: nu
     evidence: {},
     status: "observed",
     payoutEligible: true,
-    basisId: "b1",
+    basisId: LP.id,
     ...o,
   };
 }
@@ -50,7 +56,10 @@ async function swapRow(r: Rig, o: { sig: string; slot: number; pool?: string; fe
     signature: o.sig, eventIndex: 0, provider: "mock", pool: o.pool ?? MOCK_POOL, tokenMint: "m", quoteMint: WSOL, side: "buy", trader: o.trader ?? wallet(), traderSource: "payer",
     quoteAmount: dec(SOL), baseAmount: dec(1n), totalFee: dec(o.fee * 2n), eligibleFee: dec(o.fee), eligibleFeeMint: WSOL, slot: o.slot, commitment: "finalized", source: "indexer",
     ...(o.eligible === null ? {} : { payoutEligible: o.eligible ?? true, excludedReason: o.eligible === false ? "allocation_mismatch: test" : null }),
-    basis: { role: "creator" },
+    basisId: BOND.id,
+    basis: snapshotOf(o.pool && o.pool !== MOCK_POOL ? { ...BOND, pool: o.pool, phase: "bonding_curve" } : BOND, MOCK_POOL),
+    beneficiary: MOCK_CREATOR,
+    sourcePool: MOCK_POOL,
   });
 }
 
@@ -61,7 +70,7 @@ describe("migration continuity: bonding curve → verified destination", () => {
     await swapRow(r, { sig: "s2", slot: 200, fee: 2_000n }); // the final bonding-curve trade
     // the destination's first trades + the creator's LP growth (migration at slot 205)
     await swapRow(r, { sig: "d1", slot: 210, pool: DEST, fee: 0n });
-    await persistAttributions(r.db, [attribution({ key: "cp:1", slot: 250, creatorAmount: 700n }), attribution({ key: "cp:2", slot: 300, creatorAmount: 300n })]);
+    await persistAttributions(r.db, [attribution({ key: "cp:1", slot: 250, creatorAmount: 700n }), attribution({ key: "cp:2", slot: 300, creatorAmount: 300n })], INFO);
     const pools = [MOCK_POOL, DEST];
     const p1 = await periodFees(r.db, { pool: pools, afterSlot: 0, periodStartAt: null, snapshotSlot: 205 }, WSOL);
     const p2 = await periodFees(r.db, { pool: pools, afterSlot: 205, periodStartAt: null, snapshotSlot: 300 }, WSOL);
@@ -76,8 +85,8 @@ describe("migration continuity: bonding curve → verified destination", () => {
   test("re-processing is idempotent: attributions and collections are keyed, the first observation wins", async () => {
     const r = await rig();
     const a = attribution({ key: "collect:sig:3:mint", kind: "creator_fee_collection", phase: "post_migration_trading", slot: 400, creatorAmount: 5_000n, status: "collected" });
-    expect(await persistAttributions(r.db, [a])).toBe(1);
-    expect(await persistAttributions(r.db, [a, { ...a, creatorAmount: 9_999n }])).toBe(0); // duplicate ingestion, even with a different value
+    expect(await persistAttributions(r.db, [a], INFO)).toBe(1);
+    expect(await persistAttributions(r.db, [a, { ...a, creatorAmount: 9_999n }], INFO)).toBe(0); // duplicate ingestion, even with a different value
     expect(await r.db.FeeAttribution.countDocuments({})).toBe(1);
     expect((await periodFees(r.db, { pool: DEST, afterSlot: 0, periodStartAt: null, snapshotSlot: 500 }, WSOL)).payout).toBe(5_000n);
   });
@@ -87,9 +96,11 @@ describe("migration continuity: bonding curve → verified destination", () => {
     await swapRow(r, { sig: "ok", slot: 10, fee: 100n });
     await swapRow(r, { sig: "bad", slot: 11, fee: 50n, eligible: false });
     await swapRow(r, { sig: "legacy", slot: 12, fee: 7n, eligible: null }); // written before attribution fields existed
-    await persistAttributions(r.db, [attribution({ key: "u1", slot: 13, creatorAmount: 40n, payoutEligible: false, status: "unresolved", excludedReason: "position NFT holder could not be resolved", destinationPool: null })]);
+    await persistAttributions(r.db, [attribution({ key: "u1", slot: 13, creatorAmount: 40n, payoutEligible: false, status: "unresolved", excludedReason: "position NFT holder could not be resolved", destinationPool: null })], INFO);
     const f = await periodFees(r.db, { pool: MOCK_POOL, afterSlot: 0, periodStartAt: null, snapshotSlot: 20 }, WSOL);
-    expect(f.payout).toBe(107n); // eligibleFee only — never totalFee (which is 2× here)
+    // eligibleFee only — never totalFee (which is 2× here). The legacy row has a snapshot here (swapRow
+    // always writes one); see "legacy records" below for rows without one.
+    expect(f.payout).toBe(107n);
     expect(f.ineligible.reduce((s, x) => s + x.amount, 0n)).toBe(90n);
     expect(f.ineligible.map((x) => x.reason).sort()).toEqual(["allocation_mismatch: test", "position NFT holder could not be resolved"]);
   });
@@ -100,7 +111,7 @@ describe("migration continuity: bonding curve → verified destination", () => {
     // The provider exposes a verified destination and a checkpointed entitlement.
     const p: any = r.provider;
     const base = p.info.bind(p);
-    p.info = () => ({ ...base(), accountingPools: [MOCK_POOL, DEST] });
+    p.info = () => ({ ...base(), accountingPools: [MOCK_POOL, DEST], destination: { kind: "dbc_damm_v2", program: "x", pool: DEST, migrationSlot: 0, migrationSignature: "m", supported: true, allocation: LP } });
     p.checkpoint = async (slot: number, previous: (k: string) => Promise<any>) => {
       calls.push(slot);
       const prev = await previous("dammv2:pos:mint");
@@ -149,9 +160,10 @@ describe("U1 — fee beneficiary role changes", () => {
     // Records written while the pool was indexed for the partner; the provider now reports "creator"
     // (e.g. FEE_BENEFICIARY_ROLE changed in the environment, bypassing the settings store).
     await swapRow(r, { sig: "y", slot: 5, fee: 1n });
-    await r.db.Swap.updateOne({ signature: "y" }, { $set: { "basis.role": "partner" } });
+    // Simulate history written under another role (raw driver: the model refuses to rewrite a basis).
+    await r.db.Swap.collection.updateOne({ signature: "y" }, { $set: { "basis.role": "partner" } });
     const idx = new Indexer({ db: r.db, cfg: r.cfg, settings: r.settings, rpc: r.chain, wsFactory: null });
-    await expect(idx.init()).rejects.toThrow(/already has fee records attributed under role "partner"/);
+    await expect(idx.init()).rejects.toThrow(/attributed under role "partner"/);
   });
 });
 
@@ -300,7 +312,7 @@ describe("reconciliation", () => {
     await r.db.WorkerState.create({ _id: `cursor:mock:${MOCK_POOL}:${MOCK_POOL}`, cursor: { lastSignature: "x", lastSlot: 1, backfillComplete: true } });
     (r.chain as any).getSignaturesForAddress = async () => [];
     await swapRow(r, { sig: "mine", slot: 10, fee: 1_000n });
-    await persistAttributions(r.db, [attribution({ key: "vault-inflow:o:1", kind: "shared_vault_inflow", phase: "bonding_curve", destinationPool: null, slot: 20, creatorAmount: 0n, excludedAmount: 4_000n, payoutEligible: false, excludedReason: "shared_vault_other_pool" })]);
+    await persistAttributions(r.db, [attribution({ key: "vault-inflow:o:1", kind: "shared_vault_inflow", phase: "bonding_curve", destinationPool: null, slot: 20, creatorAmount: 0n, excludedAmount: 4_000n, payoutEligible: false, excludedReason: "shared_vault_other_pool" })], INFO);
   }
 
   test("shared creator vault: other pools' deposits are counted, so the comparison is exact", async () => {
