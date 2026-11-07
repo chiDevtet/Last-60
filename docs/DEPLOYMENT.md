@@ -3,12 +3,14 @@
 ## Prerequisites
 
 * **Bun ≥ 1.3** (workers, API) and **Node ≥ 20** (Next.js web).
-* **MongoDB replica set** — Atlas (M10+ for production) or self-hosted `mongod --replSet rs0`.
+* **MongoDB replica set** — Atlas (M10+ for production) or self-hosted `mongod --replSet rs0`. The
+  `last60-mongo` PM2 app runs a local single-node set in `./.mongo-dev`; it has no backups, so set
+  those up separately, and remove the app when using Atlas.
 * **Solana RPC** with WebSocket — a paid provider (e.g. Helius) is strongly recommended. The public
   endpoint works for read-only testing but rate-limits busy pools. Budget ≈ one `getTransaction`
   per pool transaction plus a few calls per second.
 * **PM2** (`npm i -g pm2`) or any supervisor (systemd, Kubernetes).
-* TLS reverse proxy (nginx, Caddy) for `last60.io` (web) and `api.last60.io` (API).
+* TLS reverse proxy (nginx, Caddy) for `last60.fun` (web and API on one domain).
 
 ## 1. Install & build
 
@@ -16,7 +18,7 @@
 git clone <repo> last60 && cd last60
 bun install --frozen-lockfile
 bun run typecheck && bun run test
-NEXT_PUBLIC_API_URL=https://api.last60.io NEXT_PUBLIC_SITE_URL=https://last60.io bun run build:web
+NEXT_PUBLIC_API_URL=https://last60.fun NEXT_PUBLIC_SITE_URL=https://last60.fun bun run build:web
 ```
 `NEXT_PUBLIC_*` values are compiled into the web bundle at build time.
 
@@ -29,7 +31,8 @@ Start from `.env.example`. Recommended split (all chmod 600):
 | `.env.indexer` | Solana, provider, rewards params, Mongo, indexer settings. **No keys.** |
 | `.env.rewards` | Same + `SCHEDULE_ENCRYPTION_KEY`, `PAYOUT_WALLET_*`, payout/fee-collection settings. |
 | `.env.api` | Solana (read-only), provider, Mongo, API/admin settings, `ADMIN_SESSION_SECRET`. **No keys, no schedule key.** |
-| `.env.web` | `NEXT_PUBLIC_*`, `API_INTERNAL_URL`. |
+| `.env.web` | `NEXT_PUBLIC_*`, `API_INTERNAL_URL`, `NODE_ENV=production`. |
+| `.env.mongo` | `MONGO_PORT` only (for the local `last60-mongo` app). **No secrets.** |
 
 Generate secrets: `openssl rand -base64 32` (schedule key), `openssl rand -base64 48` (session).
 Validate everything before starting: `bun run cli check-config` (per role).
@@ -41,32 +44,110 @@ Each process loads **only its own** env file through the runtime (`bun --env-fil
 on production hosts: Bun auto-loads it into any process started without `--env-file`.
 
 ```bash
-pm2 start ecosystem.config.cjs
+pm2 start ecosystem.config.cjs --only last60-mongo   # wait for :27017
+pm2 start ecosystem.config.cjs --only last60-indexer,last60-rewards,last60-api,last60-web
 pm2 save && pm2 startup
 pm2 logs last60-rewards
 ```
-Processes: `last60-indexer`, `last60-rewards`, `last60-api`, `last60-web`. Running a second
+The Bun apps run `bun` as the PM2 command (`script: "bun"`, `interpreter: "none"`), because PM2's
+Bun wrapper `require()`s the entrypoint and fails on modules with top-level await. Check `node -v`
+first: PM2 and the web app need Node ≥ 20 on `PATH`, which on an nvm host is not always the
+system `node`.
+
+Processes: `last60-mongo`, `last60-indexer`, `last60-rewards`, `last60-api`, `last60-web`. Running a second
 indexer/rewards instance on another host is safe: it stands by until the leader's lease expires.
 Exit code 78 means invalid configuration; PM2 will not restart-loop it.
 
-## 4. Reverse proxy (SSE needs buffering off)
+### Sharing a host with another PM2 daemon
+
+Check `ls ~/.pm2` and `ps aux | grep 'God Daemon'` before starting anything. If another daemon is
+already running, give Last60 its own `PM2_HOME` and do not share the default one:
+
+```bash
+export PM2_HOME=/root/.pm2-last60
+pm2 start ecosystem.config.cjs
+pm2 save
+pm2 startup systemd -u root --hp /root --service-name pm2-last60
+```
+
+**`pm2 startup` ignores `PM2_HOME`** and writes `PM2_HOME=/root/.pm2` and
+`PIDFile=/root/.pm2/pm2.pid` into the unit. Correct both lines to the Last60 home and run
+`systemctl daemon-reload` **before** the first `systemctl start`. A unit left at the default adopts
+the other daemon as its main process, and stopping it then kills that daemon and everything it runs.
+
+Once such a unit has been started, do not simply stop it. Set `KillMode=none`, `ExecStop=/bin/true`
+and `Restart=no`, run `systemctl daemon-reload`, and `systemctl stop` it. That releases the other
+daemon without signalling it, after which the unit can be corrected.
+
+On the production host, use the `pm2-last60` wrapper in `/usr/local/bin`, which sets this
+`PM2_HOME`; plain `pm2` talks to the other daemon.
+
+## 4. Reverse proxy (one domain, SSE needs buffering off)
+
+nginx is the only public entry point. The API is served under `/api/` on the site's own domain,
+so no `api.` DNS record is needed, and everything else goes to the web app. Issue the certificate
+first (webroot, with a deploy hook so renewals reload nginx):
+
+```bash
+certbot certonly --webroot -w /var/www/letsencrypt -d last60.fun \
+  --deploy-hook 'systemctl reload nginx'
+certbot renew --cert-name last60.fun --dry-run
+```
 
 ```nginx
-location /api/v1/stream {
-  proxy_pass http://127.0.0.1:4000;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_http_version 1.1;
-  proxy_set_header Connection "";
-  proxy_buffering off;
-  proxy_cache off;
-  proxy_read_timeout 1h;
+upstream last60_web { server 127.0.0.1:3060; keepalive 32; }
+upstream last60_api { server 127.0.0.1:4000; keepalive 32; }
+
+server {
+  listen 80;
+  server_name last60.fun;
+  location ^~ /.well-known/acme-challenge/ { root /var/www/letsencrypt; }
+  location / { return 301 https://$host$request_uri; }
 }
-location / { proxy_pass http://127.0.0.1:4000; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+
+server {
+  listen 443 ssl http2;
+  server_name last60.fun;
+  ssl_certificate     /etc/letsencrypt/live/last60.fun/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/last60.fun/privkey.pem;
+  add_header Strict-Transport-Security "max-age=31536000" always;
+
+  location /api/v1/stream {
+    proxy_pass http://last60_api;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 1h;
+  }
+  location /api/ {
+    proxy_pass http://last60_api;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  location / {
+    proxy_pass http://last60_web;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
 ```
-Set `CORS_ORIGINS=https://last60.io`, `PUBLIC_SITE_URL=https://last60.io` (both **required** for the
-API in production) and `API_TRUST_PROXY_HOPS=1` (one nginx). The API takes the client address from the right-most
-X-Forwarded-For entry appended by your proxy; with `0` it ignores forwarding headers and uses the
-socket peer. Bind the API to `127.0.0.1` when it sits behind the proxy (`API_HOST`).
+In `.env.api` set `CORS_ORIGINS=https://last60.fun`, `PUBLIC_SITE_URL=https://last60.fun` (both
+**required** for the API in production), `API_TRUST_PROXY_HOPS=1` (one nginx) and
+`API_HOST=127.0.0.1`. The API takes the client address from the right-most X-Forwarded-For entry
+appended by your proxy; with `0` it ignores forwarding headers and uses the socket peer.
+
+The web app listens on `127.0.0.1:3060`, not 3000, so it cannot be picked up by another site on a
+shared host that proxies to the common Next.js port.
 
 ## 5. Go-live sequence (do not skip)
 
@@ -90,7 +171,7 @@ socket peer. Bind the API to `127.0.0.1` when it sits behind the proxy (`API_HOS
 
 ## 6. Health & monitoring
 
-* `GET https://api.last60.io/api/v1/health` — overall + per component (heartbeats older than 30 s
+* `GET https://last60.fun/api/v1/health` — overall + per component (heartbeats older than 30 s
   are `down`). Wire it to uptime monitoring.
 * Optional per-worker local endpoints: `WORKER_HEALTH_PORT` (127.0.0.1 only).
 * Logs are JSON (pino). Alert on `level >= 50`, on terminal `WARN`/`ERROR`, on
@@ -102,6 +183,8 @@ socket peer. Bind the API to `127.0.0.1` when it sits behind the proxy (`API_HOS
 bun install
 bun run dev:mongo                         # local replica set on :27017 (no Docker)
 cp .env.example .env && edit              # LAUNCH_PROVIDER=mock for an offline loop, or a real pool + dry_run
-bun run dev:indexer & bun run dev:rewards & bun run dev:api & bun run dev:web
+bunx concurrently -k "bun run dev:indexer" "bun run dev:rewards" "bun run dev:api" "bun run dev:web"
 ```
+Ctrl+C stops all four. With `cmd & cmd &` only the last command stays in the foreground, and the
+rest keep running. Do not run these on the production host: the API collides on port 4000.
 Find an active pool for read-only experiments: `bun scripts/find-active-pool.ts raydium_launchlab`.

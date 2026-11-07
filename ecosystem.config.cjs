@@ -12,7 +12,10 @@
  * hot-looping, so the error stays visible in `pm2 logs`.
  */
 const common = {
-  interpreter: "bun",
+  // Run bun as the command, not as a PM2 interpreter: PM2's Bun wrapper require()s the entrypoint,
+  // which fails on modules with top-level await.
+  script: "bun",
+  interpreter: "none",
   cwd: __dirname,
   autorestart: true,
   max_restarts: 50,
@@ -27,17 +30,21 @@ const common = {
 module.exports = {
   apps: [
     {
+      // Local single-node replica set; data in ./.mongo-dev. Omit this app when using Atlas.
+      ...common,
+      name: "last60-mongo",
+      args: "--env-file=.env.mongo scripts/dev-mongo.ts",
+    },
+    {
       ...common,
       name: "last60-indexer",
-      script: "apps/worker/src/indexer.ts",
-      interpreter_args: "--env-file=.env.indexer",
+      args: "--env-file=.env.indexer apps/worker/src/indexer.ts",
       env: { WORKER_HEALTH_PORT: "4101" },
     },
     {
       ...common,
       name: "last60-rewards",
-      script: "apps/worker/src/rewards.ts",
-      interpreter_args: "--env-file=.env.rewards",
+      args: "--env-file=.env.rewards apps/worker/src/rewards.ts",
       env: { WORKER_HEALTH_PORT: "4102" },
       // A single active rewards leader is enforced by a lease; extra instances stand by safely.
       instances: 1,
@@ -45,14 +52,14 @@ module.exports = {
     {
       ...common,
       name: "last60-api",
-      script: "apps/api/src/index.ts",
-      interpreter_args: "--env-file=.env.api",
+      args: "--env-file=.env.api apps/api/src/index.ts",
     },
     {
       name: "last60-web",
       cwd: `${__dirname}/apps/web`,
-      script: "node_modules/next/dist/bin/next",
-      args: "start -p 3000",
+      // Next is hoisted to the workspace root. Loopback only: nginx is the public entry point.
+      script: "../../node_modules/next/dist/bin/next",
+      args: "start -p 3060 -H 127.0.0.1",
       interpreter: "node",
       node_args: "--env-file=../../.env.web",
       autorestart: true,
