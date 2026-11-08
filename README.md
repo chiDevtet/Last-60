@@ -42,7 +42,7 @@ LAUNCH_PROVIDER=raydium_launchlab            # or meteora_dbc
 TOKEN_MINT=…  POOL_ADDRESS=…  FEE_BENEFICIARY_ROLE=creator
 MONGODB_URI='mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true'
 SCHEDULE_ENCRYPTION_KEY=$(bun run cli gen-schedule-key)
-PAYOUT_WALLET_PUBLIC_KEY=<payout wallet address>
+LAST60_PAYOUT_WALLET_ADDRESS=<dedicated payout wallet address>   # see docs/PAYOUT_WALLET.md
 INDEXER_BACKFILL=none
 ```
 `bun scripts/find-active-pool.ts raydium_launchlab` prints a busy pool to try.
@@ -76,6 +76,7 @@ bun run cli revenue | revenue-reconcile                   # same report / re-run
 | [Architecture](docs/ARCHITECTURE.md) | processes, rounds, snapshot, payouts, privacy, failure handling |
 | [Fee accounting](docs/FEE_ACCOUNTING.md) | formulas, periods, ledger, collection, reconciliation |
 | [Reward funding](docs/REWARD_FUNDING.md) | two-phase business model, revenue streams, claim ↔ transfer evidence, how Forge's existing post-migration creator payout is attributed (§4a), funding policy, Forgepad findings, runbook |
+| [Payout wallet](docs/PAYOUT_WALLET.md) | the dedicated payout wallet: key generation and installation, fail-closed signer, verification, funding for fees |
 | [Providers](docs/PROVIDERS.md) | Meteora DBC & Raydium LaunchLab internals, graduation support matrix |
 | [Database](docs/DATABASE.md) | collections, constraints, state machines, reconstruction |
 | [API](docs/API.md) | public, SSE and admin endpoints |
@@ -106,6 +107,7 @@ bun run cli revenue | revenue-reconcile                   # same report / re-run
 | 14 | Provider switch by configuration only | ✔ performed live via the admin API |
 | 15 | Runs without the frontend | ✔ separate processes |
 | 16 | Phase-aware reward funding (PR #6–#8) | ✔ streams, correlation, reconciliation, policy-gated round funding and CPMM `creator_fee_on` / `CreatorFeeShare` verification; Forge's existing post-migration creator payout recognised with no Forgepad change (PR #8). Tested on real fixtures and synthetic transactions mirroring Forge's flow; **not verified on real Forge harvests** (none existed when written) and **not funding live rounds**: the default policy is legacy ([§4a](docs/REWARD_FUNDING.md#4a-forges-existing-post-migration-creator-distribution), [§13](docs/REWARD_FUNDING.md#13-known-limitations)) |
+| 17 | Dedicated payout wallet, custody and recovery (PR #10) | ✔ fail-closed payout signer bound to `LAST60_PAYOUT_WALLET_ADDRESS`; contributions fund rounds only once their SOL is verified in the payout wallet (custody transfers never create a second credit); audited operator re-run of unresolved Forge attributions. Tested on synthetic transactions; custody and recovery are **disabled by default**; **no real custody sweep or mainnet transaction performed** ([§14–§16](docs/REWARD_FUNDING.md#14-physical-custody-getting-credited-sol-into-the-payout-wallet-pr-10)) |
 
 **Before going live:** resolve the production blockers in [Audit §7](docs/AUDIT.md) — verify the
 real Forgepad pool and declare its allocation (`EXPECTED_*`; undeclared or mismatching allocations

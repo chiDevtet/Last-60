@@ -4,14 +4,23 @@
 
 | Secret | Held by | Never in |
 |---|---|---|
-| Payout wallet key (`PAYOUT_WALLET_KEYPAIR_PATH` preferred, chmod 600 enforced; or `PAYOUT_WALLET_PRIVATE_KEY`) | `last60-rewards` only | API, web, logs, DB, admin UI |
+| Dedicated payout wallet key (`LAST60_PAYOUT_WALLET_KEYPAIR_PATH` preferred, chmod 600 enforced; or `LAST60_PAYOUT_WALLET_PRIVATE_KEY`; legacy `PAYOUT_WALLET_*` aliases) | `last60-rewards` only — loaded by the payout signer | API, web, logs, DB, admin UI, reports, error messages |
 | Fee claim authority key (optional) | `last60-rewards` only | same |
 | `SCHEDULE_ENCRYPTION_KEY` | `last60-rewards` only (the API warns if it is set there) | API, web, logs |
 | `ADMIN_SESSION_SECRET` | `last60-api` | web |
 | `MONGODB_URI`, RPC API keys | servers | web (`NEXT_PUBLIC_*` values are scanned for secret values and secret-looking names at startup and refused) |
 
-* Keys are loaded once, the loaded public key must equal `PAYOUT_WALLET_PUBLIC_KEY`, and the
-  executor refuses to sign if the admin-configured `expectedPayoutPublicKey` differs.
+* The payout key is loaded once by `PayoutSigner` (signer/payoutSigner.ts); the derived public key must
+  equal `LAST60_PAYOUT_WALLET_ADDRESS`, or the rewards worker exits (code 78) — a missing address,
+  malformed key or mismatch is never tolerated and never falls back to another wallet. Error messages are
+  fixed strings that never quote the key. The executor also refuses to sign if the admin-configured
+  `expectedPayoutPublicKey` differs.
+* The signer is narrowly scoped (docs/PAYOUT_WALLET.md §3): construction, authorization (the fenced,
+  claimed payout row) and signing are separate, and the signer signs only a transaction whose single
+  transfer matches the authorization's recipient, amount and mint exactly. It never signs fee claims
+  (auto_claim requires `FEE_CLAIM_AUTHORITY_*`), custody sweeps or arbitrary transfers; no API accepts a
+  recipient or an amount to pay. Its status is published sanitized (`system_state.payout_signer_status`)
+  for the read-only wallet verification.
 * Secrets are deleted from `process.env` after loading; logger redaction covers key, schedule and
   serialized-transaction fields.
 * Use a **dedicated** payout wallet funded only with what rounds need. If the payout wallet is also
@@ -19,6 +28,12 @@
   claim authority when possible. A KMS/HSM signer can replace `Keypair` behind the same interface.
 
 ## Money movement invariants
+
+0. (PR #10) An attributed contribution is never liquidity: a round consumes a credit only when its SOL is
+   verified in the dedicated payout wallet (direct transfer, or finalized custody transfers covering it).
+   A custody transfer never creates a `reward_funding` credit; `transfer_uses` makes contribution and
+   custody mutually exclusive uses of one on-chain transfer. Operator recovery re-runs the normal
+   attribution and can never set an amount, eligibility, collection or status.
 
 1. One payout row per `(round, recipient)` — unique index.
 2. A transaction is broadcast only after its signature, blockhash, `lastValidBlockHeight` and

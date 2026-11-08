@@ -3,6 +3,7 @@
  * leader lease. It never depends on the API or the frontend being up.
  */
 import type { Keypair } from "@solana/web3.js";
+import { PayoutSigner, type PayoutSignerStatus } from "../signer/payoutSigner";
 import type { AppConfig } from "../config/env";
 import type { EffectiveSettings, SettingsStore } from "../config/runtime";
 import { RpcClient, type ChainRpc } from "../chain/rpc";
@@ -24,7 +25,10 @@ export interface RewardsWorkerDeps {
   db: Models;
   cfg: AppConfig;
   settings: SettingsStore;
-  payer: Keypair | null;
+  /** The dedicated payout signer (a raw Keypair is accepted for tests and wrapped). */
+  payer: PayoutSigner | Keypair | null;
+  /** Sanitized signer status published for operators (wallet verification). */
+  signerStatus?: PayoutSignerStatus | null;
   claimer: Keypair | null;
   rpc?: ChainRpc;
   provider?: LaunchProvider;
@@ -45,6 +49,7 @@ export class RewardsWorker {
   readonly payouts: PayoutExecutor;
   readonly fees: FeeCollector;
   readonly reconciler: Reconciler;
+  readonly signer: PayoutSigner | null;
   private plannedSinceClaim = false;
   private stopped = false;
   /**
@@ -66,9 +71,11 @@ export class RewardsWorker {
       if (!this.provider) throw new Error("provider not loaded");
       return this.provider;
     };
-    const payoutWallet = d.payer?.publicKey ?? null;
-    this.scheduler = new RoundScheduler({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, payer: d.payer, terminal: this.terminal, clock: this.clock, random: d.random, log: this.log, onRoundPlanned: () => (this.plannedSinceClaim = true) });
-    this.payouts = new PayoutExecutor({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, payer: d.payer, terminal: this.terminal, clock: this.clock, log: this.log, tokenInfo: (mint) => readMint(this.rpc, mint) });
+    const signer = d.payer instanceof PayoutSigner ? d.payer : d.payer ? PayoutSigner.fromKeypair(d.payer) : null;
+    this.signer = signer;
+    const payoutWallet = signer?.publicKey ?? null;
+    this.scheduler = new RoundScheduler({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, payer: signer, terminal: this.terminal, clock: this.clock, random: d.random, log: this.log, onRoundPlanned: () => (this.plannedSinceClaim = true) });
+    this.payouts = new PayoutExecutor({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, signer, terminal: this.terminal, clock: this.clock, log: this.log, tokenInfo: (mint) => readMint(this.rpc, mint) });
     this.fees = new FeeCollector({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, claimer: d.claimer, payoutWallet, terminal: this.terminal, clock: this.clock, log: this.log });
     this.reconciler = new Reconciler({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, payoutWallet: payoutWallet?.toBase58() ?? null, terminal: this.terminal, log: this.log });
   }
@@ -117,7 +124,7 @@ export class RewardsWorker {
             status: this.status.status === "degraded" ? "degraded" : paused ? "paused" : halted ? "degraded" : "running",
             detail: this.status.detail ?? (halted ? `payouts halted: ${halted}` : s.pausePayouts ? "payouts paused by admin" : s.pauseScheduler ? "scheduler paused by admin" : null),
             instance: this.d.cfg.instanceId,
-            metrics: { payoutMode: s.payoutMode, payer: this.d.payer?.publicKey.toBase58() ?? null },
+            metrics: { payoutMode: s.payoutMode, payer: this.signer?.address ?? null },
           });
         } else {
           await heartbeat(this.d.db, `rewards:standby:${this.d.cfg.instanceId}`, { status: "standby", instance: this.d.cfg.instanceId });
@@ -140,6 +147,7 @@ export class RewardsWorker {
           this.leader = await this.lease.tryAcquire(now);
           if (this.leader) {
             this.log.info("acquired rewards leadership");
+            await this.publishSignerStatus().catch(() => undefined);
             await this.terminal.system("Reward engine online.", `online:${this.d.cfg.instanceId}:${Math.floor(now / 60_000)}`);
           }
         }
@@ -191,5 +199,21 @@ export class RewardsWorker {
 
   stop() {
     this.stopped = true;
+  }
+
+  /**
+   * Publish the payout signer's sanitized status (configured / derived address matches / code) for
+   * the read-only wallet verification. Never contains key material.
+   */
+  async publishSignerStatus() {
+    const st: PayoutSignerStatus = this.d.signerStatus ?? {
+      configured: !!this.signer && (!this.d.cfg.payout.walletPublicKey || this.signer.address === this.d.cfg.payout.walletPublicKey),
+      address: this.d.cfg.payout.walletPublicKey,
+      derivedMatches: this.signer ? !this.d.cfg.payout.walletPublicKey || this.signer.address === this.d.cfg.payout.walletPublicKey : null,
+      code: this.signer ? "ok" : "not_configured",
+      message: this.signer ? "payout signer loaded" : "no payout signing key is configured in this process",
+      checkedAt: new Date(this.clock.now()).toISOString(),
+    };
+    await this.d.db.SystemState.updateOne({ _id: "payout_signer_status" }, { $set: { value: { ...st, instance: this.d.cfg.instanceId }, updatedAt: new Date() } }, { upsert: true });
   }
 }

@@ -10,6 +10,7 @@ import bs58 from "bs58";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { PUBLIC_API_URL } from "@/lib/config";
 import { shortAddress, sol, dateTime } from "@/lib/format";
+import { FundingPanel } from "./FundingPanel";
 
 type Field = { key: string; label: string; kind: "int" | "lamports" | "bps" | "text" | "select" | "bool" | "list"; options?: string[]; help?: string };
 const FIELDS: { group: string; fields: Field[] }[] = [
@@ -292,6 +293,8 @@ function Console({ call, me, onSignOut, notice, setNotice }: { call: (p: string,
           </table>
         </section>
       )}
+
+      <FundingPanel call={call} />
 
       <section className="card p-5">
         <h2 className="text-sm font-semibold">Configuration</h2>

@@ -221,6 +221,20 @@ export function parseFundingMemo(text: string): string | null {
   return /^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(sig) ? sig : null;
 }
 
+/**
+ * Custody memo: `last60:custody:v1:<custodyId>`. Declares a transfer into the dedicated payout wallet
+ * as the physical custody transfer of an EXISTING credited contribution (docs/REWARD_FUNDING.md §14) —
+ * never a reward contribution. A transaction carrying it is never recorded as a funding inflow.
+ */
+export const CUSTODY_MEMO_PREFIX = "last60:custody:v1:";
+export const CUSTODY_ID_RE = /^ct_[A-Za-z0-9_-]{16,40}$/;
+export function parseCustodyMemo(text: string): string | null {
+  const t = text.trim();
+  if (!t.startsWith(CUSTODY_MEMO_PREFIX)) return null;
+  const id = t.slice(CUSTODY_MEMO_PREFIX.length).trim();
+  return CUSTODY_ID_RE.test(id) ? id : null;
+}
+
 // ── claim ↔ transfer correlation ────────────────────────────────────────────────────────────
 
 export interface CollectionFact {

@@ -30,27 +30,37 @@ export function assertValidRecipient(recipient: string, payer: string): PublicKe
   return pk;
 }
 
-export function buildPayoutTransaction(p: PayoutTxParams): { tx: Transaction; signature: string; serialized: string } {
+/**
+ * Construction only: the UNSIGNED payout transaction. Signing is done by the payout signer
+ * (signer/payoutSigner.ts), which re-validates every instruction against a fenced authorization.
+ */
+export function buildUnsignedPayoutTransaction(p: Omit<PayoutTxParams, "payer"> & { payer: PublicKey }): Transaction {
   if (p.amount <= 0n) throw new Error("payout amount must be positive");
-  const to = assertValidRecipient(p.recipient, p.payer.publicKey.toBase58());
+  const payer = p.payer;
+  const to = assertValidRecipient(p.recipient, payer.toBase58());
   const ixs: TransactionInstruction[] = [
     ComputeBudgetProgram.setComputeUnitLimit({ units: p.computeUnitLimit }),
     ...(p.priorityFeeMicroLamports > 0 ? [ComputeBudgetProgram.setComputeUnitPrice({ microLamports: p.priorityFeeMicroLamports })] : []),
   ];
   if (p.mint === WSOL_MINT) {
     if (p.amount > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("SOL payout exceeds safe integer range");
-    ixs.push(SystemProgram.transfer({ fromPubkey: p.payer.publicKey, toPubkey: to, lamports: p.amount }));
+    ixs.push(SystemProgram.transfer({ fromPubkey: payer, toPubkey: to, lamports: p.amount }));
   } else {
     if (!p.token) throw new Error("SPL payout requires token program and decimals");
     const mint = new PublicKey(p.mint);
     const program = new PublicKey(p.token.program);
-    const fromAta = getAssociatedTokenAddressSync(mint, p.payer.publicKey, false, program);
+    const fromAta = getAssociatedTokenAddressSync(mint, payer, false, program);
     const toAta = getAssociatedTokenAddressSync(mint, to, false, program);
-    ixs.push(createAssociatedTokenAccountIdempotentInstruction(p.payer.publicKey, toAta, to, mint, program));
-    ixs.push(createTransferCheckedInstruction(fromAta, mint, toAta, p.payer.publicKey, p.amount, p.token.decimals, [], program));
+    ixs.push(createAssociatedTokenAccountIdempotentInstruction(payer, toAta, to, mint, program));
+    ixs.push(createTransferCheckedInstruction(fromAta, mint, toAta, payer, p.amount, p.token.decimals, [], program));
   }
   if (p.memo) ixs.push(new TransactionInstruction({ programId: MEMO_PROGRAM_ID, keys: [], data: Buffer.from(p.memo, "utf8") }));
-  const tx = new Transaction({ feePayer: p.payer.publicKey, recentBlockhash: p.blockhash }).add(...ixs);
+  return new Transaction({ feePayer: payer, recentBlockhash: p.blockhash }).add(...ixs);
+}
+
+/** Construction + signing with a raw keypair (kept for tooling and tests; the worker uses PayoutSigner). */
+export function buildPayoutTransaction(p: PayoutTxParams): { tx: Transaction; signature: string; serialized: string } {
+  const tx = buildUnsignedPayoutTransaction({ ...p, payer: p.payer.publicKey });
   tx.sign(p.payer);
   const signature = bs58.encode(tx.signature!);
   return { tx, signature, serialized: tx.serialize().toString("base64") };

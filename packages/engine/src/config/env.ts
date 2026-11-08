@@ -6,6 +6,7 @@ import { PublicKey } from "@solana/web3.js";
 import { z } from "zod";
 import { parseUnits, WSOL_MINT } from "@last60/shared";
 import { jsonSafe } from "../util/json";
+import { PayoutSigner } from "../signer/payoutSigner";
 import { APPROVED_SHARES, makeFundingPolicy, type FundingCorrelationMode, type FundingPolicy } from "../accounting/revenueStreams";
 
 export type ProcessRole = "indexer" | "rewards" | "api" | "cli" | "test";
@@ -165,9 +166,24 @@ const RawEnv = z.object({
   PAYOUT_ASSET: z.string().default("SOL"),
   PAYOUT_MODE: z.enum(["dry_run", "live"]).default("dry_run"),
   ALLOW_MAINNET_PAYOUTS: bool(false),
+  /**
+   * Dedicated Last-60 payout wallet (docs/PAYOUT_WALLET.md). The address is the payout destination of
+   * every custody transfer and the only wallet payouts are signed from. The private key is loaded ONLY
+   * by the rewards worker's payout signer and must derive exactly this address (fail closed otherwise).
+   */
+  LAST60_PAYOUT_WALLET_ADDRESS: optionalPubkey,
+  LAST60_PAYOUT_WALLET_PRIVATE_KEY: z.string().optional(),
+  LAST60_PAYOUT_WALLET_KEYPAIR_PATH: z.string().optional(),
+  /** Legacy names (PR #1–#8) of the three variables above; accepted as aliases, never with a different value. */
   PAYOUT_WALLET_PUBLIC_KEY: optionalPubkey,
   PAYOUT_WALLET_PRIVATE_KEY: z.string().optional(),
   PAYOUT_WALLET_KEYPAIR_PATH: z.string().optional(),
+  /** Operator custody workflow (sweep requests and their verification). Disabled by default. */
+  LAST60_CUSTODY_ENABLED: bool(false),
+  /** Hours an open custody (sweep) request stays bindable before it expires. */
+  LAST60_CUSTODY_REQUEST_TTL_HOURS: int(168, 1, 8_760),
+  /** Operator re-evaluation of unresolved Forge attributions. Disabled by default. */
+  LAST60_ATTRIBUTION_RECOVERY_ENABLED: bool(false),
   PAYOUT_COMMITMENT: z.enum(["confirmed", "finalized"]).default("finalized"),
   PAYOUT_PRIORITY_FEE_MICROLAMPORTS: int(10_000, 0, 100_000_000),
   PAYOUT_COMPUTE_UNIT_LIMIT: int(40_000, 1_000, 1_400_000),
@@ -235,6 +251,14 @@ export interface ExpectedAllocation {
   cpmmCreatorFeeRate?: number | null;
 }
 
+export interface CustodyConfig {
+  /** Custody sweep requests / verification are enabled (LAST60_CUSTODY_ENABLED). */
+  enabled: boolean;
+  /** The dedicated payout wallet every custody transfer must reach (null: not configured — nothing is custodied). */
+  payoutWallet: string | null;
+  requestTtlMs: number;
+}
+
 export interface RevenueConfig {
   policy: FundingPolicy;
   /** Configured Last-60 funding destination wallets (owners). */
@@ -242,6 +266,10 @@ export interface RevenueConfig {
   /** Expected Forge platform LP Fee Key owner; null = not declared (Forge LP contributions unresolved). */
   forgePlatformLpBeneficiary: string | null;
   correlationMode: FundingCorrelationMode;
+  /** Physical custody of credited contributions (docs/REWARD_FUNDING.md §14). */
+  custody: CustodyConfig;
+  /** Operator recovery of unresolved Forge attributions (docs/REWARD_FUNDING.md §15). */
+  recoveryEnabled: boolean;
 }
 
 export interface AppConfig {
@@ -343,6 +371,7 @@ export class ConfigError extends Error {
 }
 
 const SECRET_KEYS = [
+  "LAST60_PAYOUT_WALLET_PRIVATE_KEY",
   "PAYOUT_WALLET_PRIVATE_KEY",
   "FEE_CLAIM_AUTHORITY_PRIVATE_KEY",
   "SCHEDULE_ENCRYPTION_KEY",
@@ -393,6 +422,17 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
   }
   const raw = parsed.data;
   problems.push(...assertNoPublicSecrets(env));
+  // Dedicated payout wallet: canonical LAST60_* names, legacy PAYOUT_WALLET_* names as aliases.
+  const alias = (name: string, v: string | undefined, legacy: string, l: string | undefined): string | undefined => {
+    const a = v?.trim() ? v : undefined;
+    const b = l?.trim() ? l : undefined;
+    // Never echo the values (one of them may be a private key).
+    if (a !== undefined && b !== undefined && a.trim() !== b.trim()) problems.push(`${name}: also set under the legacy name ${legacy} with a different value; set only ${name}`);
+    return a ?? b;
+  };
+  const payoutWalletAddress = alias("LAST60_PAYOUT_WALLET_ADDRESS", raw.LAST60_PAYOUT_WALLET_ADDRESS, "PAYOUT_WALLET_PUBLIC_KEY", raw.PAYOUT_WALLET_PUBLIC_KEY);
+  const payoutKey = alias("LAST60_PAYOUT_WALLET_PRIVATE_KEY", raw.LAST60_PAYOUT_WALLET_PRIVATE_KEY, "PAYOUT_WALLET_PRIVATE_KEY", raw.PAYOUT_WALLET_PRIVATE_KEY);
+  const payoutKeyPath = alias("LAST60_PAYOUT_WALLET_KEYPAIR_PATH", raw.LAST60_PAYOUT_WALLET_KEYPAIR_PATH, "PAYOUT_WALLET_KEYPAIR_PATH", raw.PAYOUT_WALLET_KEYPAIR_PATH);
 
   const rpcUrl = deriveRpcUrl(raw);
   if (!rpcUrl) problems.push("SOLANA_RPC_URL: is required (or set HELIUS_API_KEY)");
@@ -470,17 +510,17 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
   }
   if (role === "rewards") {
     if (!encryptionKey) problems.push("SCHEDULE_ENCRYPTION_KEY: is required for the rewards worker");
-    if (!raw.PAYOUT_WALLET_PUBLIC_KEY) problems.push("PAYOUT_WALLET_PUBLIC_KEY: is required for the rewards worker");
-    if (raw.PAYOUT_MODE === "live" && !raw.PAYOUT_WALLET_PRIVATE_KEY && !raw.PAYOUT_WALLET_KEYPAIR_PATH) {
-      problems.push("PAYOUT_WALLET_PRIVATE_KEY or PAYOUT_WALLET_KEYPAIR_PATH: required when PAYOUT_MODE=live");
+    if (!payoutWalletAddress) problems.push("LAST60_PAYOUT_WALLET_ADDRESS: is required for the rewards worker (legacy name PAYOUT_WALLET_PUBLIC_KEY)");
+    if (raw.PAYOUT_MODE === "live" && !payoutKey && !payoutKeyPath) {
+      problems.push("LAST60_PAYOUT_WALLET_PRIVATE_KEY or LAST60_PAYOUT_WALLET_KEYPAIR_PATH: required when PAYOUT_MODE=live (legacy names PAYOUT_WALLET_PRIVATE_KEY / PAYOUT_WALLET_KEYPAIR_PATH)");
     }
     if (raw.PAYOUT_MODE === "live" && raw.SOLANA_CLUSTER === "mainnet-beta" && !raw.ALLOW_MAINNET_PAYOUTS) {
       problems.push("ALLOW_MAINNET_PAYOUTS: must be explicitly set to true to send live payouts on mainnet-beta");
     }
     if (raw.FEE_COLLECTION_MODE === "auto_claim" && raw.LAUNCH_PROVIDER !== "mock") {
+      // The payout signer never signs fee claims (narrow scope): auto_claim needs its own key.
       const hasClaimKey = raw.FEE_CLAIM_AUTHORITY_PRIVATE_KEY || raw.FEE_CLAIM_AUTHORITY_KEYPAIR_PATH;
-      const hasPayoutKey = raw.PAYOUT_WALLET_PRIVATE_KEY || raw.PAYOUT_WALLET_KEYPAIR_PATH;
-      if (!hasClaimKey && !hasPayoutKey) problems.push("FEE_CLAIM_AUTHORITY_*: auto_claim needs the fee beneficiary's signing key");
+      if (!hasClaimKey) problems.push("FEE_CLAIM_AUTHORITY_PRIVATE_KEY or FEE_CLAIM_AUTHORITY_KEYPAIR_PATH: auto_claim needs the fee beneficiary's own signing key (the payout wallet key never signs fee claims)");
     }
   }
   if (role === "api" && raw.ADMIN_WALLETS.length > 0) {
@@ -488,9 +528,19 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
       problems.push("ADMIN_SESSION_SECRET: must be at least 32 characters when ADMIN_WALLETS is set");
     }
   }
-  if (raw.NODE_ENV === "production" && raw.PAYOUT_WALLET_PRIVATE_KEY && raw.PAYOUT_WALLET_KEYPAIR_PATH) {
-    problems.push("Set only one of PAYOUT_WALLET_PRIVATE_KEY / PAYOUT_WALLET_KEYPAIR_PATH");
+  if (payoutKey && payoutKeyPath) {
+    problems.push("Set only one of LAST60_PAYOUT_WALLET_PRIVATE_KEY / LAST60_PAYOUT_WALLET_KEYPAIR_PATH");
   }
+  if (payoutWalletAddress && raw.FORGE_PLATFORM_LP_BENEFICIARY && payoutWalletAddress === raw.FORGE_PLATFORM_LP_BENEFICIARY) {
+    problems.push("LAST60_PAYOUT_WALLET_ADDRESS: must be a dedicated wallet, not FORGE_PLATFORM_LP_BENEFICIARY");
+  }
+  // Startup validation of the signing key (rewards worker only — the only process that may hold it):
+  // missing address, malformed key or a key deriving another address is fatal. Messages are sanitized.
+  if (role === "rewards" && (payoutKey || payoutKeyPath)) {
+    const st = PayoutSigner.load({ privateKey: payoutKey, keypairPath: payoutKeyPath }, payoutWalletAddress ?? null).status;
+    if (st.code !== "ok") problems.push(`LAST60_PAYOUT_WALLET_PRIVATE_KEY: ${st.message}`);
+  }
+  if (raw.LAST60_CUSTODY_ENABLED && !payoutWalletAddress) problems.push("LAST60_CUSTODY_ENABLED: requires LAST60_PAYOUT_WALLET_ADDRESS (custody transfers must reach the dedicated payout wallet)");
 
   const expectedInt = (name: string, v: string | undefined, max: number): number | null => {
     if (v === undefined || v.trim() === "") return null;
@@ -533,7 +583,10 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
   if (raw.REWARD_FUNDING_POLICY === "forge_phase_aware_v1") problems.push("REWARD_FUNDING_POLICY: forge_phase_aware_v1 is retired (it treated the creator's 50 % LP allocation as Forge-funded, allowed other percentages and payable exclusive_window links); use forge_phase_aware_v2 — see docs/REWARD_FUNDING.md");
   const phaseAware = raw.REWARD_FUNDING_POLICY === "forge_phase_aware_v2";
   if (phaseAware && activationSlot === null) problems.push("REWARD_FUNDING_POLICY_ACTIVATION_SLOT: is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 (rounds snapshotting after it are funded by verified contributions only)");
-  if (phaseAware && raw.LAST60_FUNDING_DESTINATIONS.length === 0) problems.push("LAST60_FUNDING_DESTINATIONS: at least one destination wallet is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2");
+  // Under the approved policy the dedicated payout wallet is itself a funding destination (a bonding-curve
+  // contribution sent straight to it needs no custody transfer); it is added once, never duplicated.
+  const fundingDestinations = [...new Set([...raw.LAST60_FUNDING_DESTINATIONS, ...(phaseAware && payoutWalletAddress ? [payoutWalletAddress] : [])])];
+  if (phaseAware && fundingDestinations.length === 0) problems.push("LAST60_FUNDING_DESTINATIONS: at least one destination wallet is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 (the dedicated LAST60_PAYOUT_WALLET_ADDRESS counts)");
   if (phaseAware && !raw.FORGE_PLATFORM_LP_BENEFICIARY) problems.push("FORGE_PLATFORM_LP_BENEFICIARY: is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 (the creator's 50 % LP allocation is only verifiable against Forge's platform Fee Key owner)");
   if (raw.FORGE_PLATFORM_LP_BENEFICIARY && raw.LAST60_FUNDING_DESTINATIONS.includes(raw.FORGE_PLATFORM_LP_BENEFICIARY)) problems.push("LAST60_FUNDING_DESTINATIONS: must not include FORGE_PLATFORM_LP_BENEFICIARY (a self-transfer is not a contribution)");
   const bondingBps = raw.BONDING_CREATOR_FEE_LAST60_PERCENTAGE.trim() === "0" ? 0 : share("BONDING_CREATOR_FEE_LAST60_PERCENTAGE", raw.BONDING_CREATOR_FEE_LAST60_PERCENTAGE);
@@ -606,7 +659,7 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
       assetMint: payoutAssetMint,
       mode: raw.PAYOUT_MODE,
       allowMainnet: raw.ALLOW_MAINNET_PAYOUTS,
-      walletPublicKey: raw.PAYOUT_WALLET_PUBLIC_KEY ?? null,
+      walletPublicKey: payoutWalletAddress ?? null,
       commitment: raw.PAYOUT_COMMITMENT,
       priorityFeeMicroLamports: raw.PAYOUT_PRIORITY_FEE_MICROLAMPORTS,
       computeUnitLimit: raw.PAYOUT_COMPUTE_UNIT_LIMIT,
@@ -644,15 +697,17 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     },
     revenue: {
       policy: policy!,
-      fundingDestinations: [...new Set(raw.LAST60_FUNDING_DESTINATIONS)],
+      fundingDestinations,
       forgePlatformLpBeneficiary: raw.FORGE_PLATFORM_LP_BENEFICIARY ?? null,
       correlationMode: raw.FUNDING_CORRELATION_MODE,
+      custody: { enabled: raw.LAST60_CUSTODY_ENABLED, payoutWallet: payoutWalletAddress ?? null, requestTtlMs: raw.LAST60_CUSTODY_REQUEST_TTL_HOURS * 3_600_000 },
+      recoveryEnabled: raw.LAST60_ATTRIBUTION_RECOVERY_ENABLED,
     },
     terminal: { retentionDays: raw.TERMINAL_RETENTION_DAYS },
     public: { appName: raw.NEXT_PUBLIC_APP_NAME, explorer: raw.NEXT_PUBLIC_SOLANA_EXPLORER },
     secrets: {
-      payoutWalletPrivateKey: raw.PAYOUT_WALLET_PRIVATE_KEY,
-      payoutWalletKeypairPath: raw.PAYOUT_WALLET_KEYPAIR_PATH,
+      payoutWalletPrivateKey: payoutKey,
+      payoutWalletKeypairPath: payoutKeyPath,
       feeClaimAuthorityPrivateKey: raw.FEE_CLAIM_AUTHORITY_PRIVATE_KEY,
       feeClaimAuthorityKeypairPath: raw.FEE_CLAIM_AUTHORITY_KEYPAIR_PATH,
     },

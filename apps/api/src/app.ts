@@ -16,9 +16,19 @@ import {
   SettingsStore,
   SettingsValidationError,
   CRITICAL_KEYS,
+  buildFundingPipeline,
+  cancelCustodyRequest,
+  createCustodyRequest,
+  CustodyError,
+  payoutWalletVerification,
+  recoverAttribution,
+  RecoveryError,
+  revenueRuntimeOf,
+  submitCustodySignature,
   type AppConfig,
   type Models,
   type ChainRpc,
+  type LaunchProvider,
 } from "@last60/engine";
 import type { HealthDTO } from "@last60/shared";
 import { AdminAuth, AuthError } from "./auth";
@@ -32,6 +42,8 @@ export interface ApiDeps {
   hub: StreamHub;
   auth: AdminAuth;
   rpc?: ChainRpc | null;
+  /** Loads the configured launch (with its verified destination) for operator recovery; lazy. */
+  providerFor?: () => Promise<LaunchProvider>;
   now?: () => number;
   sseLimits?: { perIp: number; total: number; maxLifetimeMs: number };
 }
@@ -162,6 +174,8 @@ export function createApp(d: ApiDeps) {
   });
   app.onError((err, c) => {
     if (err instanceof AuthError) return c.json({ error: err.message }, err.status);
+    if (err instanceof CustodyError) return c.json({ error: err.message, code: err.code }, 409);
+    if (err instanceof RecoveryError) return c.json({ error: err.message, code: err.code }, 400);
     if (err instanceof z.ZodError) return c.json({ error: "invalid request", issues: err.issues.map((i) => `${i.path.join(".")}: ${i.message}`) }, 400);
     console.error(err);
     return c.json({ error: "internal error" }, 500);
@@ -343,6 +357,66 @@ export function createApp(d: ApiDeps) {
     const state = c.req.query("state");
     const rows = await d.db.Payout.find(state ? { state } : {}).sort({ createdAt: -1 }).limit(100).lean();
     return c.json(jsonSafe(rows));
+  });
+
+  // ── dedicated payout wallet, custody and attribution recovery (docs/REWARD_FUNDING.md §14–§16) ──
+  // Read-only views never include key material. Mutations take no amount, recipient, eligibility or
+  // status from the request: they are derived from the stored contribution and the configured wallet.
+  const custodyCfg = () => ({ enabled: d.cfg.revenue.custody.enabled, payoutWallet: d.cfg.revenue.custody.payoutWallet, requestTtlMs: d.cfg.revenue.custody.requestTtlMs });
+  const audit = async (c: Context<Env>, action: string, key: string, to: unknown, reason: string | null) =>
+    d.db.ConfigAudit.create({ version: (await d.settings.raw()).version, actor: c.get("admin"), action, changes: [{ key, from: null, to: jsonSafe(to) }], reason, ip: ipOf(c) });
+  admin.get("/payout-wallet", async (c) => {
+    const s = await d.settings.get();
+    return c.json(jsonSafe(await payoutWalletVerification(d.db, { address: d.cfg.payout.walletPublicKey, runtimeExpectedAddress: s.expectedPayoutPublicKey, rpc: d.rpc ?? null, payoutMode: s.payoutMode })));
+  });
+  admin.get("/funding", async (c) => {
+    const s = await d.settings.get();
+    const wallet = await payoutWalletVerification(d.db, { address: d.cfg.payout.walletPublicKey, runtimeExpectedAddress: s.expectedPayoutPublicKey, rpc: d.rpc ?? null, payoutMode: s.payoutMode });
+    const pipeline = await buildFundingPipeline(d.db, { payoutWallet: d.cfg.payout.walletPublicKey, balance: wallet.balanceLamports === null ? null : BigInt(wallet.balanceLamports), reserveLamports: d.cfg.payout.minReserveLamports, sourcePool: s.poolAddress });
+    return c.json(jsonSafe({ wallet, pipeline, features: { custodyEnabled: d.cfg.revenue.custody.enabled, recoveryEnabled: d.cfg.revenue.recoveryEnabled } }));
+  });
+  admin.post("/funding/custody", async (c) => {
+    const body = z.object({ fundingKey: z.string().min(1).max(500), reason: z.string().max(500).optional() }).strict().parse(await c.req.json());
+    const row = await createCustodyRequest(d.db, custodyCfg(), { fundingKey: body.fundingKey, actor: c.get("admin"), now: now() });
+    await audit(c, "custody_request", body.fundingKey, { custodyId: row.custodyId, expected: row.instructions.lamports }, body.reason ?? null);
+    return c.json(jsonSafe({ custodyId: row.custodyId, fundingKey: row.fundingKey, sourceWallet: row.sourceWallet, destinationWallet: row.destinationWallet, expectedAmount: row.instructions.lamports, memo: row.memo, expiresAt: row.expiresAt, instructions: row.instructions }));
+  });
+  admin.post("/funding/custody/:id/submit", async (c) => {
+    const body = z.object({ signature: z.string().min(64).max(90) }).strict().parse(await c.req.json());
+    if (!d.rpc) return c.json({ error: "no RPC configured in the API process" }, 503);
+    const r = await submitCustodySignature(d.db, d.rpc, custodyCfg(), { custodyId: c.req.param("id"), signature: body.signature, actor: c.get("admin"), now: now() });
+    await audit(c, "custody_submit", c.req.param("id"), r, body.signature);
+    return c.json(jsonSafe(r), r.accepted ? 200 : 422);
+  });
+  admin.post("/funding/custody/:id/cancel", async (c) => {
+    const body = z.object({ reason: z.string().min(3).max(300) }).strict().parse(await c.req.json());
+    const r = await cancelCustodyRequest(d.db, { custodyId: c.req.param("id"), actor: c.get("admin"), reason: body.reason, now: now() });
+    await audit(c, "custody_cancel", c.req.param("id"), r, body.reason);
+    return c.json(r);
+  });
+  admin.get("/funding/custody/:id", async (c) => {
+    const row = await d.db.CustodyTransfer.findOne({ custodyId: c.req.param("id") }).lean();
+    return row ? c.json(jsonSafe(row)) : c.json({ error: "not found" }, 404);
+  });
+  admin.get("/funding/attributions", async (c) => {
+    const status = c.req.query("status") ?? "unresolved";
+    if (!["pending", "linked", "unresolved"].includes(status)) return c.json({ error: "invalid status" }, 400);
+    return c.json(jsonSafe(await d.db.FundingAttribution.find({ status }).sort({ slot: -1 }).limit(200).lean()));
+  });
+  admin.post("/funding/attributions/recover", async (c) => {
+    // Strict: an amount, payoutEligible, collectionKey, status or correlation field is a 400.
+    const body = z.object({ attributionKey: z.string().min(1).max(500), requestId: z.string().max(80).optional(), note: z.string().max(500).optional() }).strict().parse(await c.req.json());
+    if (!d.providerFor) return c.json({ error: "recovery requires the configured launch provider" }, 503);
+    if (!d.rpc) return c.json({ error: "no RPC configured in the API process" }, 503);
+    const rr = revenueRuntimeOf(d.cfg);
+    if (!rr) return c.json({ error: "revenue runtime unavailable" }, 503);
+    const out: any = await recoverAttribution({ db: d.db, provider: d.providerFor, runtime: rr, rpc: d.rpc, enabled: d.cfg.revenue.recoveryEnabled, now }, { attributionKey: body.attributionKey, operator: c.get("admin"), requestId: body.requestId, note: body.note });
+    await audit(c, "attribution_recovery", body.attributionKey, { requestId: out.requestId, outcome: out.outcome, rewardFundingKey: out.rewardFundingKey ?? null }, body.note ?? null);
+    return c.json(jsonSafe(out), out.outcome === "rejected" ? 409 : 200);
+  });
+  admin.get("/funding/recoveries", async (c) => {
+    const key = c.req.query("attributionKey");
+    return c.json(jsonSafe(await d.db.AttributionRecovery.find(key ? { attributionKey: key } : {}).sort({ requestedAt: -1 }).limit(100).lean()));
   });
   app.route("/api/admin", admin);
 

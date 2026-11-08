@@ -17,7 +17,7 @@ import type { FlatInstruction, NormalizedTx } from "../chain/tx";
 import { decodeTokenTransfer, SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID, subtreeTransfers, tokenAccountInfo } from "../chain/tx";
 import { COLLECT_CP_FEES_DISC, RAYDIUM_CP_LOCK_PROGRAM_ID } from "../providers/migration";
 import type { ParsedTransaction } from "../providers/LaunchProvider";
-import { assetOf, FORGE_CREATOR_DISTRIBUTION, NATIVE_SOL, parseFundingMemo, type CollectionStream, type FundingRoute, type LaunchPhase } from "../accounting/revenueStreams";
+import { assetOf, FORGE_CREATOR_DISTRIBUTION, NATIVE_SOL, parseCustodyMemo, parseFundingMemo, type CollectionStream, type FundingRoute, type LaunchPhase } from "../accounting/revenueStreams";
 
 export const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
 export const MEMO_PROGRAM_IDS = new Set(["MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", "Memo1UhkJRfHyvLMcVucJwxXeuD728EQVDDwQDxFMNo"]);
@@ -105,6 +105,17 @@ export function fundingMemoOf(tx: NormalizedTx): string | null | "ambiguous" {
   }
   if (sigs.size === 0) return null;
   return sigs.size === 1 ? [...sigs][0]! : "ambiguous";
+}
+
+/** Distinct `last60:custody:v1:<id>` memos in the transaction (custody transfers, never contributions). */
+export function custodyMemosOf(tx: NormalizedTx): string[] {
+  const ids = new Set<string>();
+  for (const ix of tx.instructions) {
+    if (!MEMO_PROGRAM_IDS.has(ix.programId)) continue;
+    const id = parseCustodyMemo(ix.data.toString("utf8"));
+    if (id) ids.add(id);
+  }
+  return [...ids];
 }
 
 /** System Program `Transfer` (instruction tag 2): [from, to], u64 lamports at byte 4. */
@@ -231,9 +242,11 @@ export function extractRevenue(tx: NormalizedTx, parsed: ParsedTransaction, f: R
   const forgeLegs = new Set(forge.map((x) => x.ordinal));
   out.push(...forge);
 
-  // 5. Funding inflows into configured Last-60 destinations.
+  // 5. Funding inflows into configured Last-60 destinations. A transaction declared as a CUSTODY
+  //    transfer (last60:custody:v1 memo) moves an already-credited contribution into the payout wallet:
+  //    it is never a second contribution, so none of its transfers is recorded as a funding inflow.
   const destinations = new Set(f.fundingDestinations);
-  if (destinations.size) {
+  if (destinations.size && custodyMemosOf(tx).length === 0) {
     const sources = new Set([f.creator, f.forgePlatformLpBeneficiary, f.destination?.platformNftWallet].filter((x): x is string => !!x));
     const memo = fundingMemoOf(tx);
     const memoSig = memo === "ambiguous" ? null : memo;

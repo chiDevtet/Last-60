@@ -10,7 +10,7 @@
  *     reusing the persisted snapshot slot (deterministic).
  *   - Allocation, payouts and ledger entries are committed in ONE MongoDB transaction.
  */
-import type { Keypair } from "@solana/web3.js";
+import type { PublicKey } from "@solana/web3.js";
 import { basesOf, basisDistributable } from "../accounting/attribution";
 import type { AppConfig } from "../config/env";
 import type { EffectiveSettings, SettingsStore } from "../config/runtime";
@@ -30,6 +30,7 @@ import { allocate } from "./allocation";
 import { boundsOf, drawExecuteAt, roundIndexAt, type ScheduleParams } from "./roundMath";
 import { periodFees, selectRecipients } from "./selection";
 import { persistAttributions } from "../indexer/ingest";
+import { custodyCoverage } from "../custody/custody";
 
 export interface SchedulerDeps {
   db: Models;
@@ -37,7 +38,8 @@ export interface SchedulerDeps {
   settings: SettingsStore;
   rpc: ChainRpc;
   provider: () => LaunchProvider;
-  payer: Keypair | null;
+  /** Only the payout wallet's PUBLIC key is needed here (excluded from selection). */
+  payer: { publicKey: PublicKey } | null;
   terminal: TerminalWriter;
   clock: Clock;
   random?: (min: number, max: number) => number;
@@ -303,7 +305,7 @@ export class RoundScheduler {
       if (legacyCap !== null) {
         legacyFees = period.afterSlot !== null && period.afterSlot >= legacyCap ? 0n : (await periodFees(this.d.db, { ...period, snapshotSlot: Math.min(snapshotSlot, legacyCap) }, settings.payoutAssetMint, { verifiedBasisIds })).payout;
       }
-      const funding = phaseAware ? await this.consumableFunding(policy!, snapshotSlot, settings.payoutAssetMint) : { credits: [], total: 0n, byStream: {}, pendingFinality: 0, heldByAllocationGuard: 0 };
+      const funding = phaseAware ? await this.consumableFunding(policy!, snapshotSlot, settings.payoutAssetMint) : { credits: [], total: 0n, byStream: {}, pendingFinality: 0, heldByAllocationGuard: 0, awaitingCustody: 0, awaitingCustodyAmount: 0n };
       const rolloverIn = prev ? big(prev.rolloverOut) : 0n;
       const a = allocate({ fees: legacyFees, funding: funding.total, rolloverIn, rewardBps: settings.rewardBps, recipients: selection.recipients.map((r) => r.wallet), minPayout: settings.minPayoutLamports, skippedRoundPolicy: settings.skippedRoundPolicy });
       const dryRun = settings.payoutMode !== "live";
@@ -341,7 +343,7 @@ export class RoundScheduler {
               feeBreakdown: { byPhase: fees.byPhase, swaps: fees.swaps, attributions: fees.attributions, verifiedBasisIds, bases: bases.map((b) => ({ id: b.id, phase: b.phase, pool: b.pool, role: b.role, beneficiary: b.beneficiary, verification: b.verification })) },
               fundingPolicy: policy ? { ...policySnapshot(policy), inForce: phaseAware ? policy!.version : "legacy_creator_fee_v1", legacyFeeSlotCap: legacyCap } : null,
               funding: dec(funding.total),
-              fundingBreakdown: { byStream: Object.fromEntries(Object.entries(funding.byStream).map(([k, v]) => [k, (v as bigint).toString()])), credits: funding.credits.length, pendingFinality: funding.pendingFinality, heldByAllocationGuard: funding.heldByAllocationGuard, creatorFeesRecordedNotDistributed: (fees.payout - legacyFees).toString() },
+              fundingBreakdown: { byStream: Object.fromEntries(Object.entries(funding.byStream).map(([k, v]) => [k, (v as bigint).toString()])), credits: funding.credits.length, pendingFinality: funding.pendingFinality, heldByAllocationGuard: funding.heldByAllocationGuard, awaitingCustody: funding.awaitingCustody, awaitingCustodyAmount: funding.awaitingCustodyAmount.toString(), custodyPayoutWallet: this.payoutWallet(), creatorFeesRecordedNotDistributed: (fees.payout - legacyFees).toString() },
               reward: dec(a.pool),
               retained: dec(a.retained + a.retainedPool),
               rolloverIn: dec(a.rolloverIn),
@@ -422,15 +424,27 @@ export class RoundScheduler {
    * consumed, in the payout asset, after the activation slot, at or before the snapshot, correlated
    * by same transaction or memo — and whose transfer AND original claim transactions are both
    * FINALIZED and successful (a confirmed-but-forked transfer or claim can never fund a payout; such
-   * credits wait for a later round, and a claim that never finalizes never funds). Finally the
+   * credits wait for a later round, and a claim that never finalizes never funds) — and whose SOL is
+   * physically in the dedicated payout wallet (direct transfer, or finalized, reconciled custody
+   * transfers covering the whole credit; docs/REWARD_FUNDING.md §14). Finally the
    * per-claim cap guarantees that the total ever consumed for one claim never exceeds its expected
    * Last-60 allocation, whatever was written by concurrent reconciliation passes.
    */
+  /** The dedicated payout wallet (environment only — never a runtime override). */
+  private payoutWallet(): string | null {
+    return this.d.cfg.revenue?.custody?.payoutWallet ?? this.d.cfg.payout.walletPublicKey ?? null;
+  }
+
   private async consumableFunding(policy: NonNullable<AppConfig["revenue"]>["policy"], snapshotSlot: number, payoutMint: string) {
     const match = consumableFundingMatch(policy, snapshotSlot, payoutMint);
     const candidates: any[] = match ? await this.d.db.RewardFunding.find(match).sort({ slot: 1, ordinal: 1 }).lean() : [];
     const claimSig = (c: any) => c.collectionSignature ?? String(c.collectionKey).split(":")[1];
-    const sigs = [...new Set(candidates.flatMap((c) => [c.signature, claimSig(c)]).filter(Boolean))];
+    // Physical custody (docs/REWARD_FUNDING.md §14): an attributed credit is not liquidity. It funds a
+    // round only once its SOL is independently observed in the dedicated payout wallet — its own
+    // transfer went there (direct), or finalized, reconciled custody transfers cover all of it.
+    const coverage = await custodyCoverage(this.d.db, candidates, this.payoutWallet());
+    const custodySigs = (c: any) => coverage.get(c.key)?.signatures ?? [];
+    const sigs = [...new Set(candidates.flatMap((c) => [c.signature, claimSig(c), ...custodySigs(c)]).filter(Boolean))];
     const finalized = new Set<string>();
     for (let i = 0; i < sigs.length; i += 200) {
       const chunk = sigs.slice(i, i + 200);
@@ -439,7 +453,10 @@ export class RoundScheduler {
         if (st[j] && !st[j]!.err && st[j]!.confirmationStatus === "finalized") finalized.add(sig);
       });
     }
-    const final = candidates.filter((c) => finalized.has(c.signature) && finalized.has(claimSig(c)));
+    const attributedFinal = candidates.filter((c) => finalized.has(c.signature) && finalized.has(claimSig(c)));
+    const custodied = (c: any) => !!coverage.get(c.key)?.satisfied && custodySigs(c).every((x) => finalized.has(x));
+    const final = attributedFinal.filter(custodied);
+    const awaiting = attributedFinal.filter((c) => !custodied(c));
     // Per-claim cap over every credit of the claims involved (already-consumed ones count first).
     const cols = [...new Set(final.map((c) => c.collectionKey))];
     const recs: any[] = cols.length ? await this.d.db.RevenueReconciliation.find({ key: { $in: cols } }, { key: 1, expectedLast60: 1 }).lean() : [];
@@ -458,7 +475,8 @@ export class RoundScheduler {
       total += v;
       byStream[c.stream] = (byStream[c.stream] ?? 0n) + v;
     }
-    return { credits, total, byStream, pendingFinality: candidates.length - final.length, heldByAllocationGuard: cap.blocked.length };
+    if (awaiting.length) this.log.info({ awaitingCustody: awaiting.length }, "attributed contributions awaiting custody in the payout wallet");
+    return { credits, total, byStream, pendingFinality: candidates.length - attributedFinal.length, heldByAllocationGuard: cap.blocked.length, awaitingCustody: awaiting.length, awaitingCustodyAmount: awaiting.reduce((s, c) => s + big(c.creditableAmount), 0n) };
   }
 
   /**

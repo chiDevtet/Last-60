@@ -18,6 +18,7 @@
  * a claim whose distribution never comes stays "awaiting_distribution" with its untransferred balance.
  */
 import { PublicKey } from "@solana/web3.js";
+import type { ClientSession } from "mongoose";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import type { Models } from "../db/models";
 import { big, dec } from "../db/decimal";
@@ -55,6 +56,7 @@ import {
   type TransferFact,
 } from "../accounting/revenueStreams";
 import { extractRevenue, revenueEventKey, type RevenueDraft, type RevenueLaunchFacts } from "./decode";
+import { claimTransferUse, ingestCustodyTransfers, transferKeyOf } from "../custody/custody";
 
 export interface RevenueRuntime {
   cluster: string;
@@ -62,12 +64,14 @@ export interface RevenueRuntime {
   fundingDestinations: string[];
   forgePlatformLpBeneficiary: string | null;
   correlationMode: FundingCorrelationMode;
+  /** Custody workflow (memo-matched custody transfers into the dedicated payout wallet). */
+  custody?: { enabled: boolean; payoutWallet: string | null; requestTtlMs?: number };
 }
 
 /** Revenue runtime from the application configuration (null when the config predates PR #6, e.g. tests). */
-export function revenueRuntimeOf(cfg: { solana: { cluster: string }; revenue?: { policy: FundingPolicy; fundingDestinations: string[]; forgePlatformLpBeneficiary: string | null; correlationMode: FundingCorrelationMode } }): RevenueRuntime | null {
+export function revenueRuntimeOf(cfg: { solana: { cluster: string }; revenue?: { policy: FundingPolicy; fundingDestinations: string[]; forgePlatformLpBeneficiary: string | null; correlationMode: FundingCorrelationMode; custody?: RevenueRuntime["custody"] } }): RevenueRuntime | null {
   if (!cfg.revenue?.policy) return null;
-  return { cluster: cfg.solana.cluster, policy: cfg.revenue.policy, fundingDestinations: cfg.revenue.fundingDestinations, forgePlatformLpBeneficiary: cfg.revenue.forgePlatformLpBeneficiary, correlationMode: cfg.revenue.correlationMode };
+  return { cluster: cfg.solana.cluster, policy: cfg.revenue.policy, fundingDestinations: cfg.revenue.fundingDestinations, forgePlatformLpBeneficiary: cfg.revenue.forgePlatformLpBeneficiary, correlationMode: cfg.revenue.correlationMode, custody: cfg.revenue.custody };
 }
 
 /**
@@ -89,10 +93,12 @@ export function forgeDistributionWatch(info: Pick<PoolInfo, "tokenMint" | "baseT
 }
 
 /** Addresses the indexer must also watch so funding inflows in separate transactions are observed. */
-export function revenueWatchAddresses(r: Pick<RevenueRuntime, "fundingDestinations" | "forgePlatformLpBeneficiary"> | Pick<RevenueRuntime, "fundingDestinations"> | null | undefined, info?: Pick<PoolInfo, "tokenMint" | "baseTokenProgram" | "destination"> | null): string[] {
+export function revenueWatchAddresses(r: (Pick<RevenueRuntime, "fundingDestinations"> & Partial<Pick<RevenueRuntime, "forgePlatformLpBeneficiary" | "custody">>) | null | undefined, info?: Pick<PoolInfo, "tokenMint" | "baseTokenProgram" | "destination"> | null): string[] {
   if (!r) return [];
-  const forge = info && "forgePlatformLpBeneficiary" in r ? forgeDistributionWatch(info, r).map((w) => w.address) : [];
-  return [...new Set([...r.fundingDestinations, ...forge])];
+  const forge = info && "forgePlatformLpBeneficiary" in r ? forgeDistributionWatch(info, r as Pick<RevenueRuntime, "forgePlatformLpBeneficiary">).map((w) => w.address) : [];
+  // The dedicated payout wallet is watched when custody is enabled (memo-matched custody transfers).
+  const payout = r.custody?.enabled && r.custody.payoutWallet ? [r.custody.payoutWallet] : [];
+  return [...new Set([...r.fundingDestinations, ...forge, ...payout])];
 }
 
 /** Launch facts the Forge creator-distribution attribution needs (null: the route is not applicable). */
@@ -205,6 +211,8 @@ export interface RevenueIngestResult {
 /** Decode, verify and persist the revenue facts of one transaction, then reconcile the launch. Idempotent. */
 export async function ingestRevenue(db: Models, tx: NormalizedTx, parsed: ParsedTransaction, provider: LaunchProvider, r: RevenueRuntime, opts: { commitment: "confirmed" | "finalized" }): Promise<RevenueIngestResult> {
   const f = revenueFactsOf(provider, r);
+  // Custody transfers (last60:custody:v1 memo) are matched to their open request; they are never revenue.
+  await ingestCustodyTransfers(db, tx, r.custody, opts.commitment);
   const drafts = extractRevenue(tx, parsed, f);
   if (!drafts.length) return { newEvents: 0, newCredits: 0 };
   const info = provider.info();
@@ -335,8 +343,12 @@ function collectionFact(c: any, absorbed: Map<string, bigint>, linked: bigint): 
   return { key: c.key, stream: c.stream, signature: c.signature, slot: c.slot, ordinal: c.ordinal, asset: c.asset, recipient: c.beneficiary, gross: big(c.netAmount), expectedLast60: expectedLast60Of(c, absorbed), linked, verified: c.snapshot?.verification === "verified" && c.status === "collected" };
 }
 
-async function linkedTotals(db: Models, keys: string[], excludeCredits: string[] = []): Promise<Map<string, { observed: bigint; creditable: bigint }>> {
-  const rows: any[] = keys.length ? await db.RewardFunding.aggregate([{ $match: { collectionKey: { $in: keys }, ...(excludeCredits.length ? { key: { $nin: excludeCredits } } : {}) } }, { $group: { _id: "$collectionKey", o: { $sum: "$observedAmount" }, c: { $sum: "$creditableAmount" } } }]) : [];
+export async function linkedTotals(db: Models, keys: string[], excludeCredits: string[] = [], session?: ClientSession): Promise<Map<string, { observed: bigint; creditable: bigint }>> {
+  const agg = () => {
+    const a = db.RewardFunding.aggregate([{ $match: { collectionKey: { $in: keys }, ...(excludeCredits.length ? { key: { $nin: excludeCredits } } : {}) } }, { $group: { _id: "$collectionKey", o: { $sum: "$observedAmount" }, c: { $sum: "$creditableAmount" } } }]);
+    return session ? a.session(session) : a;
+  };
+  const rows: any[] = keys.length ? await agg() : [];
   return new Map(rows.map((x) => [x._id, { observed: big(x.o), creditable: big(x.c) }]));
 }
 
@@ -348,7 +360,7 @@ export type LaunchRef = { sourcePool: string; quoteMint: string; provider: strin
  * condition is evaluated here, for every correlation method alike; `o.supported` lets a method bound
  * the creditable amount further (never raise it) and `o.extraReasons` add method-specific refusals.
  */
-async function writeCredit(
+export async function writeCredit(
   db: Models,
   launch: LaunchRef,
   r: RevenueRuntime,
@@ -357,8 +369,12 @@ async function writeCredit(
   fact: CollectionFact,
   method: CorrelationMethod,
   alreadyCreditable: bigint,
-  o: { supported?: bigint; excess?: bigint; extraReasons?: string[]; attribution?: Record<string, unknown> | null } = {},
+  o: { supported?: bigint; excess?: bigint; extraReasons?: string[]; attribution?: Record<string, unknown> | null; session?: ClientSession } = {},
 ): Promise<{ inserted: boolean; payable: boolean; reasons: string[] }> {
+  // One on-chain transfer, one use: a transfer already used as a custody transfer is never also a
+  // contribution (and the reservation makes a later custody binding of this transfer impossible).
+  const use = await claimTransferUse(db, { key: transferKeyOf(t.signature, t.ordinal), use: "reward_funding", ref: t.key, signature: t.signature, ordinal: t.ordinal }, o.session);
+  if (!use.ok) return { inserted: false, payable: false, reasons: [`transfer_already_used_as_${use.existing}`] };
   const expected = fact.expectedLast60 ?? 0n;
   const remaining = expected > alreadyCreditable ? expected - alreadyCreditable : 0n;
   const phaseAware = r.policy.version === CURRENT_PHASE_AWARE_VERSION && r.policy.activationSlot !== null;
@@ -434,7 +450,7 @@ async function writeCredit(
         createdAt: new Date(),
       },
     },
-    { upsert: true },
+    { upsert: true, ...(o.session ? { session: o.session } : {}) },
   );
   return { inserted: !!res.upsertedCount, payable, reasons };
 }
@@ -515,84 +531,20 @@ export async function attributeForgeDistributions(db: Models, launch: LaunchRef,
   let decided = 0;
   const queue: any[] = await db.FundingAttribution.find({ sourcePool: launch.sourcePool, status: "pending" }, { signature: 1, slot: 1 }).sort({ slot: 1, ordinal: 1 }).limit(limit).lean();
   if (!queue.length) return { newCredits, touched, decided };
-  const coverages = await Promise.all(forge.coverageKeys.map((k) => coveredThroughSlot(db, k)));
-  const covered = coverages.some((c) => c === null) ? null : Math.min(...(coverages as number[]));
+  const covered = await forgeCoverage(db, forge);
   const signatures = [...new Set(queue.map((q) => q.signature))];
+  const writer: CreditWriter = async (p) => {
+    const w = await writeCredit(db, launch, r, p.t, p.col, p.fact, p.method, p.alreadyCreditable, p.o);
+    if (w.inserted) newCredits++;
+    touched.add(p.col.key);
+    return w;
+  };
   for (const sig of signatures) {
-    const legsAll: any[] = await db.RevenueEvent.find({ sourcePool: launch.sourcePool, kind: "funding_inflow", route: FORGE_CREATOR_DISTRIBUTION, signature: sig }).sort({ ordinal: 1 }).lean();
-    if (!legsAll.length) continue;
-    const slot = legsAll[0].slot;
-    const toCreator = legsAll.filter((e) => e.destinationOwner === forge.creator);
-    const decisions = new Map<string, { status: "linked" | "unresolved" | "pending"; reasons: string[]; candidates: string[]; collection?: any; method?: CorrelationMethod; payable?: boolean; evidence?: Record<string, unknown> }>();
-    for (const e of legsAll) if (e.destinationOwner !== forge.creator) decisions.set(e.key, { status: "unresolved", reasons: [`recipient_not_launch_creator: ${e.destinationOwner ?? "?"} (Forge outflow in a creator-distribution transaction; never Last-60 funding)`], candidates: [] });
-
-    // (a) Explicit evidence first: same transaction as the harvest, or a last60:v1 memo naming it.
-    const remainingLegs: any[] = [];
-    for (const t of toCreator) {
-      const or: any[] = [{ signature: t.signature }];
-      if (t.memoClaimSignature) or.push({ signature: t.memoClaimSignature });
-      const cands: any[] = await db.RevenueEvent.find({ sourcePool: launch.sourcePool, kind: "collection", stream: "forge_platform_lp_fee_collection", beneficiary: t.sourceOwner, $or: or }).lean();
-      if (!cands.length) {
-        remainingLegs.push(t);
-        continue;
-      }
-      const totals = await linkedTotals(db, cands.map((c) => c.key), [t.key]);
-      const facts = cands.map((c) => collectionFact(c, absorbed, totals.get(c.key)?.observed ?? 0n));
-      const link = correlateTransfer(transferFact(t), facts, "strict");
-      if (!link.linked) {
-        remainingLegs.push(t);
-        continue;
-      }
-      const col = cands.find((c) => c.key === link.collectionKey)!;
-      const w = await writeCredit(db, launch, r, t, col, facts.find((c) => c.key === col.key)!, link.method, totals.get(col.key)?.creditable ?? 0n);
-      if (w.inserted) newCredits++;
-      touched.add(col.key);
-      decisions.set(t.key, { status: "linked", reasons: w.reasons, candidates: [col.signature], collection: col, method: link.method, payable: w.payable });
-    }
-
-    // (b) Forge's existing memo-less payout: structural sequence attribution.
-    if (remainingLegs.length) {
-      const harvestRows: any[] = await db.RevenueEvent.find({ sourcePool: launch.sourcePool, stream: "forge_platform_lp_fee_collection", slot: { $lte: slot } }).sort({ slot: -1, ordinal: -1 }).limit(HARVEST_ROWS).lean();
-      const harvests = groupHarvests(harvestRows, absorbed);
-      // The window must reach the harvest before the latest one (or the start of the launch's harvests).
-      const distinctSlots = [...new Set(harvests.filter((h) => h.slot < slot).map((h) => h.slot))].sort((a, b) => b - a);
-      let truncated = harvestRows.length === HARVEST_ROWS && distinctSlots.length < 2;
-      const lo = distinctSlots[1] ?? distinctSlots[0] ?? slot;
-      const windowRows: any[] = await db.RevenueEvent.find({ sourcePool: launch.sourcePool, kind: "funding_inflow", route: FORGE_CREATOR_DISTRIBUTION, "evidence.anchored": true, slot: { $gte: lo, $lte: slot }, signature: { $ne: sig } }, { signature: 1, slot: 1, evidence: 1 }).limit(WINDOW_DISTRIBUTION_ROWS).lean();
-      if (windowRows.length === WINDOW_DISTRIBUTION_ROWS) truncated = true;
-      const distributions: ForgeDistributionTx[] = [...new Map(windowRows.map((w) => [w.signature, { signature: w.signature, slot: w.slot, anchored: true, problems: [], legs: [] }])).values()];
-      const problems = [...new Set(legsAll.flatMap((e) => (e.evidence?.problems ? String(e.evidence.problems).split(" | ") : [])))];
-      const d: ForgeDistributionTx = { signature: sig, slot, anchored: !!legsAll[0].evidence?.anchored, problems, legs: remainingLegs.map(transferFact) };
-      const harvestKeys = harvests.flatMap((h) => h.legs.map((l) => l.key));
-      const totals = await linkedTotals(db, harvestKeys, legsAll.map((e) => e.key));
-      const linkedElsewhere = new Map([...totals].map(([k, v]) => [k, v.creditable]));
-      const result: ForgeAttribution = attributeForgeDistribution(d, { harvests, distributions, coveredThroughSlot: covered, windowTruncated: truncated, tokenAsset: assetOf(forge.tokenMint), linkedElsewhere });
-      const evidence = { method: "forge_distribution_sequence", distributionSignature: sig, distributionSlot: slot, anchorMint: forge.tokenMint, forgeWallet: forge.forgeWallet, creator: forge.creator, coveredThroughSlot: covered, ...(result.outcome === "linked" ? { harvestSignature: result.harvest, harvestSlot: result.harvestSlot, previousHarvestSignature: result.previousHarvest } : {}) };
-      if (result.outcome === "pending") {
-        for (const t of remainingLegs) decisions.set(t.key, { status: "pending", reasons: result.reasons, candidates: [] });
-      } else if (result.outcome === "unresolved") {
-        for (const t of remainingLegs) decisions.set(t.key, { status: "unresolved", reasons: result.reasons, candidates: result.candidates, evidence });
-      } else {
-        const H = harvestRows.filter((c) => c.signature === result.harvest);
-        for (const leg of result.legs) {
-          const t = remainingLegs.find((x) => x.key === leg.transferKey)!;
-          const col = leg.collectionKey ? H.find((c) => c.key === leg.collectionKey) : null;
-          if (!col) {
-            decisions.set(t.key, { status: "unresolved", reasons: leg.reasons, candidates: [result.harvest], evidence });
-            continue;
-          }
-          const fact = collectionFact(col, absorbed, 0n);
-          const w = await writeCredit(db, launch, r, t, col, fact, "forge_distribution_sequence", linkedElsewhere.get(col.key) ?? 0n, { supported: leg.creditable, excess: leg.excess, extraReasons: leg.reasons, attribution: evidence });
-          if (w.inserted) newCredits++;
-          touched.add(col.key);
-          decisions.set(t.key, { status: "linked", reasons: w.reasons, candidates: [result.harvest], collection: col, method: "forge_distribution_sequence", payable: w.payable, evidence });
-        }
-      }
-    }
-
+    const ev = await evaluateForgeDistribution(db, launch, forge, absorbed, sig, covered, writer);
+    if (!ev) continue;
     // Record the decisions (pending → decided, conditionally; a decided row is never rewritten).
-    for (const e of legsAll) {
-      const dcs = decisions.get(e.key);
+    for (const e of ev.legsAll) {
+      const dcs = ev.decisions.get(e.key);
       if (!dcs) continue;
       const credit: any = dcs.status === "linked" ? await db.RewardFunding.findOne({ key: e.key }, { collectionKey: 1, collectionSignature: 1, correlationMethod: 1, payoutEligible: 1, ineligibleReason: 1 }).lean() : null;
       const set: Record<string, unknown> = { evaluatedAt: new Date(), reasons: credit ? (credit.ineligibleReason ? String(credit.ineligibleReason).split(" | ") : []) : dcs.reasons, candidates: dcs.candidates, evidence: dcs.evidence ?? null };
@@ -604,6 +556,122 @@ export async function attributeForgeDistributions(db: Models, launch: LaunchRef,
     }
   }
   return { newCredits, touched, decided };
+}
+
+/** Indexing coverage of the launch's Forge attribution addresses (min over cursors; null = unknown). */
+export async function forgeCoverage(db: Models, forge: ForgeLaunchContext): Promise<number | null> {
+  const coverages = await Promise.all(forge.coverageKeys.map((k) => coveredThroughSlot(db, k)));
+  return coverages.some((c) => c === null) ? null : Math.min(...(coverages as number[]));
+}
+
+/** Everything `writeCredit` needs for one linked leg (the deterministic result of the attribution). */
+export interface CreditPlan {
+  t: any;
+  col: any;
+  fact: CollectionFact;
+  method: CorrelationMethod;
+  /** Creditable amount already linked to the collection by OTHER transfers (bounds this credit). */
+  alreadyCreditable: bigint;
+  o: { supported?: bigint; excess?: bigint; extraReasons?: string[]; attribution?: Record<string, unknown> | null };
+  /** Credit keys excluded when `alreadyCreditable` was computed (re-checked by recovery). */
+  excludeKeys: string[];
+}
+export type CreditWriter = (p: CreditPlan) => Promise<{ inserted: boolean; payable: boolean; reasons: string[] }>;
+export interface ForgeLegDecisionRecord {
+  status: "linked" | "unresolved" | "pending";
+  reasons: string[];
+  candidates: string[];
+  collection?: any;
+  method?: CorrelationMethod;
+  payable?: boolean;
+  evidence?: Record<string, unknown>;
+  /** For linked legs: the credit the normal algorithm writes. */
+  plan?: CreditPlan;
+  /** For sequence attributions: the pure attribution result. */
+  attribution?: ForgeAttribution;
+}
+
+/**
+ * The normal, deterministic attribution of ONE Forge creator-distribution transaction (explicit
+ * same-transaction / memo evidence first, then the structural sequence attribution). Used by the
+ * attribution pass (with a writer that writes credits) and — unchanged — by operator recovery, which
+ * passes `write = null` to obtain the decisions and credit plans without writing anything.
+ */
+export async function evaluateForgeDistribution(db: Models, launch: LaunchRef, forge: ForgeLaunchContext, absorbed: Map<string, bigint>, sig: string, covered: number | null, write: CreditWriter | null): Promise<{ legsAll: any[]; decisions: Map<string, ForgeLegDecisionRecord>; slot: number; harvestCandidates: string[]; windowTruncated: boolean } | null> {
+  const legsAll: any[] = await db.RevenueEvent.find({ sourcePool: launch.sourcePool, kind: "funding_inflow", route: FORGE_CREATOR_DISTRIBUTION, signature: sig }).sort({ ordinal: 1 }).lean();
+  if (!legsAll.length) return null;
+  const run: CreditWriter = write ?? (async () => ({ inserted: false, payable: false, reasons: [] }));
+  const slot = legsAll[0].slot;
+  const toCreator = legsAll.filter((e) => e.destinationOwner === forge.creator);
+  const decisions = new Map<string, ForgeLegDecisionRecord>();
+  for (const e of legsAll) if (e.destinationOwner !== forge.creator) decisions.set(e.key, { status: "unresolved", reasons: [`recipient_not_launch_creator: ${e.destinationOwner ?? "?"} (Forge outflow in a creator-distribution transaction; never Last-60 funding)`], candidates: [] });
+  let harvestCandidates: string[] = [];
+  let windowTruncated = false;
+
+  // (a) Explicit evidence first: same transaction as the harvest, or a last60:v1 memo naming it.
+  const remainingLegs: any[] = [];
+  for (const t of toCreator) {
+    const or: any[] = [{ signature: t.signature }];
+    if (t.memoClaimSignature) or.push({ signature: t.memoClaimSignature });
+    const cands: any[] = await db.RevenueEvent.find({ sourcePool: launch.sourcePool, kind: "collection", stream: "forge_platform_lp_fee_collection", beneficiary: t.sourceOwner, $or: or }).lean();
+    if (!cands.length) {
+      remainingLegs.push(t);
+      continue;
+    }
+    const totals = await linkedTotals(db, cands.map((c) => c.key), [t.key]);
+    const facts = cands.map((c) => collectionFact(c, absorbed, totals.get(c.key)?.observed ?? 0n));
+    const link = correlateTransfer(transferFact(t), facts, "strict");
+    if (!link.linked) {
+      remainingLegs.push(t);
+      continue;
+    }
+    const col = cands.find((c) => c.key === link.collectionKey)!;
+    const plan: CreditPlan = { t, col, fact: facts.find((c) => c.key === col.key)!, method: link.method, alreadyCreditable: totals.get(col.key)?.creditable ?? 0n, o: {}, excludeKeys: [t.key] };
+    const w = await run(plan);
+    decisions.set(t.key, { status: "linked", reasons: w.reasons, candidates: [col.signature], collection: col, method: link.method, payable: w.payable, plan });
+  }
+
+  // (b) Forge's existing memo-less payout: structural sequence attribution.
+  if (remainingLegs.length) {
+    const harvestRows: any[] = await db.RevenueEvent.find({ sourcePool: launch.sourcePool, stream: "forge_platform_lp_fee_collection", slot: { $lte: slot } }).sort({ slot: -1, ordinal: -1 }).limit(HARVEST_ROWS).lean();
+    const harvests = groupHarvests(harvestRows, absorbed);
+    harvestCandidates = harvests.map((h) => h.signature);
+    // The window must reach the harvest before the latest one (or the start of the launch's harvests).
+    const distinctSlots = [...new Set(harvests.filter((h) => h.slot < slot).map((h) => h.slot))].sort((a, b) => b - a);
+    let truncated = harvestRows.length === HARVEST_ROWS && distinctSlots.length < 2;
+    const lo = distinctSlots[1] ?? distinctSlots[0] ?? slot;
+    const windowRows: any[] = await db.RevenueEvent.find({ sourcePool: launch.sourcePool, kind: "funding_inflow", route: FORGE_CREATOR_DISTRIBUTION, "evidence.anchored": true, slot: { $gte: lo, $lte: slot }, signature: { $ne: sig } }, { signature: 1, slot: 1, evidence: 1 }).limit(WINDOW_DISTRIBUTION_ROWS).lean();
+    if (windowRows.length === WINDOW_DISTRIBUTION_ROWS) truncated = true;
+    windowTruncated = truncated;
+    const distributions: ForgeDistributionTx[] = [...new Map(windowRows.map((w) => [w.signature, { signature: w.signature, slot: w.slot, anchored: true, problems: [], legs: [] }])).values()];
+    const problems = [...new Set(legsAll.flatMap((e) => (e.evidence?.problems ? String(e.evidence.problems).split(" | ") : [])))];
+    const d: ForgeDistributionTx = { signature: sig, slot, anchored: !!legsAll[0].evidence?.anchored, problems, legs: remainingLegs.map(transferFact) };
+    const harvestKeys = harvests.flatMap((h) => h.legs.map((l) => l.key));
+    const exclude = legsAll.map((e) => e.key);
+    const totals = await linkedTotals(db, harvestKeys, exclude);
+    const linkedElsewhere = new Map([...totals].map(([k, v]) => [k, v.creditable]));
+    const result: ForgeAttribution = attributeForgeDistribution(d, { harvests, distributions, coveredThroughSlot: covered, windowTruncated: truncated, tokenAsset: assetOf(forge.tokenMint), linkedElsewhere });
+    const evidence = { method: "forge_distribution_sequence", distributionSignature: sig, distributionSlot: slot, anchorMint: forge.tokenMint, forgeWallet: forge.forgeWallet, creator: forge.creator, coveredThroughSlot: covered, ...(result.outcome === "linked" ? { harvestSignature: result.harvest, harvestSlot: result.harvestSlot, previousHarvestSignature: result.previousHarvest } : {}) };
+    if (result.outcome === "pending") {
+      for (const t of remainingLegs) decisions.set(t.key, { status: "pending", reasons: result.reasons, candidates: [], attribution: result });
+    } else if (result.outcome === "unresolved") {
+      for (const t of remainingLegs) decisions.set(t.key, { status: "unresolved", reasons: result.reasons, candidates: result.candidates, evidence, attribution: result });
+    } else {
+      const H = harvestRows.filter((c) => c.signature === result.harvest);
+      for (const leg of result.legs) {
+        const t = remainingLegs.find((x) => x.key === leg.transferKey)!;
+        const col = leg.collectionKey ? H.find((c) => c.key === leg.collectionKey) : null;
+        if (!col) {
+          decisions.set(t.key, { status: "unresolved", reasons: leg.reasons, candidates: [result.harvest], evidence, attribution: result });
+          continue;
+        }
+        const plan: CreditPlan = { t, col, fact: collectionFact(col, absorbed, 0n), method: "forge_distribution_sequence", alreadyCreditable: linkedElsewhere.get(col.key) ?? 0n, o: { supported: leg.creditable, excess: leg.excess, extraReasons: leg.reasons, attribution: evidence }, excludeKeys: exclude };
+        const w = await run(plan);
+        decisions.set(t.key, { status: "linked", reasons: w.reasons, candidates: [result.harvest], collection: col, method: "forge_distribution_sequence", payable: w.payable, evidence, plan, attribution: result });
+      }
+    }
+  }
+  return { legsAll, decisions, slot, harvestCandidates, windowTruncated };
 }
 
 /** Group LP-collection rows into harvest transactions (per-mint legs), for the pure attribution. */

@@ -16,6 +16,7 @@ import { big, dec } from "../src/db/decimal";
 import type { Models } from "../src/db/models";
 import { APPROVED_SHARES, attributeForgeDistribution, makeFundingPolicy, STREAM_INFO, WSOL_MINT, type CollectionFact, type ForgeAttributionContext, type ForgeDistributionTx, type ForgeHarvestTx, type TransferFact } from "../src/accounting/revenueStreams";
 import { forgeDistributionWatch, forgeLaunchContextOf, ingestRevenue, revenueWatchAddresses } from "../src/revenue/ingest";
+import { bindCustodyTransfer, createCustodyRequest } from "../src/custody/custody";
 import { buildRevenueReport, renderRevenueReport } from "../src/revenue/report";
 import { coveredThroughSlot } from "../src/indexer/cursor";
 import { cursorId, syncAddress } from "../src/indexer/signatureSync";
@@ -573,7 +574,7 @@ describe("round consumption of Forge creator distributions", () => {
    * A rewards rig whose chain runs at the fixture's slots: the harvest and payout signatures are real
    * signatures of that chain (so their finality is read from it), ingested through the real decoder.
    */
-  async function roundRig(o: { finalizeHarvest?: boolean } = {}) {
+  async function roundRig(o: { finalizeHarvest?: boolean; custody?: boolean } = {}) {
     const r = await rig({ env: { REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: String(ACT), LAST60_FUNDING_DESTINATIONS: DEST, FORGE_PLATFORM_LP_BENEFICIARY: FORGE } });
     r.chain.slot = ACT + 50;
     await r.worker.scheduler.tick(r.clock.now());
@@ -592,6 +593,17 @@ describe("round consumption of Forge creator distributions", () => {
     r.chain.advance(2);
     await ingest(r.db, l.p, harvestTx(l, { signature: hSig, slot: hSlot, quote: 2n * SOL, token: TK }));
     await ingest(r.db, l.p, payoutTx(l, { signature: dSig, slot: dSlot, ...forgeSplit(2n * SOL, TK) }));
+    if (o.custody !== false) {
+      // Physical custody: the creator sweeps the credited SOL into the dedicated payout wallet.
+      const payout = r.payer.publicKey.toBase58();
+      const solCredit: any = await r.db.RewardFunding.findOne({ fundingMint: WSOL_MINT }).lean();
+      const req = await createCustodyRequest(r.db, { enabled: true, payoutWallet: payout }, { fundingKey: solCredit.key, actor: "test-operator" });
+      const cSig = r.trade({ trader: wallet(), kind: "sell", quote: 1n }); // a chain signature (finality is read from the chain)
+      const sweep = buildTx({ signature: cSig, slot: r.chain.slot, feePayer: l.creator, ixs: [systemTransfer(l.creator, payout, SOL), memo(req.memo)] });
+      const b = await bindCustodyTransfer(r.db, { custodyId: req.custodyId, tx: sweep, commitment: "finalized", method: "memo_observed", actor: "indexer", payoutWallet: payout, requireMemo: true });
+      if (!b.accepted) throw new Error(b.reason);
+      r.chain.advance(2);
+    }
     r.chain.advance(40);
     const run = async (start: number) => {
       await r.worker.scheduler.tick(r.clock.now());
@@ -620,6 +632,16 @@ describe("round consumption of Forge creator distributions", () => {
     if (r2?.snapshotSlot) expect(big(r2.funding ?? 0)).toBe(0n);
     expect(await r.db.RewardFunding.countDocuments({ roundNumber: { $ne: null } })).toBe(1);
     expect((await r.worker.reconciler.ledger()).problems).toEqual([]);
+  });
+
+  test("22b. attributed but not custodied: the creator's SOL never funds a round until it is verified in the payout wallet", async () => {
+    const { r, run } = await roundRig({ custody: false });
+    expect(await r.db.RewardFunding.countDocuments({ payoutEligible: true })).toBe(2); // attributed …
+    await run(T0);
+    const r1: any = await r.db.Round.findOne({ roundNumber: 1 }).lean();
+    expect(big(r1.funding)).toBe(0n); // … but the SOL sits in the creator's wallet: not liquidity
+    expect(r1.fundingBreakdown).toMatchObject({ credits: 0, pendingFinality: 0, awaitingCustody: 1, awaitingCustodyAmount: String(SOL) });
+    expect(await r.db.RewardFunding.countDocuments({ roundNumber: { $ne: null } })).toBe(0);
   });
 
   test("21. a harvest that has not reached finality (or never lands) never funds a round", async () => {

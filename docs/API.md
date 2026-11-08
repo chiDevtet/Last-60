@@ -57,6 +57,17 @@ Wallet-signature authentication (rate-limited 3 rps):
 | `POST /payouts/:id/requeue` | requeue a `failed` payout |
 | `POST /halt/clear {reason}` | clear a reconciliation halt |
 | `GET /reconciliation`, `GET /payouts?state=` | reports, payout rows |
+| `GET /payout-wallet` | read-only verification of the dedicated payout wallet: address, signer configured, derived key matches, balance, latest payout / custody reconciliation, payouts enabled (never key material) |
+| `GET /funding` | wallet verification + the funding pipeline: (1) attribution, (2) custody, (3) round funding, (4) payouts, liquidity and mismatch, unresolved Forge attributions, recovery attempts |
+| `POST /funding/custody {fundingKey, reason?}` | open a sweep request for one credited contribution (`LAST60_CUSTODY_ENABLED`); amount, source and destination are derived, never accepted; `409` with `code` when refused |
+| `POST /funding/custody/:custodyId/submit {signature}` | verify a custodian's transaction from the chain and bind it (`422` with the rejection reason) |
+| `POST /funding/custody/:custodyId/cancel {reason}`, `GET /funding/custody/:custodyId` | cancel an open request; read one |
+| `GET /funding/attributions?status=unresolved\|pending\|linked` | Forge creator-distribution attributions |
+| `POST /funding/attributions/recover {attributionKey, requestId?, note?}` | re-run the normal attribution for one unresolved row (`LAST60_ATTRIBUTION_RECOVERY_ENABLED`); strict body — any amount / eligibility / status / collection / correlation field is `400`; returns the append-only audit record (`409` when rejected) |
+| `GET /funding/recoveries?attributionKey=` | recovery audit history |
+
+All funding mutations are written to `config_audit` (`custody_request`, `custody_submit`,
+`custody_cancel`, `attribution_recovery`) with the admin wallet as actor.
 
 Runtime-editable settings: launch provider, token mint, pool, fee role, buyer count, minimum buy,
 reward bps, minimum payout, skipped-round policy, excluded wallets, payout asset, payout mode,
