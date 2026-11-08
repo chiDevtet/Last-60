@@ -57,8 +57,12 @@ module.exports = {
     {
       name: "last60-web",
       cwd: `${__dirname}/apps/web`,
-      // Next is hoisted to the workspace root. Loopback only: nginx is the public entry point.
-      script: "../../node_modules/next/dist/bin/next",
+      // Next's location depends on Bun's install layout: linked into apps/web/node_modules (isolated
+      // linker, Bun >= 1.3 default) or hoisted to the workspace root. Both paths are stable across
+      // upgrades, unlike the resolved store path. Loopback only: nginx is the public entry point.
+      script: require("node:fs").existsSync(`${__dirname}/apps/web/node_modules/next`)
+        ? "node_modules/next/dist/bin/next"
+        : "../../node_modules/next/dist/bin/next",
       args: "start -p 3060 -H 127.0.0.1",
       interpreter: "node",
       node_args: "--env-file=../../.env.web",
