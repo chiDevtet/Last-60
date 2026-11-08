@@ -8,6 +8,9 @@
  *   reward_funding   (key = funding inflow) — one credit per transfer, consumed by one round
  *   revenue_reconciliations (key = collection) — derived per-claim reconciliation
  *   funding_attributions (key = funding inflow) — attribution work queue / audit of Forge creator distributions
+ *   custody_transfers (custodyId), (transferKey), one open request per contribution — physical custody sweeps
+ *   transfer_uses    (key = signature:ordinal) — one on-chain transfer is EITHER a contribution OR a custody transfer
+ *   attribution_recoveries (requestId) — append-only audit of operator re-evaluations
  *   rounds           (roundNumber), (roundIndex)
  *   payouts          (roundNumber, recipient), confirmedSignature
  *   ledger_entries   (key)  — idempotency key per economic fact
@@ -401,11 +404,153 @@ const fundingAttributionSchema = new Schema(
     evaluations: { type: Number, default: 0 },
     createdAt: { type: Date, default: Date.now },
     evaluatedAt: { type: Date, default: null },
+    /**
+     * Set ONCE by an operator recovery that re-ran the normal attribution and linked the leg
+     * ({ requestId, outcome, rewardFundingKey, payoutEligible, at, operator }). The original decision
+     * (status, reasons, candidates, evidence) is never rewritten; the full audit lives in
+     * `attribution_recoveries`.
+     */
+    recovery: { type: Schema.Types.Mixed, default: null },
   },
   { collection: "funding_attributions", versionKey: false },
 );
 fundingAttributionSchema.index({ sourcePool: 1, status: 1, slot: 1 });
 fundingAttributionSchema.index({ signature: 1 });
+
+/** Append-only collections: inserts only — no update, replace or delete of any field. */
+function appendOnly(schema: Schema) {
+  const deny = function () {
+    throw new Error("append-only audit record cannot be modified or deleted");
+  };
+  for (const hook of ["updateOne", "updateMany", "findOneAndUpdate", "replaceOne", "deleteOne", "deleteMany", "findOneAndDelete", "findOneAndReplace"] as const) schema.pre(hook, deny);
+}
+
+// ─── custody transfers (docs/REWARD_FUNDING.md §14) ─────────────────────────────
+/**
+ * Physical custody of a credited contribution: a SOL transfer from the wallet that holds a credited
+ * contribution (the custodian — the launch creator for Forge's creator payout, or an intermediate
+ * funding destination) into the dedicated Last-60 payout wallet. A custody transfer is NEVER a reward
+ * contribution: it is associated with exactly one existing `reward_funding` credit (`fundingKey`), never
+ * creates one, and never credits more than that credit's outstanding (not yet custodied) amount.
+ *
+ * Lifecycle: requested → (bound to one verified on-chain transfer) awaiting_finality → reconciled |
+ * partial; or failed (transaction failed / never finalized), cancelled, expired. Bound fields are
+ * written once by a compare-and-set on `status: "requested"`; `history` is the append-only audit trail.
+ */
+export const CUSTODY_STATUSES = ["requested", "awaiting_finality", "reconciled", "partial", "failed", "cancelled", "expired"] as const;
+const custodyTransferSchema = new Schema(
+  {
+    custodyId: { type: String, required: true, unique: true },
+    /** The original contribution (`reward_funding.key`) this transfer moves into custody. */
+    fundingKey: { type: String, required: true },
+    collectionKey: { type: String, default: null },
+    stream: { type: String, default: null },
+    route: { type: String, default: null },
+    sourcePool: { type: String, required: true },
+    tokenMint: { type: String, default: null },
+    creator: { type: String, default: null },
+    /** Wallet holding the contribution (the credit's destination wallet). */
+    sourceWallet: { type: String, required: true },
+    /** The dedicated payout wallet at request time. */
+    destinationWallet: { type: String, required: true },
+    /** Accounting asset (WSOL mint = native SOL; custody accepts native SOL System transfers only). */
+    mint: { type: String, required: true },
+    contributionSignature: { type: String, default: null },
+    contributionSlot: { type: Number, required: true },
+    /** Outstanding (not yet custodied) contribution amount when the request was created. */
+    expectedAmount: { type: D, required: true },
+    /** Memo the transfer should carry: last60:custody:v1:<custodyId>. */
+    memo: { type: String, required: true },
+    requestedBy: { type: String, required: true },
+    expiresAt: { type: Date, required: true },
+    // ── bound transfer (written once) ──
+    method: { type: String, default: null }, // memo_observed | operator_signature
+    boundBy: { type: String, default: null },
+    transferKey: { type: String, default: null }, // `${signature}:${instruction ordinal}`
+    signature: { type: String, default: null },
+    ordinal: { type: Number, default: null },
+    slot: { type: Number, default: null },
+    blockTime: { type: Date, default: null },
+    observedAmount: { type: D, default: null },
+    /** Portion credited to custody (≤ outstanding at binding). */
+    creditedAmount: { type: D, default: null },
+    /** Portion above the outstanding amount (sits in the wallet, never credited). */
+    excessAmount: { type: D, default: null },
+    /** Network fee of the transfer transaction (paid by its fee payer; never a contribution). */
+    networkFeeLamports: { type: D, default: null },
+    feePayer: { type: String, default: null },
+    /** Final status once the transfer is finalized (reconciled | partial). */
+    statusOnFinality: { type: String, default: null },
+    confirmationStatus: { type: String, enum: ["none", "confirmed", "finalized", "failed"], default: "none" },
+    status: { type: String, enum: CUSTODY_STATUSES, required: true },
+    reconciliation: { type: String, enum: ["pending", "matched", "partial", "excess"], default: "pending" },
+    finalizedSlot: { type: Number, default: null },
+    failureReason: { type: String, default: null },
+    history: { type: [{ _id: false, at: Date, event: String, actor: String, detail: Schema.Types.Mixed }], default: [] },
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now },
+  },
+  { collection: "custody_transfers", versionKey: false },
+);
+custodyTransferSchema.index({ transferKey: 1 }, { unique: true, partialFilterExpression: { transferKey: { $type: "string" } } });
+// At most one OPEN sweep request per contribution (duplicate / concurrent requests are rejected).
+custodyTransferSchema.index({ fundingKey: 1 }, { unique: true, partialFilterExpression: { status: "requested" }, name: "one_open_request_per_contribution" });
+custodyTransferSchema.index({ fundingKey: 1, status: 1 });
+custodyTransferSchema.index({ status: 1, updatedAt: -1 });
+custodyTransferSchema.index({ sourcePool: 1, status: 1 });
+guardImmutable(custodyTransferSchema, ["custodyId", "fundingKey", "collectionKey", "stream", "route", "sourcePool", "tokenMint", "creator", "sourceWallet", "destinationWallet", "mint", "contributionSignature", "contributionSlot", "expectedAmount", "memo", "requestedBy"]);
+
+/**
+ * One row per on-chain transfer (signature + instruction ordinal) that Last-60 has USED: either as a
+ * reward contribution (`reward_funding`) or as a custody transfer. Inserted before the use is
+ * recorded; the unique key makes the two uses mutually exclusive, so a custody sweep can never be
+ * counted as a second contribution (and a contribution transfer never as custody).
+ */
+const transferUseSchema = new Schema(
+  {
+    key: { type: String, required: true, unique: true },
+    use: { type: String, enum: ["reward_funding", "custody_transfer"], required: true },
+    ref: { type: String, required: true },
+    signature: { type: String, required: true },
+    ordinal: { type: Number, required: true },
+    createdAt: { type: Date, default: Date.now },
+  },
+  { collection: "transfer_uses", versionKey: false },
+);
+transferUseSchema.index({ signature: 1 });
+appendOnly(transferUseSchema);
+
+/**
+ * Append-only audit of operator recovery requests for unresolved Forge attributions
+ * (docs/REWARD_FUNDING.md §15). One row per request; never updated or deleted.
+ */
+const attributionRecoverySchema = new Schema(
+  {
+    requestId: { type: String, required: true, unique: true },
+    attributionKey: { type: String, required: true },
+    operator: { type: String, required: true },
+    requestedAt: { type: Date, required: true },
+    completedAt: { type: Date, required: true },
+    note: { type: String, default: null },
+    /** The original decision, copied verbatim (status, reasons, candidates, evidence, …). */
+    original: { type: Schema.Types.Mixed, default: null },
+    /** Evidence evaluated: coverage keys and slots, finalized slot, algorithm and policy version, candidates. */
+    evaluation: { type: Schema.Types.Mixed, default: null },
+    outcome: { type: String, enum: ["linked", "linked_not_payable", "still_unresolved", "rejected"], required: true },
+    resultReasons: { type: [String], default: [] },
+    linkedHarvestSignature: { type: String, default: null },
+    linkedHarvestSlot: { type: Number, default: null },
+    previousHarvestSignature: { type: String, default: null },
+    rewardFundingKey: { type: String, default: null },
+    payoutEligible: { type: Boolean, default: false },
+    transactions: { type: Schema.Types.Mixed, default: null },
+    failureReason: { type: String, default: null },
+  },
+  { collection: "attribution_recoveries", versionKey: false },
+);
+attributionRecoverySchema.index({ attributionKey: 1, requestedAt: -1 });
+attributionRecoverySchema.index({ requestedAt: -1 });
+appendOnly(attributionRecoverySchema);
 
 /**
  * Per-collection reconciliation (durable claim record). DERIVED: recomputed idempotently from the
@@ -690,7 +835,7 @@ const workerStateSchema = new Schema(
 const reconciliationSchema = new Schema(
   {
     at: { type: Date, default: Date.now },
-    kind: { type: String, enum: ["fee_source", "ledger", "payout_wallet"], required: true },
+    kind: { type: String, enum: ["fee_source", "ledger", "payout_wallet", "custody"], required: true },
     status: { type: String, enum: ["ok", "mismatch", "over_attribution", "shared_vault", "skipped"], required: true },
     slot: Number,
     expected: D,
@@ -721,6 +866,9 @@ export const schemas = {
   RewardFunding: rewardFundingSchema,
   RevenueReconciliation: revenueReconciliationSchema,
   FundingAttribution: fundingAttributionSchema,
+  CustodyTransfer: custodyTransferSchema,
+  TransferUse: transferUseSchema,
+  AttributionRecovery: attributionRecoverySchema,
   BuyerActivity: buyerActivitySchema,
   Round: roundSchema,
   Payout: payoutSchema,

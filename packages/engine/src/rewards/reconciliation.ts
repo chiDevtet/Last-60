@@ -8,6 +8,9 @@
  * 2. ledger:       per round, fees + rolloverIn = retained + dust + rolloverOut + Σ payouts,
  *                  and payout rows equal perRecipient × recipientCount.
  * 3. payout_wallet: wallet balance ≥ pending live payouts + reserve.
+ * 4. custody:      bound custody transfers are promoted to finalized / failed from on-chain status, and
+ *                  the payout wallet balance must cover custodied-but-unconsumed contributions + pending
+ *                  live payouts + reserve (an attributed credit is never treated as liquidity).
  */
 import type { AppConfig } from "../config/env";
 import type { SettingsStore } from "../config/runtime";
@@ -20,6 +23,8 @@ import { cursorId, readCursor, syncAddress } from "../indexer/signatureSync";
 import { periodFees } from "./selection";
 import { repairPayoutLedger } from "./payouts";
 import { rootLogger, type Logger } from "../util/logger";
+import { refreshCustodyFinality } from "../custody/custody";
+import { buildFundingPipeline } from "../custody/report";
 
 export interface ReconcileDeps {
   db: Models;
@@ -37,6 +42,7 @@ export interface ReconcileReport {
   ledger: { status: string; checked: number; problems: string[] };
   payoutWallet: { status: string; balance: bigint; pending: bigint } | null;
   destination: { status: string; problems: string[] } | null;
+  custody?: { status: string; finalized: number; failed: number; expired: number; shortfall: string | null } | null;
 }
 
 export class Reconciler {
@@ -57,6 +63,10 @@ export class Reconciler {
     });
     report.ledger = await this.ledger();
     report.payoutWallet = await this.payoutWalletCheck().catch(() => null);
+    report.custody = await this.custody().catch((err) => {
+      this.log.warn({ err: String(err) }, "custody reconciliation skipped");
+      return null;
+    });
     return report;
   }
 
@@ -203,6 +213,19 @@ export class Reconciler {
     await this.d.db.Reconciliation.create({ kind: "ledger", status, details: { checked: rounds.length, problems: problems.slice(0, 50), payoutLedgerRepair: repair } });
     if (problems.length) await this.d.terminal.error("Ledger invariant check failed; operators notified.", `ledger:${Math.floor(Date.now() / 3_600_000)}`);
     return { status, checked: rounds.length, problems };
+  }
+
+  /** Custody finality + liquidity check against the dedicated payout wallet (cfg, never a runtime override). */
+  async custody() {
+    const wallet = this.d.cfg.revenue?.custody?.payoutWallet ?? this.d.cfg.payout.walletPublicKey ?? null;
+    const fin = await refreshCustodyFinality(this.d.db, this.d.rpc);
+    if (!wallet) return { status: "skipped", ...fin, shortfall: null };
+    const balance = await this.d.rpc.getBalance(wallet, "confirmed");
+    const p = await buildFundingPipeline(this.d.db, { payoutWallet: wallet, balance, reserveLamports: this.d.cfg.payout.minReserveLamports, limit: 1 });
+    const status = p.liquidity.mismatch ? "mismatch" : "ok";
+    await this.d.db.Reconciliation.create({ kind: "custody", status, expected: dec(big(p.liquidity.custodiedUnconsumed) + big(p.liquidity.pendingLivePayouts)), actual: dec(balance), diff: dec(balance - big(p.liquidity.custodiedUnconsumed) - big(p.liquidity.pendingLivePayouts)), details: { wallet, ...fin, liquidity: p.liquidity, awaitingCustody: p.custody.attributedAwaitingCustody, outstanding: p.custody.outstanding } });
+    if (status === "mismatch") await this.d.terminal.warn("Payout wallet holds less SOL than its custodied contributions and pending payouts require; operators notified.", `custody-shortfall:${Math.floor(Date.now() / 3_600_000)}`);
+    return { status, ...fin, shortfall: p.liquidity.shortfall };
   }
 
   async payoutWalletCheck() {

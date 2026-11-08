@@ -16,6 +16,9 @@ locally). Multi-document transactions are required for round allocation. Models:
 | `revenue_events` | phase-aware revenue facts (PR #6; `route` on funding inflows since PR #8: `last60_destination` / `forge_creator_distribution`, null = legacy destination route): fee collections (`bonding_curve_creator_fee`, `cpmm_creator_trading_fee`, `forge_platform_lp_fee_collection`) and `last60_funding_inflow` transfers — cluster, token mint, pool / source pool, provider, launch phase, signature, top-level + inner instruction index, ordinal, slot, block time, fee mint, asset, decimals, gross / net, source / destination account and owner, beneficiary, status, v1 `snapshot` (stream, phase, beneficiaries, policy, effective fee config, verification, problems). Immutable | **`key` unique**; **`(signature, ordinal, stream, feeMint)` unique**; `(sourcePool, kind, slot)`; `(kind, sourceOwner, asset, slot)`; `(sourcePool, stream, slot)`; `(sourcePool, route, slot)` |
 | `reward_funding` | one credit per funding inflow linked to a claim: stream, correlation method (`same_transaction` / `memo` / `exclusive_window` / `forge_distribution_sequence`), `route`, immutable `attribution` evidence (Forge creator route), observed / creditable / excess amounts, payout eligibility + reason, policy and snapshot; `roundNumber` / `consumedAt` set once by the consuming round | **`key` unique** (= inflow); `(collectionKey, slot)`; `(payoutEligible, roundNumber, fundingMint, slot)` |
 | `funding_attributions` | PR #8: one row per Forge creator-distribution leg — bounded attribution queue and audit trail: `status` (`pending` → `linked` / `unresolved`, decided once), reasons, candidate harvests, collection, method, evidence, evaluations. Derived; the economic facts stay on `revenue_events` / `reward_funding` | **`key` unique** (= inflow); `(sourcePool, status, slot)`; `signature` |
+| `custody_transfers` | PR #9: physical custody of a credited contribution — one sweep request bound to at most one verified on-chain transfer into the dedicated payout wallet: original contribution (`fundingKey`), launch, creator, source / destination wallet, mint, expected / observed / credited / excess amounts, network fee, signature, slot, `confirmationStatus`, `status`, `reconciliation`, `finalizedSlot`, append-only `history`. Request facts immutable | **`custodyId` unique**; **`transferKey` unique (partial)**; **one open request per contribution** (`fundingKey` unique where `status: requested`); `(fundingKey, status)`; `(status, updatedAt)` |
+| `transfer_uses` | PR #9: one row per on-chain transfer (`signature:ordinal`) Last-60 has used, as `reward_funding` or as `custody_transfer` — the two uses are mutually exclusive. Append-only | **`key` unique**; `signature` |
+| `attribution_recoveries` | PR #9: append-only audit of operator recovery requests: request id, attribution key, operator, times, note, original decision, evaluated evidence (algorithm, coverage, finality), outcome, reasons, linked harvest, reward-funding key, transactions, failure reason | **`requestId` unique**; `(attributionKey, requestedAt)` |
 | `revenue_reconciliations` | derived per-claim reconciliation (recomputed idempotently): gross, expected / actual / creditable Last-60, expected / implied retained, excess, untransferred, status, discrepancies, distributions | **`key` unique** (= claim / correlation id); `(sourcePool, stream, collectionSlot)`; `status` |
 | `buyer_activity` | per-wallet totals: buys, qualifying buys, spent, rewards, rounds paid | `wallet` unique |
 | `rounds` | one per round: schedule, sealed execute time, snapshot, config snapshot, allocation, totals, state, lock; `fundingPolicy` snapshot (+ `legacyFeeSlotCap`), `funding`, `fundingBreakdown` | **`roundNumber` unique**, **`roundIndex` unique**, `(state, roundNumber)` |
@@ -25,7 +28,7 @@ locally). Multi-document transactions are required for round allocation. Models:
 | `counters` | monotonically increasing terminal `seq` | `_id` |
 | `worker_leases` | leader leases with fencing tokens | `_id` |
 | `worker_state` | heartbeats, metrics, indexer cursors (`cursor:<provider>:<pool>:<address>`) | `_id` |
-| `reconciliation_reports` | fee-source / ledger / payout-wallet checks | `(kind, at)` |
+| `reconciliation_reports` | fee-source / ledger / payout-wallet / custody (liquidity) checks | `(kind, at)` |
 | `admin_nonces` | single-use sign-in challenges | `nonce` unique, TTL |
 
 ## Private fields
@@ -65,6 +68,15 @@ No manual data migration is required; indexes are synchronised at process start 
   rows without `payoutEligible` count as eligible (same program formula), legacy confirmed payouts
   without `ledgerApplied` are repaired once by the reconciler.
 * Legacy swap rows have no stored `basis`: a beneficiary-role change on such a pool is refused.
+
+**Payout wallet, custody and recovery (PR #9).** New collections `custody_transfers`, `transfer_uses`,
+`attribution_recoveries` and the field `funding_attributions.recovery` (default null) are created by the
+usual index sync; no data migration. Existing credits keep their records; credits written before
+`transfer_uses` existed are still protected (a custody binding refuses any transfer already recorded as a
+`reward_funding` credit). Existing unresolved attributions are untouched until an operator explicitly
+requests a recovery. Note for upgrades: under `forge_phase_aware_v2` an unconsumed credit now funds a
+round only once its SOL is verified in the payout wallet (direct, or custody) — Forge creator-route
+credits wait for custody transfers.
 
 **Indexing coverage (PR #8).** `worker_state` signature-cursor rows carry `syncedThroughSlot`: every
 transaction of the address at or below it is ingested (recorded by a complete poll pass whose signature

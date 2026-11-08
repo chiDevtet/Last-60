@@ -10,10 +10,23 @@
  *   revenue [--json]           phase-aware revenue report: every stream, per fee mint (read-only)
  *   revenue-reconcile          re-run claim ↔ transfer correlation and reconciliation now (idempotent;
  *                              writes only derived reconciliation rows and new funding credits)
+ *   payout-wallet              read-only verification of the dedicated payout wallet (address, signer status,
+ *                              derived-key match, balance, latest payout / custody reconciliation; never a key)
+ *   funding [--json]           the four funding stages: attribution / custody / round funding / payouts + liquidity
+ *   custody-request <fundingKey> [reason]   open a sweep request for ONE credited contribution (LAST60_CUSTODY_ENABLED)
+ *   custody-submit <custodyId> <signature>  verify a custodian's transfer from the chain and bind it to the request
+ *   custody-cancel <custodyId> <reason>     cancel an open request
+ *   custody-refresh            promote bound custody transfers to finalized / failed (idempotent)
+ *   attributions [status]      Forge creator-distribution attributions (default: unresolved)
+ *   recover <attributionKey> [note]          re-run the normal attribution for ONE unresolved attribution
+ *                              (LAST60_ATTRIBUTION_RECOVERY_ENABLED); recorded in attribution_recoveries
+ *   recoveries [attributionKey] recovery audit history
  *   gen-schedule-key           print a new SCHEDULE_ENCRYPTION_KEY
+ *
+ * The CLI runs with the server's database credentials: its operator identity is `cli:$USER`.
  */
 import { randomBytes } from "node:crypto";
-import { ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, buildRevenueReport, renderRevenueReport, reconcileFunding, forgeLaunchContextOf, revenueRuntimeOf, type ProcessRole } from "@last60/engine";
+import { buildFundingPipeline, cancelCustodyRequest, createCustodyRequest, payoutWalletVerification, recoverAttribution, refreshCustodyFinality, renderFundingPipeline, submitCustodySignature, ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, buildRevenueReport, renderRevenueReport, reconcileFunding, forgeLaunchContextOf, revenueRuntimeOf, type ProcessRole } from "@last60/engine";
 
 const [cmd, ...args] = process.argv.slice(2);
 const print = (v: unknown) => console.log(JSON.stringify(jsonSafe(v), null, 2));
@@ -107,8 +120,72 @@ try {
       print({ newCredits: await reconcileFunding(db, { sourcePool: info.poolAddress, quoteMint: info.quoteMint, provider: info.provider, tokenMint: info.tokenMint, forge: forgeLaunchContextOf(provider, rr) }, rr) });
       break;
     }
+    case "payout-wallet": {
+      const s = await settings.get(true);
+      const rpc = new RpcClient({ urls: s.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
+      print(await payoutWalletVerification(db, { address: cfg.payout.walletPublicKey, runtimeExpectedAddress: s.expectedPayoutPublicKey, rpc, payoutMode: s.payoutMode }));
+      break;
+    }
+    case "funding": {
+      const s = await settings.get(true);
+      const rpc = new RpcClient({ urls: s.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
+      const balance = cfg.payout.walletPublicKey ? await rpc.getBalance(cfg.payout.walletPublicKey).catch(() => null) : null;
+      const r = await buildFundingPipeline(db, { payoutWallet: cfg.payout.walletPublicKey, balance, reserveLamports: cfg.payout.minReserveLamports, sourcePool: s.poolAddress });
+      if (args.includes("--json")) print(r);
+      else console.log(renderFundingPipeline(r));
+      break;
+    }
+    case "custody-request": {
+      if (!args[0]) throw new Error("usage: custody-request <fundingKey> [reason]");
+      const row = await createCustodyRequest(db, cfg.revenue.custody, { fundingKey: args[0], actor });
+      await db.ConfigAudit.create({ version: (await settings.raw()).version, actor, action: "custody_request", changes: [{ key: args[0], from: null, to: { custodyId: row.custodyId } }], reason: args.slice(1).join(" ") || null });
+      print({ custodyId: row.custodyId, instructions: row.instructions, expiresAt: row.expiresAt });
+      break;
+    }
+    case "custody-submit": {
+      if (!args[0] || !args[1]) throw new Error("usage: custody-submit <custodyId> <signature>");
+      const s = await settings.get(true);
+      const rpc = new RpcClient({ urls: s.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
+      const r = await submitCustodySignature(db, rpc, cfg.revenue.custody, { custodyId: args[0], signature: args[1], actor });
+      await db.ConfigAudit.create({ version: (await settings.raw()).version, actor, action: "custody_submit", changes: [{ key: args[0], from: null, to: jsonSafe(r) }], reason: args[1] });
+      print(r);
+      break;
+    }
+    case "custody-cancel": {
+      if (!args[0] || args.length < 2) throw new Error("usage: custody-cancel <custodyId> <reason>");
+      print(await cancelCustodyRequest(db, { custodyId: args[0], actor, reason: args.slice(1).join(" ") }));
+      break;
+    }
+    case "custody-refresh": {
+      const s = await settings.get(true);
+      const rpc = new RpcClient({ urls: s.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
+      print(await refreshCustodyFinality(db, rpc));
+      break;
+    }
+    case "attributions":
+      print(await db.FundingAttribution.find({ status: args[0] ?? "unresolved" }).sort({ slot: -1 }).limit(200).lean());
+      break;
+    case "recover": {
+      if (!args[0]) throw new Error("usage: recover <attributionKey> [note]");
+      const s = await settings.get(true);
+      const rpc = new RpcClient({ urls: s.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
+      const rr = revenueRuntimeOf(cfg)!;
+      const providerFor = async () => {
+        const p = createProvider(providerTargetFor(s, cfg), rpc);
+        await p.load();
+        await attachStoredMigration(db, p);
+        return p;
+      };
+      const out: any = await recoverAttribution({ db, provider: providerFor, runtime: rr, rpc, enabled: cfg.revenue.recoveryEnabled }, { attributionKey: args[0], operator: actor, note: args.slice(1).join(" ") || undefined });
+      await db.ConfigAudit.create({ version: (await settings.raw()).version, actor, action: "attribution_recovery", changes: [{ key: args[0], from: null, to: { requestId: out.requestId, outcome: out.outcome } }], reason: args.slice(1).join(" ") || null });
+      print(out);
+      break;
+    }
+    case "recoveries":
+      print(await db.AttributionRecovery.find(args[0] ? { attributionKey: args[0] } : {}).sort({ requestedAt: -1 }).limit(100).lean());
+      break;
     default:
-      console.log("commands: status | check-config | pause <c> | resume <c> | requeue <id> | clear-halt <reason> | reconcile | round <n> | revenue [--json] | revenue-reconcile | gen-schedule-key");
+      console.log("commands: status | check-config | pause <c> | resume <c> | requeue <id> | clear-halt <reason> | reconcile | round <n> | revenue [--json] | revenue-reconcile | payout-wallet | funding [--json] | custody-request <fundingKey> | custody-submit <custodyId> <signature> | custody-cancel <custodyId> <reason> | custody-refresh | attributions [status] | recover <attributionKey> [note] | recoveries [key] | gen-schedule-key");
   }
 } finally {
   await db.close();

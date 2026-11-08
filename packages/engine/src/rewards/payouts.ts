@@ -12,10 +12,11 @@
  * (same signature), which Solana deduplicates.
  */
 import type { Keypair } from "@solana/web3.js";
+import { PayoutSigner, type PayoutAuthorization } from "../signer/payoutSigner";
 import type { AppConfig } from "../config/env";
 import { liveSigningBlockReason, type SettingsStore } from "../config/runtime";
 import { RpcError, type ChainRpc } from "../chain/rpc";
-import { buildPayoutTransaction } from "../chain/payoutTx";
+import { buildUnsignedPayoutTransaction } from "../chain/payoutTx";
 import type { Models } from "../db/models";
 import { big, dec } from "../db/decimal";
 import { inTransaction } from "../db/connection";
@@ -32,7 +33,10 @@ export interface PayoutDeps {
   cfg: AppConfig;
   settings: SettingsStore;
   rpc: ChainRpc;
-  payer: Keypair | null;
+  /** The dedicated payout signer (preferred). */
+  signer?: PayoutSigner | null;
+  /** @deprecated raw keypair (tests); wrapped into a PayoutSigner. */
+  payer?: Keypair | null;
   terminal: TerminalWriter;
   clock: Clock;
   log?: Logger;
@@ -50,8 +54,10 @@ const TOKEN_2022_ACCOUNT_SIZE = 182;
 
 export class PayoutExecutor {
   private readonly log: Logger;
+  private readonly signer: PayoutSigner | null;
   constructor(private readonly d: PayoutDeps) {
     this.log = (d.log ?? rootLogger()).child({ component: "payouts" });
+    this.signer = d.signer ?? (d.payer ? PayoutSigner.fromKeypair(d.payer) : null);
   }
 
   private now() {
@@ -110,8 +116,12 @@ export class PayoutExecutor {
       await this.d.terminal.warn(`Live payouts are queued and not being signed: ${blocked}.`, `live-blocked:${Math.floor(this.now() / 600_000)}`, p.roundNumber);
       return false;
     }
-    if (!this.d.payer) throw new Error("live payout requested but no payout signing key is loaded");
-    const payerPk = this.d.payer.publicKey.toBase58();
+    // Fail closed: no validated signer → nothing is signed, and never from another wallet.
+    if (!this.signer) throw new Error("live payout requested but no validated payout signer is loaded (LAST60_PAYOUT_WALLET_PRIVATE_KEY missing or invalid)");
+    const payerPk = this.signer.address;
+    if (this.d.cfg.payout.walletPublicKey && this.d.cfg.payout.walletPublicKey !== payerPk) {
+      throw new Error(`payout signer ${payerPk} is not the configured LAST60_PAYOUT_WALLET_ADDRESS ${this.d.cfg.payout.walletPublicKey}; refusing to sign`);
+    }
     if (settings.expectedPayoutPublicKey && settings.expectedPayoutPublicKey !== payerPk) {
       throw new Error(`payout key ${payerPk} does not match the configured payout public key ${settings.expectedPayoutPublicKey}; refusing to sign`);
     }
@@ -142,8 +152,10 @@ export class PayoutExecutor {
     }
 
     const { blockhash, lastValidBlockHeight } = await this.d.rpc.getLatestBlockhash("confirmed");
-    const built = buildPayoutTransaction({
-      payer: this.d.payer,
+    // 1. Construction (unsigned) → 2. authorization (the fenced, claimed payout row) → 3. signing
+    // (the signer re-validates every instruction against the authorization).
+    const unsigned = buildUnsignedPayoutTransaction({
+      payer: this.signer.publicKey,
       recipient: p.recipient,
       amount,
       mint: p.mint,
@@ -153,6 +165,8 @@ export class PayoutExecutor {
       memo: this.d.cfg.payout.memo ? `last60:r${p.roundNumber}:${String(p._id)}` : null,
       token: token2022,
     });
+    const auth = await authorizePayout(this.d.db, p._id, token, token2022?.program ?? null);
+    const built = this.signer.signPayout(unsigned, auth);
     const n = (p.attemptCount ?? 0) + 1;
     // Persist BEFORE broadcasting. If this CAS fails we lost the lock and must not send.
     const persisted = await this.d.db.Payout.updateOne(
@@ -370,6 +384,20 @@ export class PayoutExecutor {
   requeueFailed(payoutId: string, actor: string): Promise<boolean> {
     return requeueFailedPayout(this.d.db, payoutId, actor, this.now());
   }
+}
+
+/**
+ * Payout authorization: what may be signed is defined by the payout row this worker has claimed
+ * (state `signing`, our fencing token, live mode) in a round that is paying — never by a request.
+ */
+export async function authorizePayout(db: Models, payoutId: unknown, lockToken: string, tokenProgram: string | null): Promise<PayoutAuthorization> {
+  const p: any = await db.Payout.findOne({ _id: payoutId, state: "signing", "lock.token": lockToken, mode: "live" }).lean();
+  if (!p) throw new Error("payout authorization failed: the payout is not claimed by this worker");
+  const round: any = await db.Round.findOne({ roundNumber: p.roundNumber }, { state: 1 }).lean();
+  // Payout rows are created only inside their round's planning transaction; a round that is already
+  // settled can never authorize another transfer.
+  if (round && ["completed", "rolled_over", "missed", "open", "scheduled", "snapshotting"].includes(round.state)) throw new Error(`payout authorization failed: round #${p.roundNumber} is ${round.state}`);
+  return Object.freeze({ kind: "reward_payout" as const, payoutId: String(p._id), roundNumber: p.roundNumber as number, recipient: p.recipient as string, amount: big(p.amount), mint: p.mint as string, tokenProgram: p.mint === WSOL ? null : tokenProgram, lockToken });
 }
 
 /**

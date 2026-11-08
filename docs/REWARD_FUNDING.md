@@ -1,4 +1,4 @@
-# Phase-aware revenue attribution and Last-60 reward funding (PR #6, corrected in PR #7, Forge creator distributions in PR #8)
+# Phase-aware revenue attribution and Last-60 reward funding (PR #6, corrected in PR #7, Forge creator distributions in PR #8, payout wallet, custody and recovery in PR #9)
 
 This document describes how LAST60 attributes Forge's revenue across the two launch phases, which
 streams may fund Last-60 buyer rewards, what evidence is required, and how Last-60 recognises Forge's
@@ -7,7 +7,21 @@ streams may fund Last-60 buyer rewards, what evidence is required, and how Last-
 `attributeForgeDistribution`), `src/revenue/decode.ts` (transaction decoding, incl.
 `forgeCreatorDistribution`), `src/revenue/ingest.ts` (persistence, correlation, attribution,
 reconciliation), `src/indexer/cursor.ts` (indexing coverage), `src/revenue/report.ts` (reporting),
-`src/rewards/scheduler.ts` (rounds).
+`src/rewards/scheduler.ts` (rounds), `src/custody/custody.ts` (physical custody, §14),
+`src/recovery/attributionRecovery.ts` (operator recovery, §15), `src/signer/payoutSigner.ts` (the
+dedicated payout wallet's signer, §16 and docs/PAYOUT_WALLET.md).
+
+**Four things are never interchangeable** (since PR #9):
+
+| # | Question | Record | Becomes true when |
+|---|---|---|---|
+| 1 | Who economically contributed? | `reward_funding` credit (attribution, §4–§5) | a verified transfer is correlated to a verified claim |
+| 2 | Who physically holds the SOL? | `custody_transfers` (§14) | the SOL is independently observed — finalized, verified — in the dedicated payout wallet |
+| 3 | Is it actually funding a reward round? | `reward_funding.roundNumber` (§8) | 1 and 2 hold, finality and the per-claim cap pass, and a round consumes it |
+| 4 | Is a buyer payout authorized? | `payouts` + the payout signer (§16) | the round planned it and the signer validated the transaction against its authorization |
+
+An attributed contribution is an accounting fact, **not** liquidity: until its SOL is verified in the
+payout wallet it cannot fund any round.
 
 ## 1. The approved business model in one page
 
@@ -54,8 +68,9 @@ routes are recognised:
 
 A transfer **from** the creator's wallet never satisfies a Forge LP claim (it cannot be told apart from
 the creator's own bonding or CPMM revenue): the source of a credited transfer must be the claim's
-recipient. Funds credited to rounds must end up in the payout wallet: use the creator wallet as the
-payout wallet or sweep it (rounds wait in `awaiting_funds` otherwise).
+recipient. Since PR #9 the creator's receipt of Forge's payout is the (single) economic contribution,
+and the creator's later transfer of that SOL into the dedicated payout wallet is a **custody transfer**
+(§14) — never a second contribution. A credit funds rounds only once that custody is verified.
 
 ## 2. Streams
 
@@ -193,7 +208,8 @@ link is the sequence of indexed, launch-scoped transactions.
 for a payout — two harvests in one slot, a harvest in the payout's slot, a second payout after the same
 harvest, an unpaid earlier harvest, a window too large to prove (> 24 harvest rows / 64 payouts) — is
 recorded `unresolved` with the candidate harvests and is never payable. Decided rows are never
-re-evaluated, so a later ingestion can never flip an unresolved payout to payable.
+re-evaluated by the attribution pass, so a later ingestion can never flip an unresolved payout to
+payable by itself; only an explicit, audited operator recovery (§15) re-runs the same algorithm.
 
 **Unresolved and excess.** Unresolved legs are revenue events (`route: forge_creator_distribution`)
 with a `funding_attributions` row (`unresolved`, reasons, candidates); no credit is written unless a
@@ -337,7 +353,11 @@ recorded and reported, never converted).
 |---|---|
 | `REWARD_FUNDING_POLICY` | `legacy_creator_fee_v1` (default) or `forge_phase_aware_v2` (approved model); `forge_phase_aware_v1` is rejected |
 | `REWARD_FUNDING_POLICY_ACTIVATION_SLOT` | required for v2; set it to a slot **at or after** the deployment that enables it (credits recorded before activation are permanently ineligible — fail closed) |
-| `LAST60_FUNDING_DESTINATIONS` | Last-60 funding wallets (comma separated); required for v2; also watched by the indexer. Funds credited to rounds must end up in the payout wallet (use it as the destination, or sweep) |
+| `LAST60_FUNDING_DESTINATIONS` | Last-60 funding wallets (comma separated); also watched by the indexer. Under v2 the dedicated `LAST60_PAYOUT_WALLET_ADDRESS` is added automatically (once), so a contribution sent straight to it needs no custody transfer; v2 requires at least one destination (the payout wallet counts) |
+| `LAST60_PAYOUT_WALLET_ADDRESS` (+ `…_KEYPAIR_PATH` / `…_PRIVATE_KEY`, rewards only) | the dedicated payout wallet (§16, docs/PAYOUT_WALLET.md); legacy `PAYOUT_WALLET_*` names are aliases |
+| `LAST60_CUSTODY_ENABLED` | `false` (default): no custody request can be opened or bound. Rounds still require verified custody (direct contributions into the payout wallet are verified by their own transfer) |
+| `LAST60_CUSTODY_REQUEST_TTL_HOURS` | how long an open custody request can be bound (default 168) |
+| `LAST60_ATTRIBUTION_RECOVERY_ENABLED` | `false` (default): every recovery request is refused (and audited) |
 | `FORGE_PLATFORM_LP_BENEFICIARY` | Forge's platform Fee Key owner; must equal PlatformConfig `platform_nft_wallet` (Forgepad `8KXqQwtr…`); **required** for v2. Also the source wallet of Forge's creator distributions (§4a): once a LaunchLab → CPMM migration is verified, the indexer watches this wallet's associated token account for the launch token from the migration slot |
 | `BONDING_CREATOR_FEE_LAST60_PERCENTAGE` | must be 75 (approved model; any other value is a config error) |
 | `FORGE_PLATFORM_LP_LAST60_PERCENTAGE` | must be 50 (approved model; any other value is a config error) |
@@ -345,7 +365,7 @@ recorded and reported, never converted).
 | `EXPECTED_CPMM_CREATOR_FEE_RATE` | AmmConfig `creator_fee_rate` the migrated pool must use (Forgepad 500) |
 | `EXPECTED_LAUNCHLAB_PLATFORM_CONFIG` | existing; required (with the rate) for a verified bonding basis |
 
-PR #8 adds **no** environment variable: the Forge creator route needs only `FORGE_PLATFORM_LP_BENEFICIARY`
+PR #8 added **no** environment variable: the Forge creator route needs only `FORGE_PLATFORM_LP_BENEFICIARY`
 (already required for v2) and on-chain facts (pool creator, token mint and token program, verified
 migration). Nothing about the creator, the token or a creator-to-token mapping is configured.
 
@@ -418,6 +438,20 @@ decision (`db.funding_attributions.find({ status: "unresolved" })`). `pending` t
 the indexer's coverage of the destination pool or of Forge's launch-token account is behind (check
 `worker_state` cursors / `syncedThroughSlot`).
 
+Payout wallet, custody and recovery (PR #9, §14–§16):
+
+```bash
+bun run cli payout-wallet                       # read-only wallet verification (never a key)
+bun run cli funding [--json]                    # attribution / custody / round funding / payouts + liquidity
+bun run cli custody-request <fundingKey> [why]  # open a sweep request for ONE credited contribution
+bun run cli custody-submit <custodyId> <sig>    # verify the custodian's transfer from the chain and bind it
+bun run cli custody-cancel <custodyId> <why>
+bun run cli custody-refresh                     # promote bound transfers to finalized / failed (also automatic)
+bun run cli attributions [unresolved|pending|linked]
+bun run cli recover <attributionKey> [note]     # re-run the normal attribution for ONE unresolved row
+bun run cli recoveries [attributionKey]         # append-only recovery audit
+```
+
 Rollout:
 
 1. Deploy with the default legacy policy; set `LAST60_FUNDING_DESTINATIONS`,
@@ -426,7 +460,8 @@ Rollout:
 2. Confirm with `bun run cli revenue` on real Forge harvests that LP claims reconcile, Forge's creator
    payouts link (`forge_distribution_sequence`) with credits naming the creator
    (`allocationOwner: creator`, source = the Fee Key holder, destination = the creator), and review every
-   `unresolved` reason. Make the creator wallet the payout wallet, or sweep it into the payout wallet.
+   `unresolved` reason. Install the dedicated payout wallet (docs/PAYOUT_WALLET.md) and, when you are
+   ready to collect creators' custody transfers, set `LAST60_CUSTODY_ENABLED=true` (§14).
 3. Choose an activation slot at or after the switch-over and set `REWARD_FUNDING_POLICY=forge_phase_aware_v2`
    with `REWARD_FUNDING_POLICY_ACTIVATION_SLOT` on **both** workers (and the CLI). Rounds whose
    snapshot is after it are funded by verified contributions only.
@@ -457,3 +492,166 @@ Rollout:
 * Reconciliation passes for `last60_destination` inflows are per launch and scan that launch's unlinked
   inflows / unreconciled claims (bounded to 500 per pass); the Forge creator route uses its own indexed
   queue (§4a). At very high claim counts consider archiving fully reconciled claims.
+* Custody (§14) is creator-initiated: Last-60 cannot move SOL out of a creator's wallet. A creator who
+  never sends the custody transfer leaves the contribution attributed but unfunded (reported as
+  "attributed, awaiting custody"; it never funds a round).
+* A contribution funds a round only when custody covers its whole creditable amount; partial custody is
+  recorded and the contribution waits for the remainder.
+* Custody verified into a payout wallet does not carry over when the payout wallet is rotated
+  (docs/PAYOUT_WALLET.md §8).
+
+## 14. Physical custody: getting credited SOL into the payout wallet (PR #9)
+
+### Why
+
+An attributed contribution says **who contributed**; it does not put SOL in the wallet that pays
+rewards. Forge's existing collector pays the creator's 50 % to the **creator's** wallet (§4a) — that
+receipt is the contribution and is credited once (`reward_funding`, route `forge_creator_distribution`).
+Last-60 cannot sign for the creator's wallet and never stores creator keys, so the creator (or whoever
+holds the contribution) must send it to the dedicated payout wallet. That transfer is a **custody
+transfer**: it moves the existing contribution; it never creates another `reward_funding` credit.
+
+### Custody modes (`custodyRequirement`)
+
+| Credit | Custodian | Mode | What proves custody |
+|---|---|---|---|
+| `last60_destination` credit whose destination **is** the payout wallet (e.g. the bonding 75 % sent straight to it, same transaction or `last60:v1` memo) | payout wallet | `direct` | the credit's own (finalized) transfer — no sweep |
+| `forge_creator_distribution` credit | the launch creator | `transfer` | a verified custody transfer creator → payout wallet |
+| `last60_destination` credit into another funding destination | that destination wallet | `transfer` | a verified custody transfer destination → payout wallet |
+| not payable, not native SOL, no destination recorded, or no payout wallet configured | — | `not_applicable` | never funds a round |
+
+### Workflow (operator-authorized, creator-initiated)
+
+1. **Request** (operator, `LAST60_CUSTODY_ENABLED=true`): `custody-request <fundingKey>` or admin
+   "Open sweep request". It names ONE credit; the amount (the credit's **outstanding**, not yet
+   custodied amount), the source (the credit's custodian) and the destination (the configured payout
+   wallet) come from the records — no API accepts them. At most one open request per contribution
+   (unique partial index); requests expire after `LAST60_CUSTODY_REQUEST_TTL_HOURS`.
+2. **Transfer** (the custodian, from its own wallet): exactly the stated lamports of **native SOL**
+   (System Program `transfer`, not wrapped SOL) to the payout wallet, in a transfer-only transaction,
+   ideally with the SPL memo `last60:custody:v1:<custodyId>`.
+3. **Binding**: with the memo, the indexer (which watches the payout wallet when custody is enabled)
+   matches it automatically; otherwise the operator submits the signature (`custody-submit`, admin
+   "Submit signature"), which is fetched from the RPC (`finalized`, else `confirmed`).
+4. **Finality**: a transfer bound at `confirmed` is `awaiting_finality` and counts for nothing until the
+   reconciler (or `custody-refresh`) sees it `finalized` and successful; a failed or never-finalized
+   transfer becomes `failed` and its amount is outstanding again (the transfer stays reserved).
+
+### Verification (`verifyCustodyTransfer`, pure; `bindCustodyTransfer`, transactional)
+
+A transfer is bound only if **all** hold — otherwise the request stays open and the rejection is
+appended to its `history`:
+
+* the transaction succeeded and contains only System / ComputeBudget / Memo instructions;
+* exactly one non-zero System `transfer` from the request's custodian to the request's payout wallet,
+  which is still the configured payout wallet; an SPL / wrapped-SOL transfer is `incorrect_mint`, other
+  sources / destinations are `incorrect_source_wallet` / `incorrect_destination_wallet`;
+* strictly after the contribution's slot (a transfer before the contribution was received cannot be a
+  sweep of it; same-slot order is unknowable);
+* no custody memo naming another request (on the indexer path the memo must be present);
+* the transfer is not already used: `transfer_uses` (unique `signature:ordinal`) makes "reward
+  contribution" and "custody transfer" mutually exclusive uses of one on-chain transfer, and a transfer
+  recorded as a contribution (even before `transfer_uses` existed) is refused;
+* the contribution is still payable, unconsumed and held by that custodian.
+
+Inside one MongoDB transaction the binding reserves the transfer, recomputes the outstanding amount from
+every bound custody row and compare-and-sets the request from `requested`. **Credited =
+min(observed, outstanding)**; any excess is recorded (`reconciliation: excess`), never credited; less is
+`partial`. The amount is the instruction's lamports: the network fee is paid separately by the fee payer,
+recorded (`networkFeeLamports`) and never counted. A balance increase alone is never evidence: an
+unrelated deposit into the payout wallet (no request, no matching memo) is ignored, and a creator →
+payout transfer without a memo never becomes a contribution (no claim names it in strict mode; in
+`exclusive_window` mode the reservation refuses it once bound as custody). A transaction carrying a
+`last60:custody:v1` memo is never recorded as a funding inflow.
+
+### Rounds
+
+`consumableFunding` (scheduler) additionally requires that the credit's SOL is in the payout wallet:
+`direct`, or settled (`reconciled` / `partial`, `finalized`) custody rows **into the currently
+configured payout wallet** covering the whole creditable amount; the custody signatures' finality is
+re-checked on-chain with the transfer and claim signatures. An attributed but uncustodied credit stays
+unconsumed (`fundingBreakdown.awaitingCustody` / `awaitingCustodyAmount`) and funds a later round once
+custody is verified; a credit is still consumed by at most one round. A round that consumed custodied
+funding still waits in `awaiting_funds` if the live wallet balance does not cover its payouts.
+
+### Reconciliation
+
+Every reconciliation pass runs `refreshCustodyFinality` and writes a `custody` report: the payout wallet
+balance must cover **custodied, unconsumed contributions + pending live payouts + reserve**; less is a
+`mismatch` (terminal WARN). The funding report also shows the unattributed surplus (fee top-ups, custody
+excess) separately — accounting is never treated as liquidity.
+
+### Records
+
+`custody_transfers`: `custodyId` (unique), `fundingKey` (the original contribution), collection key,
+stream, route, launch (`sourcePool`, `tokenMint`), `creator`, `sourceWallet`, `destinationWallet`,
+`mint`, contribution signature and slot, `expectedAmount`, `memo`, `requestedBy`, `expiresAt`; once
+bound: `method` (`memo_observed` / `operator_signature`), `transferKey`, `signature`, `ordinal`, `slot`,
+`observedAmount`, `creditedAmount`, `excessAmount`, `networkFeeLamports`, `feePayer`,
+`confirmationStatus` (`none` / `confirmed` / `finalized` / `failed`), `status` (`requested` /
+`awaiting_finality` / `reconciled` / `partial` / `failed` / `cancelled` / `expired`), `reconciliation`
+(`pending` / `matched` / `partial` / `excess`), `finalizedSlot`, `failureReason`, the append-only
+`history` and timestamps. Request facts are immutable (model guard); `transfer_uses` is append-only.
+
+### Bonding-curve funding
+
+The 75 % bonding-curve contribution is unchanged in substance: it is the creator's observed transfer
+(same transaction as the claim, or a `last60:v1:<claim>` memo) into a Last-60 funding destination.
+Since the payout wallet is a funding destination under v2, a creator who sends the 75 % straight to it
+needs no further step (`direct`). A contribution sent to another configured destination needs a custody
+transfer from that destination. The 25 % creator share is never credited (anything above the 75 % is
+excess), and an uncorrelated or unverified transfer is never a credit.
+
+## 15. Auditable recovery of unresolved Forge attributions (PR #9)
+
+PR #8 deliberately leaves uncertain Forge creator distributions `unresolved`, and the attribution pass
+never re-evaluates a decided row. When later evidence becomes available (typically: coverage claimed
+completeness but a harvest was missing and has since been backfilled), an operator may ask Last-60 to
+**re-run the normal verification** for one row. Recovery is permission to rerun verification, not
+permission to override it.
+
+**Request** (`bun run cli recover <attributionKey> [note]`, `POST /api/admin/funding/attributions/recover
+{attributionKey, requestId?, note?}`, admin "Re-run verification"): an authenticated operator (admin
+wallet session; the CLI acts as `cli:$USER`) selects one row. The request carries **no** amount,
+`payoutEligible`, `collectionKey`, status or correlation; any such field is refused (`400` at the API,
+`override_fields_not_allowed` in the engine). `LAST60_ATTRIBUTION_RECOVERY_ENABLED=false` (default)
+refuses every request.
+
+**Checks** (`recoverAttribution`), in order; any failure is recorded and leaves the row unresolved:
+
+1. the row exists, is route `forge_creator_distribution`, is `unresolved`, was never recovered, belongs
+   to the configured launch (bonding pool and token mint) and has no `reward_funding` credit;
+2. indexing coverage of the launch's attribution addresses (destination pool + Forge's launch-token
+   account) reaches the payout slot, and the payout slot is finalized;
+3. the **normal** attribution (`evaluateForgeDistribution` → `attributeForgeDistribution`, unchanged:
+   launch anchor, wallets, harvest sequence, slot ordering, exclusivity, alternation, mint, amount
+   bounds, same-transaction / memo correlation) is re-run, read-only, over the indexed history;
+4. only a **linked** result for the selected leg proceeds; the linked harvest and the payout must be
+   finalized and successful on-chain;
+5. one MongoDB transaction re-checks the row (still unresolved, not recovered), the absence of a credit
+   and the collection's other credits (unchanged since the evaluation), writes the credit through the
+   normal `writeCredit` — which alone decides payability — sets the one-time `recovery` pointer and
+   inserts the audit row.
+
+Outcomes: `linked` (payable credit); `linked_not_payable` (e.g. a SOL leg above the harvest's 50 %:
+credited with its excess, never payable — exactly as the normal pass); `still_unresolved` (the normal
+attribution still refuses; its reasons are recorded); `rejected` (a precondition failed). A repeated
+`requestId` returns the recorded result; concurrent requests produce exactly one credit (unique credit
+key, conditional pointer, transactional re-checks).
+
+**Immutable audit.** The original decision (`status`, `reasons`, `candidates`, `evidence`,
+`evaluatedAt`, `evaluations`) is never rewritten; a linked recovery only adds
+`funding_attributions.recovery = {requestId, outcome, rewardFundingKey, payoutEligible, at, operator}`.
+Every request is one append-only `attribution_recoveries` row: `requestId`, `attributionKey`,
+`operator`, `requestedAt` / `completedAt`, `note`, the `original` decision verbatim, the `evaluation`
+(algorithm, policy, coverage keys and slot, finalized slot, harvest candidates, window truncation,
+attribution outcome), `outcome`, `resultReasons`, `linkedHarvestSignature` / slot,
+`previousHarvestSignature`, `rewardFundingKey`, `payoutEligible`, `transactions` and `failureReason`.
+The model refuses updates and deletes of audit rows. The recovered credit's `attribution` evidence also
+carries `recovery: {requestId, operator, algorithm, coveredThroughSlot, finalizedSlot, originalReasons}`.
+
+## 16. The dedicated payout wallet (PR #9)
+
+See docs/PAYOUT_WALLET.md: variables, fail-closed key validation, the narrowly scoped signer
+(construction → authorization → signing; one authorized transfer per transaction), key generation and
+secure installation, read-only verification, and funding the wallet for fees.

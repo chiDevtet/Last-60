@@ -2,10 +2,14 @@ import pino, { type Logger } from "pino";
 
 export type { Logger };
 
-const REDACT = [
+export const LOG_REDACT_PATHS = [
   "*.privateKey",
   "*.secretKey",
   "*.PAYOUT_WALLET_PRIVATE_KEY",
+  "*.LAST60_PAYOUT_WALLET_PRIVATE_KEY",
+  "*.payoutWalletPrivateKey",
+  "secrets",
+  "*.secrets",
   "*.FEE_CLAIM_AUTHORITY_PRIVATE_KEY",
   "*.SCHEDULE_ENCRYPTION_KEY",
   "*.ADMIN_SESSION_SECRET",
@@ -23,7 +27,7 @@ export function createLogger(opts: { level?: string; name?: string; pretty?: boo
   return pino({
     name: opts.name ?? "last60",
     level: opts.level ?? process.env.LOG_LEVEL ?? "info",
-    redact: { paths: REDACT, censor: "[redacted]" },
+    redact: { paths: LOG_REDACT_PATHS, censor: "[redacted]" },
     base: { pid: process.pid },
     timestamp: pino.stdTimeFunctions.isoTime,
     ...(pretty ? { transport: { target: "pino-pretty", options: { colorize: true, translateTime: "SYS:HH:MM:ss.l" } } } : {}),

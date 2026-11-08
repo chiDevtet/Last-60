@@ -44,7 +44,8 @@ jobs:
 
       # Explicit, named run of the accounting-safety suites (phase-aware revenue streams, funding
       # credits and round funding, CPMM creator_fee_on / CreatorFeeShare, migration verification,
-      # immutable snapshots). A missing file fails this step. They run again in the full suite below.
+      # immutable snapshots, dedicated payout wallet, custody transfers and attribution recovery). A
+      # missing file fails this step. They run again in the full suite below.
       - name: Revenue, funding and migration verification suites
         run: >-
           bun test
@@ -57,6 +58,11 @@ jobs:
           packages/engine/test/basis-guards.test.ts
           packages/engine/test/basis-history.test.ts
           packages/engine/test/config.test.ts
+          packages/engine/test/forge-creator-distribution.test.ts
+          packages/engine/test/approved-model.test.ts
+          packages/engine/test/payout-wallet.test.ts
+          packages/engine/test/custody.test.ts
+          packages/engine/test/attribution-recovery.test.ts
 
       - name: Test
         run: bun run test

@@ -27,8 +27,8 @@ Start from `.env.example`. Recommended split (all chmod 600):
 | File | Contains |
 |---|---|
 | `.env.indexer` | Solana, provider, rewards params, Mongo, indexer settings. **No keys.** |
-| `.env.rewards` | Same + `SCHEDULE_ENCRYPTION_KEY`, `PAYOUT_WALLET_*`, payout/fee-collection settings. |
-| `.env.api` | Solana (read-only), provider, Mongo, API/admin settings, `ADMIN_SESSION_SECRET`. **No keys, no schedule key.** |
+| `.env.rewards` | Same + `SCHEDULE_ENCRYPTION_KEY`, `LAST60_PAYOUT_WALLET_ADDRESS` + `LAST60_PAYOUT_WALLET_KEYPAIR_PATH` (the only process with the payout key — docs/PAYOUT_WALLET.md), payout/fee-collection settings. |
+| `.env.api` | Solana (read-only), provider, Mongo, API/admin settings, `ADMIN_SESSION_SECRET`, `LAST60_PAYOUT_WALLET_ADDRESS` (address only), `LAST60_CUSTODY_ENABLED` / `LAST60_ATTRIBUTION_RECOVERY_ENABLED` when those workflows are wanted. **No keys, no schedule key.** |
 | `.env.web` | `NEXT_PUBLIC_*`, `API_INTERNAL_URL`. |
 
 Generate secrets: `openssl rand -base64 32` (schedule key), `openssl rand -base64 48` (session).
@@ -76,7 +76,11 @@ socket peer. Bind the API to `127.0.0.1` when it sits behind the proxy (`API_HOS
    `allocation.verification` is `verified` (no `ALLOCATION MISMATCH` warning). Let it run for at least a few
    hours. Check `bun run cli reconcile` reports `ok`, run `scripts/verify-round.ts` on several
    rounds, and review the simulated payouts.
-3. **Devnet or small-value live test** of the payout wallet path if desired.
+3. **Payout wallet** — generate and install the dedicated keypair (docs/PAYOUT_WALLET.md §4–§5), fund
+   it for fees (§7), and confirm `bun run cli payout-wallet` reports the signer configured with a
+   matching derived key. Custody (`LAST60_CUSTODY_ENABLED`) and recovery
+   (`LAST60_ATTRIBUTION_RECOVERY_ENABLED`) stay off until explicitly wanted. A devnet or small-value
+   live test of the payout path is recommended.
 4. **Mainnet live** — requires explicit authorization from the project owner:
    `PAYOUT_MODE=live` **and** `ALLOW_MAINNET_PAYOUTS=true` in `.env.rewards`, a funded dedicated
    payout wallet, `PAYOUT_COMMITMENT=finalized`. Watch the first rounds closely. The rewards
