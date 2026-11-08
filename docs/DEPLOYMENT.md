@@ -2,7 +2,9 @@
 
 ## Prerequisites
 
-* **Bun ≥ 1.3** (workers, API) and **Node ≥ 20** (Next.js web).
+* **Bun 1.4.4** (the version CI uses; workers, API) and **Node ≥ 20** (Next.js web). Bun ≥ 1.3 installs
+  workspaces with the isolated linker, so packages are linked per workspace (`apps/web/node_modules/next`)
+  rather than hoisted to the root; scripts that import packages must run from a workspace that depends on them.
 * **MongoDB replica set** — Atlas (M10+ for production) or self-hosted `mongod --replSet rs0`. The
   `last60-mongo` PM2 app runs a local single-node set in `./.mongo-dev`; it has no backups, so set
   those up separately, and remove the app when using Atlas.
@@ -49,6 +51,17 @@ pm2 start ecosystem.config.cjs --only last60-indexer,last60-rewards,last60-api,l
 pm2 save && pm2 startup
 pm2 logs last60-rewards
 ```
+Start PM2 from a **clean environment**. PM2 copies the calling shell's environment into every app
+it starts and saves it in `dump.pm2`, and Bun lets inherited variables override `--env-file`. A stray
+export such as an old `SOLANA_RPC_URL` then silently wins over the env files, survives restarts and
+reboots, and lands on disk with any tokens the shell held. Wrap PM2 so it never inherits:
+
+```bash
+env -i HOME=/root PATH="$PATH" PM2_HOME=/root/.pm2-last60 pm2 start ecosystem.config.cjs
+```
+Check it with `tr '\0' '\n' < /proc/$(pm2 pid last60-indexer)/environ`: no `SOLANA_*` or other app
+variables should appear there, since they come from the env files.
+
 The Bun apps run `bun` as the PM2 command (`script: "bun"`, `interpreter: "none"`), because PM2's
 Bun wrapper `require()`s the entrypoint and fails on modules with top-level await. Check `node -v`
 first: PM2 and the web app need Node ≥ 20 on `PATH`, which on an nvm host is not always the
