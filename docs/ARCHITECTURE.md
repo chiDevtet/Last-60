@@ -38,7 +38,7 @@ seconds of the round and is kept secret until it happens. Randomness decides **w
                                          └────────────────────────────┘
 ```
 
-* `indexer`, `rewards`, `api`, `web` are separate PM2 processes. Only `rewards` ever loads a
+* `indexer`, `rewards`, `api`, `web` are separate PM2 processes (plus `mongo` for a local replica set). Only `rewards` ever loads a
   private key or the schedule encryption key. `api` and `web` can be down without affecting
   rounds or payouts (acceptance criterion 15).
 * Code lives in two packages: `packages/shared` (browser-safe types/formatters) and

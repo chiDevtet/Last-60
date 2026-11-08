@@ -25,8 +25,8 @@ without authenticated X/Telegram API access and should be checked manually befor
 | 12 | THE-LAST-60 | hyphenated | free | free | free | free | hyphens hurt recall |
 
 **Decision: keep LAST60.** It is the only candidate that explains the product in five
-characters, survives being spoken, and yields a distinctive mark. Primary domain recommendation:
-**last60.io**, with **last60.xyz** and **last60.fun** as defensive registrations. Ticker suggestion:
+characters, survives being spoken, and yields a distinctive mark. Production domain:
+**last60.fun**. The original recommendation was last60.io, with last60.xyz and last60.fun as defensive registrations. Ticker suggestion:
 `$LAST60` (or `$L60` where tickers are length-limited).
 
 ## Concept — "the final arc"
