@@ -1,4 +1,4 @@
-# Phase-aware revenue attribution and Last-60 reward funding (PR #6, corrected in PR #7, Forge creator distributions in PR #8, payout wallet, custody and recovery in PR #9)
+# Phase-aware revenue attribution and Last-60 reward funding (PR #6, corrected in PR #7, Forge creator distributions in PR #8, payout wallet, custody and recovery in PR #10)
 
 This document describes how LAST60 attributes Forge's revenue across the two launch phases, which
 streams may fund Last-60 buyer rewards, what evidence is required, and how Last-60 recognises Forge's
@@ -11,7 +11,7 @@ reconciliation), `src/indexer/cursor.ts` (indexing coverage), `src/revenue/repor
 `src/recovery/attributionRecovery.ts` (operator recovery, §15), `src/signer/payoutSigner.ts` (the
 dedicated payout wallet's signer, §16 and docs/PAYOUT_WALLET.md).
 
-**Four things are never interchangeable** (since PR #9):
+**Four things are never interchangeable** (since PR #10):
 
 | # | Question | Record | Becomes true when |
 |---|---|---|---|
@@ -68,7 +68,7 @@ routes are recognised:
 
 A transfer **from** the creator's wallet never satisfies a Forge LP claim (it cannot be told apart from
 the creator's own bonding or CPMM revenue): the source of a credited transfer must be the claim's
-recipient. Since PR #9 the creator's receipt of Forge's payout is the (single) economic contribution,
+recipient. Since PR #10 the creator's receipt of Forge's payout is the (single) economic contribution,
 and the creator's later transfer of that SOL into the dedicated payout wallet is a **custody transfer**
 (§14) — never a second contribution. A credit funds rounds only once that custody is verified.
 
@@ -438,7 +438,7 @@ decision (`db.funding_attributions.find({ status: "unresolved" })`). `pending` t
 the indexer's coverage of the destination pool or of Forge's launch-token account is behind (check
 `worker_state` cursors / `syncedThroughSlot`).
 
-Payout wallet, custody and recovery (PR #9, §14–§16):
+Payout wallet, custody and recovery (PR #10, §14–§16):
 
 ```bash
 bun run cli payout-wallet                       # read-only wallet verification (never a key)
@@ -500,7 +500,7 @@ Rollout:
 * Custody verified into a payout wallet does not carry over when the payout wallet is rotated
   (docs/PAYOUT_WALLET.md §8).
 
-## 14. Physical custody: getting credited SOL into the payout wallet (PR #9)
+## 14. Physical custody: getting credited SOL into the payout wallet (PR #10)
 
 ### Why
 
@@ -602,7 +602,7 @@ needs no further step (`direct`). A contribution sent to another configured dest
 transfer from that destination. The 25 % creator share is never credited (anything above the 75 % is
 excess), and an uncorrelated or unverified transfer is never a credit.
 
-## 15. Auditable recovery of unresolved Forge attributions (PR #9)
+## 15. Auditable recovery of unresolved Forge attributions (PR #10)
 
 PR #8 deliberately leaves uncertain Forge creator distributions `unresolved`, and the attribution pass
 never re-evaluates a decided row. When later evidence becomes available (typically: coverage claimed
@@ -650,7 +650,7 @@ attribution outcome), `outcome`, `resultReasons`, `linkedHarvestSignature` / slo
 The model refuses updates and deletes of audit rows. The recovered credit's `attribution` evidence also
 carries `recovery: {requestId, operator, algorithm, coveredThroughSlot, finalizedSlot, originalReasons}`.
 
-## 16. The dedicated payout wallet (PR #9)
+## 16. The dedicated payout wallet (PR #10)
 
 See docs/PAYOUT_WALLET.md: variables, fail-closed key validation, the narrowly scoped signer
 (construction → authorization → signing; one authorized transfer per transaction), key generation and

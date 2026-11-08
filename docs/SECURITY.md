@@ -29,7 +29,7 @@
 
 ## Money movement invariants
 
-0. (PR #9) An attributed contribution is never liquidity: a round consumes a credit only when its SOL is
+0. (PR #10) An attributed contribution is never liquidity: a round consumes a credit only when its SOL is
    verified in the dedicated payout wallet (direct transfer, or finalized custody transfers covering it).
    A custody transfer never creates a `reward_funding` credit; `transfer_uses` makes contribution and
    custody mutually exclusive uses of one on-chain transfer. Operator recovery re-runs the normal
