@@ -21,7 +21,7 @@ import { FeeCollector } from "./feeCollector";
 import { Reconciler } from "./reconciliation";
 import { readMint } from "../providers/mint";
 import { CreatorWalletAutomation } from "../creator/creatorWallet";
-import { fulfilExportRequests, fulfilWalletRequests } from "../wallets/vault";
+import { fulfilExportRequests, fulfilWalletRequests, publishImportKey } from "../wallets/vault";
 
 export interface RewardsWorkerDeps {
   db: Models;
@@ -235,8 +235,19 @@ export class RewardsWorker {
     if (now - this.lastWalletPass < 2_000) return;
     this.lastWalletPass = now;
     try {
-      const made = await fulfilWalletRequests(this.d.db, this.d.cfg, this.log);
-      for (const role of made) await this.terminal.system(`New ${role} wallet generated and stored encrypted. Processes restart to load it; export a backup from the admin console.`, `wallet-generated:${role}`);
+      await publishImportKey(this.d.db, this.d.cfg);
+      const made = await fulfilWalletRequests(this.d.db, this.d.cfg, this.log, now);
+      for (const role of made) {
+        const row: any = await this.d.db.WalletVault.findById(role, { origin: 1 }).lean();
+        await this.terminal.system(row?.origin === "imported" ? `Existing ${role} wallet imported and stored encrypted. Processes restart to load it.` : `New ${role} wallet generated and stored encrypted. Processes restart to load it; export a backup from the admin console.`, `wallet-ready:${role}`);
+      }
+      // A refused import is surfaced; one encrypted to a key that is not this worker's is a tampering signal.
+      const refused: any[] = await this.d.db.WalletVault.find({ status: "refused", refusedAt: { $gt: new Date(now - 600_000) } }, { refusedReason: 1, refusedAt: 1 }).lean();
+      for (const r of refused) {
+        const tamper = /encrypted_to_an_unknown_key|bad_admin_signature|signer_not_in/.test(r.refusedReason ?? "");
+        const text = `Import of the ${r._id} wallet refused: ${r.refusedReason}.${tamper ? " This can mean the request was tampered with in transit — check the API server before retrying." : ""}`;
+        await (tamper ? this.terminal.error(text, `wallet-import-refused:${r._id}:${new Date(r.refusedAt).getTime()}`) : this.terminal.warn(text, `wallet-import-refused:${r._id}:${new Date(r.refusedAt).getTime()}`));
+      }
       await fulfilExportRequests(this.d.db, this.d.cfg, { now, log: this.log });
     } catch (err: any) {
       this.log.error({ err: String(err?.message ?? err) }, "wallet vault request failed");

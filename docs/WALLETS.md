@@ -1,6 +1,6 @@
 # Wallets from the admin console, and the pool before launch
 
-The admin page (**Wallets & launch**) can generate the **payout wallet** and the **creator wallet**, show
+The admin page (**Wallets & launch**) can generate — or **import** — the **payout wallet** and the **creator wallet**, show
 their balances, back them up, and show the pool derived from the token mint before the token is launched.
 No environment variable has to be edited for any of it.
 
@@ -66,6 +66,45 @@ too — the worker trusts only its own list. Without it every export is refused 
 On the rewards host, a shell alternative: `bun run cli wallet-export <payout|creator> --yes` (with the
 rewards worker's environment) prints the key.
 
+## 2a. Import an existing wallet (e.g. the Phantom wallet you launch from)
+
+Admin page → **Import existing wallet** (shown while a role has no wallet). Paste the private key as
+Phantom / Solflare export it (base58) or as a Solana CLI keypair file (JSON array).
+
+1. The page checks the key **in the browser** and shows the address it controls. The key is never sent in
+   the clear.
+2. It fetches the rewards worker's **import key** — an X25519 public key the worker derives from its vault
+   key and publishes on request — and shows its fingerprint. The first import **pins** that key in this
+   browser; if it ever changes, the page warns you before going on (expected only if the vault key was
+   replaced). Compare the fingerprint on the rewards host with `bun run cli wallets`
+   (`importKey.fingerprintFromVaultKey`).
+3. Your **admin wallet signs an import intent**: site, wallet role, the address being imported, a request
+   id, the worker key the browser encrypts to, and an expiry (≤ 5 minutes).
+4. The page seals the key to the worker key (one-time X25519 key → HKDF-SHA256 → AES-256-GCM, with a label
+   distinct from exports) and sends only the ciphertext.
+5. The API checks the intent (signer = the signed-in admin, site, role, expiry, the worker key it published)
+   and stores the sealed key.
+6. The rewards worker re-checks everything itself — the signer must be in **its own** `ADMIN_WALLETS`, and
+   the browser must have encrypted to **its own** import key — decrypts, verifies the key really controls
+   the signed address, then stores it encrypted at rest exactly like a generated wallet (marked
+   `imported`). The sealed copy is deleted. All processes restart to load it.
+
+Refusals are shown on the page and the terminal (`key_does_not_control_the_signed_address`,
+`cannot_decrypt_sealed_key`, `encrypted_to_an_unknown_key`, `signer_not_in_rewards_worker_admin_wallets`,
+…); you can retry after a refusal. `encrypted_to_an_unknown_key` is raised as an ERROR: the browser
+encrypted to a key that is not the worker's, which can mean the API server was tampered with — check it
+before retrying.
+
+The same rules as generation apply: an imported wallet is never replaced from the admin page, an
+environment wallet always wins, and one key cannot be both the payout and the creator wallet.
+
+**What import protects and what it does not.** Nobody who can write to the database can store a key of
+their own as your payout wallet (the worker requires your admin wallet's signature over the exact address),
+and the API never sees the key. The one thing the browser must trust is the worker's import key, which it
+receives through the API: a compromised API could serve its own key on a **first** import from a fresh
+browser. The pin (and the fingerprint you can compare on the server) is the defence; the worker also
+refuses — loudly — anything encrypted to a key that is not its own.
+
 ## 3. Fund the wallets
 
 * **Creator wallet:** a little SOL for network fees (≈ 0.05 SOL; the automation always keeps
@@ -89,7 +128,9 @@ A Raydium LaunchLab (Forgepad) pool address is a program-derived address of the 
 ## 5. Launch checklist from the admin page
 
 1. Generate the payout wallet; export a backup.
-2. Generate the creator wallet; export it (backup + Phantom import); fund it.
+2. Creator wallet, either way:
+   * **generate** it, export it (backup + Phantom import) and fund it; or
+   * **import** the Phantom wallet you will launch from (§2a) — it is already funded and backed up.
 3. Launch the token on Forgepad **from the creator wallet**.
 4. Set the token mint in Configuration (pool derived). This can also be done before step 3.
 5. Switch payout mode to `live` when ready (mainnet also needs `ALLOW_MAINNET_PAYOUTS=true` in the rewards

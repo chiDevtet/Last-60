@@ -137,6 +137,14 @@ describe("frontend isolation", () => {
     expect(files.length).toBeGreaterThan(5);
     for (const f of files) {
       const t = readFileSync(f, "utf8");
+      // The ONE deliberate exception: the admin Wallets panel handles a wallet key the admin pastes (import)
+      // or asked to see (export). It may name a `secretKey`, but only ever sends it sealed to the rewards
+      // worker (sealImport) and must still never touch server key variables, the payout signer or the engine.
+      if (f.endsWith("/app/admin/WalletsPanel.tsx")) {
+        expect({ f, hit: /PRIVATE_KEY|KEYPAIR_PATH|PayoutSigner|@last60\/engine/.test(t) }).toEqual({ f, hit: false });
+        expect(t).toContain("sealImport(secretKey");
+        continue;
+      }
       expect({ f, hit: /PRIVATE_KEY|KEYPAIR_PATH|PayoutSigner|secretKey|@last60\/engine/.test(t) }).toEqual({ f, hit: false });
     }
   });

@@ -560,7 +560,10 @@ export const WALLET_ROLES = ["payout", "creator"] as const;
 const walletVaultSchema = new Schema(
   {
     _id: { type: String, enum: WALLET_ROLES, required: true },
-    status: { type: String, enum: ["requested", "active"], required: true },
+    /** requested → active; an import the rewards worker rejects becomes `refused` (it may be retried). */
+    status: { type: String, enum: ["requested", "active", "refused"], required: true },
+    /** `generated` by the rewards worker, or `imported` from a key the admin already held. */
+    origin: { type: String, enum: ["generated", "imported"], default: "generated" },
     address: { type: String, default: null },
     alg: { type: String, default: null },
     keyId: { type: String, default: null },
@@ -569,6 +572,13 @@ const walletVaultSchema = new Schema(
     requestedBy: { type: String, required: true },
     requestedAt: { type: Date, required: true },
     reason: { type: String, default: null },
+    /**
+     * Pending import only (cleared once decided): the admin-signed intent and the key SEALED to the rewards
+     * worker's import key ({ adminWallet, message, signature, sealed: { senderKey, iv, ciphertext } }).
+     */
+    import: { type: Schema.Types.Mixed, default: null },
+    refusedReason: { type: String, default: null },
+    refusedAt: { type: Date, default: null },
     generatedAt: { type: Date, default: null },
     generatedBy: { type: String, default: null },
     lastExportedAt: { type: Date, default: null },

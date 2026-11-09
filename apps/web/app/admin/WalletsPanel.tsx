@@ -8,10 +8,13 @@
  *   - "Export private key" creates a one-time key pair HERE, has your admin wallet sign an export intent
  *     naming this browser's key, and the rewards worker seals the secret to that key. Only this tab can open
  *     it; the API and database relay ciphertext, delivered once. Nothing is written to storage.
+ *   - "Import existing wallet" parses the pasted key HERE (it never leaves the tab in the clear), seals it to
+ *     the rewards worker's published import key, and has your admin wallet sign an intent naming the address
+ *     and that worker key. The worker key is pinned in this browser on first use; a change is flagged.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import bs58 from "bs58";
-import { EXPORT_MAX_TTL_MS, exportIntentMessage, newExportRequest, openExport, type ExportWalletRole } from "@last60/shared";
+import { EXPORT_MAX_TTL_MS, exportIntentMessage, importIntentMessage, keyFingerprint, newExportRequest, openExport, parseSolanaSecretKey, sealImport, type ExportWalletRole } from "@last60/shared";
 import { dateTime, shortAddress, sol } from "@/lib/format";
 
 type Call = (p: string, i?: RequestInit) => Promise<any>;
@@ -62,6 +65,83 @@ function Revealed({ role, address, secret, onHide }: { role: string; address: st
   );
 }
 
+const PIN_KEY = "last60.admin.importKey";
+const readPin = () => {
+  try {
+    return localStorage.getItem(PIN_KEY);
+  } catch {
+    return null;
+  }
+};
+const writePin = (k: string) => {
+  try {
+    localStorage.setItem(PIN_KEY, k);
+  } catch {
+    /* storage unavailable: no pin, every import asks for the fingerprint check */
+  }
+};
+
+/** Import a private key the admin already holds (e.g. the Phantom wallet the token was launched from). */
+function ImportForm({ role, title, call, signMessage, site, onDone, onError }: { role: ExportWalletRole; title: string; call: Call; signMessage: SignMessage; site: string | null; onDone: (m: string) => void; onError: (m: string) => void }) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const parsed = text.trim() ? parseSolanaSecretKey(text) : null;
+  const clear = () => setText("");
+  useEffect(() => clear, []); // never keep a pasted key around after the form closes
+
+  async function submit() {
+    if (!parsed || "error" in parsed) return;
+    setBusy(true);
+    const secretKey = Uint8Array.from(parsed.secretKey);
+    try {
+      // 1. The rewards worker's import key (published on request; it may take a couple of seconds).
+      let k: any = null;
+      for (let i = 0; i < 20; i++) {
+        k = await call("/wallets/import-key");
+        if (k.status === "ready") break;
+        await new Promise((r) => setTimeout(r, 1_500));
+      }
+      if (k?.status !== "ready") throw new Error("the rewards worker did not publish its import key (is it running?)");
+      // 2. Pin it on first use; a different key later is a red flag (it could mean the API was tampered with).
+      const pinned = readPin();
+      if (pinned && pinned !== k.publicKey) {
+        const ok = confirm(`WARNING: the rewards worker's import key changed.\n\nPinned: ${keyFingerprint(pinned)}\nNow:    ${k.fingerprint}\n\nThis is expected only if the vault key was replaced on the rewards server. Check it there with: bun run cli wallets\n\nContinue and trust the new key?`);
+        if (!ok) throw new Error("import cancelled: worker key changed");
+      } else if (!pinned) {
+        const ok = confirm(`First import from this browser.\n\nRewards worker import key fingerprint: ${k.fingerprint}\n(you can compare it on the rewards server with: bun run cli wallets)\n\nTrust this key?`);
+        if (!ok) throw new Error("import cancelled");
+      }
+      writePin(k.publicKey);
+      if (!confirm(`Import ${parsed.address} as the ${title.toLowerCase()}?\n\nYour admin wallet will ask you to sign. The key is encrypted in this browser before it is sent. All Last-60 processes restart (about 15 s) to load it.`)) throw new Error("import cancelled");
+      // 3. Sign the intent (address + worker key), seal the key to the worker, send ciphertext only.
+      const requestId = newExportRequest().requestId;
+      const message = importIntentMessage({ site: site ?? window.location.host, role, address: parsed.address, requestId, workerKey: k.publicKey, expiresAt: new Date(Date.now() + EXPORT_MAX_TTL_MS - 30_000).toISOString() });
+      const { signature } = await signMessage(message);
+      const sealed = await sealImport(secretKey, k.publicKey, requestId);
+      const r = await call(`/wallets/${role}/import`, { method: "POST", body: JSON.stringify({ requestId, message, signature, sealed }) });
+      if (!r.accepted) throw new Error(`import refused: ${r.reason}`);
+      clear();
+      onDone(`Importing ${parsed.address} as the ${title.toLowerCase()}… processes restart in about 15 seconds to load it.`);
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      secretKey.fill(0);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 rounded-lg border border-line p-3">
+      <label className="text-[11px] text-mist" htmlFor={`imp-${role}`}>Private key (base58 from Phantom / Solflare, or a Solana CLI JSON array)</label>
+      <input id={`imp-${role}`} type="password" autoComplete="off" spellCheck={false} value={text} onChange={(e) => setText(e.target.value)} className="focus-ring mt-1 w-full rounded-lg border border-line bg-carbon px-3 py-1.5 font-mono text-xs" />
+      {parsed && "error" in parsed && <p className="mt-1 text-[11px] text-bad">✕ {parsed.error}</p>}
+      {parsed && "address" in parsed && <p className="mt-1 text-[11px] text-good">✓ Key for <span className="font-mono">{parsed.address}</span></p>}
+      <p className="mt-1 text-[11px] text-dim">The key is checked and encrypted in this browser; the server never receives it in the clear.</p>
+      <button disabled={busy || !parsed || "error" in parsed} onClick={submit} className="focus-ring mt-2 rounded-lg bg-frost px-3 py-1.5 text-xs font-semibold text-void disabled:opacity-40">{busy ? "Importing…" : "Import"}</button>
+    </div>
+  );
+}
+
 export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: SignMessage }) {
   const [data, setData] = useState<any>(null);
   const [launch, setLaunch] = useState<any>(null);
@@ -71,6 +151,7 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
   const [revealed, setRevealed] = useState<{ role: string; address: string; secret: Uint8Array } | null>(null);
   const [mint, setMint] = useState("");
   const [derived, setDerived] = useState<any>(null);
+  const [importing, setImporting] = useState<string | null>(null);
   const alive = useRef(true);
 
   const load = useCallback(async () => {
@@ -166,7 +247,7 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
             <div key={role} className="rounded-xl border border-line p-4">
               <div className="flex items-center gap-2">
                 <h3 className="text-sm font-semibold">{title}</h3>
-                {w.source && <span className="rounded border border-line px-1.5 text-[10px] text-mist">{w.source === "vault" ? "generated" : "environment"}</span>}
+                {w.source && <span className="rounded border border-line px-1.5 text-[10px] text-mist">{w.source === "vault" ? (w.vault?.origin === "imported" ? "imported" : "generated") : "environment"}</span>}
                 {w.pendingRestart && <span className="text-[10px] text-warn">◷ restarting processes to load it</span>}
               </div>
               <p className="mt-1 text-[11px] text-dim">{blurb}</p>
@@ -187,17 +268,28 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
                       <button disabled={!!busy} onClick={() => exportKey(role, w.address)} className="focus-ring rounded-lg border border-line px-3 py-1.5 text-xs text-mist hover:text-frost disabled:opacity-40">
                         {busy === `exp:${role}` ? "Exporting…" : "Export private key"}
                       </button>
-                      <span className={`text-[11px] ${w.vault?.lastExportedAt ? "text-mist" : "text-warn"}`}>{w.vault?.lastExportedAt ? `last backed up ${dateTime(w.vault.lastExportedAt)}` : "⚠ not backed up yet"}</span>
+                      <span className={`text-[11px] ${w.vault?.lastExportedAt || w.vault?.origin === "imported" ? "text-mist" : "text-warn"}`}>{w.vault?.lastExportedAt ? `last backed up ${dateTime(w.vault.lastExportedAt)}` : w.vault?.origin === "imported" ? "imported — you already hold this key" : "⚠ not backed up yet"}</span>
                     </div>
                   )}
                   {revealed?.role === role && <Revealed role={role} address={revealed.address} secret={revealed.secret} onHide={() => setRevealed(null)} />}
                 </>
               ) : pending ? (
-                <p className="mt-3 text-xs text-warn">◷ Generation requested {dateTime(w.vault.requestedAt)} — waiting for the rewards worker.</p>
+                <p className="mt-3 text-xs text-warn">◷ {w.vault.origin === "imported" ? "Import" : "Generation"} requested {dateTime(w.vault.requestedAt)} — waiting for the rewards worker.</p>
               ) : (
-                <button disabled={!!busy} onClick={() => generate(role)} className="focus-ring mt-3 rounded-lg bg-frost px-3 py-1.5 text-xs font-semibold text-void disabled:opacity-40">
-                  {busy === `gen:${role}` ? "Requesting…" : `Generate ${title.toLowerCase()}`}
-                </button>
+                <>
+                  {w.vault?.status === "refused" && <p className="mt-3 text-xs text-bad">✕ Last import refused: {w.vault.refusedReason}</p>}
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button disabled={!!busy} onClick={() => generate(role)} className="focus-ring rounded-lg bg-frost px-3 py-1.5 text-xs font-semibold text-void disabled:opacity-40">
+                      {busy === `gen:${role}` ? "Requesting…" : `Generate ${title.toLowerCase()}`}
+                    </button>
+                    <button onClick={() => setImporting(importing === role ? null : role)} className="focus-ring rounded-lg border border-line px-3 py-1.5 text-xs text-mist hover:text-frost">
+                      {importing === role ? "Cancel import" : "Import existing wallet"}
+                    </button>
+                  </div>
+                  {importing === role && (
+                    <ImportForm role={role} title={title} call={call} signMessage={signMessage} site={data.site} onDone={(m) => { setImporting(null); setErr(null); setMsg(m); load().catch(() => undefined); }} onError={(m) => { setMsg(null); setErr(m); }} />
+                  )}
+                </>
               )}
             </div>
           );

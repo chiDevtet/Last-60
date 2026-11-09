@@ -16,13 +16,13 @@
  *     encrypted to the requesting browser and must be signed by an admin wallet listed in the rewards
  *     worker's own ADMIN_WALLETS (`fulfilExportRequests`; @last60/shared walletExport).
  */
-import { createCipheriv, createDecipheriv, createHmac, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHmac, hkdfSync, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 import { ed25519 } from "@noble/curves/ed25519.js";
-import { EXPORT_MAX_TTL_MS, parseExportIntentMessage, sealExport } from "@last60/shared";
+import { EXPORT_MAX_TTL_MS, importPublicKey, keyFingerprint, openImport, parseExportIntentMessage, parseImportIntentMessage, sealExport, type SealedImport } from "@last60/shared";
 import type { AppConfig, VaultAddresses } from "../config/env";
 import type { Models } from "../db/models";
 import { WALLET_ROLES } from "../db/models";
@@ -109,10 +109,12 @@ export async function requestWalletGeneration(db: Models, cfg: Pick<AppConfig, "
   const role = input.role as WalletRole;
   if (cfg.wallets[role].source === "env") throw new VaultError("wallet_configured_in_environment", `the ${role} wallet is configured in the environment (${cfg.wallets[role].address ?? "key only"}); remove it there to generate one here`);
   const existing: any = await db.WalletVault.findById(role).lean();
-  if (existing?.status === "active") throw new VaultError("wallet_exists", `a ${role} wallet was already generated (${existing.address}); it is never replaced from the admin console`);
-  if (existing) return { role, status: existing.status as string, address: existing.address as string | null, created: false };
+  if (existing?.status === "active") throw new VaultError("wallet_exists", `a ${role} wallet already exists (${existing.address}); it is never replaced from the admin console`);
+  if (existing?.status === "requested" && existing.origin === "imported") throw new VaultError("wallet_exists", `an import of the ${role} wallet is pending`);
+  if (existing?.status === "requested") return { role, status: existing.status as string, address: existing.address as string | null, created: false };
+  if (existing?.status === "refused") await db.WalletVault.deleteOne({ _id: role, status: "refused" });
   try {
-    await db.WalletVault.create({ _id: role, status: "requested", requestedBy: input.actor, requestedAt: new Date(input.now ?? Date.now()), reason: input.reason ?? null });
+    await db.WalletVault.create({ _id: role, status: "requested", origin: "generated", requestedBy: input.actor, requestedAt: new Date(input.now ?? Date.now()), reason: input.reason ?? null });
   } catch (err: any) {
     if (err?.code !== 11000) throw err;
   }
@@ -120,7 +122,7 @@ export async function requestWalletGeneration(db: Models, cfg: Pick<AppConfig, "
 }
 
 /** Rewards worker (leader): generate and encrypt every requested wallet. Returns the roles generated. */
-export async function fulfilWalletRequests(db: Models, cfg: Pick<AppConfig, "wallets" | "secrets" | "instanceId">, log: Logger = rootLogger()): Promise<WalletRole[]> {
+export async function fulfilWalletRequests(db: Models, cfg: Pick<AppConfig, "wallets" | "secrets" | "instanceId" | "api">, log: Logger = rootLogger(), now = Date.now()): Promise<WalletRole[]> {
   const pending: any[] = await db.WalletVault.find({ status: "requested" }).lean();
   if (!pending.length) return [];
   const key = loadVaultKey(cfg, { create: true })!;
@@ -129,6 +131,10 @@ export async function fulfilWalletRequests(db: Models, cfg: Pick<AppConfig, "wal
   if (other && other.keyId !== vaultKeyId(key)) throw new VaultError("vault_key_mismatch", "this rewards worker's vault key differs from the one existing wallets were encrypted with; refusing to generate");
   const done: WalletRole[] = [];
   for (const row of pending) {
+    if (row.origin === "imported") {
+      if (await fulfilImport(db, cfg, key, row, log, now)) done.push(row._id);
+      continue;
+    }
     const kp = Keypair.generate();
     const enc = encryptSecretKey(key, row._id, kp);
     const r = await db.WalletVault.updateOne({ _id: row._id, status: "requested" }, { $set: { status: "active", address: kp.publicKey.toBase58(), ...enc, generatedAt: new Date(), generatedBy: cfg.instanceId } });
@@ -183,6 +189,143 @@ export function watchVaultWallets(db: Models, booted: Required<VaultAddresses>, 
   };
 }
 
+// ── import (an existing key the admin already holds) ─────────────────────────────────────────
+
+export const IMPORT_KEY_STATE_ID = "wallet_import_key";
+const IMPORT_KEY_INFO = "last60/wallet-import/x25519/v1";
+
+/** The rewards worker's X25519 import secret, derived from the vault key (stable: imports survive restarts). */
+export function importSecretOf(vaultKey: Buffer): Uint8Array {
+  return new Uint8Array(hkdfSync("sha256", vaultKey, Buffer.alloc(0), IMPORT_KEY_INFO, 32));
+}
+
+/** API: the published import key (and ask the rewards worker to publish it if it has not yet). */
+export async function requestImportKey(db: Models, now = Date.now()): Promise<{ status: "ready"; publicKey: string; fingerprint: string; publishedAt: string | null } | { status: "pending" }> {
+  const doc: any = await db.SystemState.findById(IMPORT_KEY_STATE_ID).lean();
+  const v = doc?.value;
+  if (v?.publicKey) return { status: "ready", publicKey: v.publicKey, fingerprint: keyFingerprint(v.publicKey), publishedAt: v.publishedAt ?? null };
+  await db.SystemState.updateOne({ _id: IMPORT_KEY_STATE_ID }, { $set: { "value.requested": true, "value.requestedAt": new Date(now).toISOString(), updatedAt: new Date(now) } }, { upsert: true });
+  return { status: "pending" };
+}
+
+/**
+ * Rewards worker: publish the import public key when asked (creating the vault key if needed), and keep it
+ * current if the vault key changed. Without a request and without a vault key, nothing is created.
+ */
+export async function publishImportKey(db: Models, cfg: Pick<AppConfig, "wallets" | "secrets">): Promise<string | null> {
+  const doc: any = await db.SystemState.findById(IMPORT_KEY_STATE_ID).lean();
+  const requested = !!doc?.value?.requested;
+  const key = loadVaultKey(cfg, { create: requested });
+  if (!key) return null;
+  const secret = importSecretOf(key);
+  const publicKey = importPublicKey(secret);
+  secret.fill(0);
+  if (doc?.value?.publicKey === publicKey && !requested) return publicKey;
+  await db.SystemState.updateOne({ _id: IMPORT_KEY_STATE_ID }, { $set: { value: { publicKey, keyId: vaultKeyId(key), publishedAt: new Date().toISOString() }, updatedAt: new Date() } }, { upsert: true });
+  return publicKey;
+}
+
+export interface ImportRequestInput {
+  requestId: string;
+  message: string;
+  signature: string;
+  sealed: SealedImport;
+  adminWallet: string;
+  site: string | null;
+  now?: number;
+}
+
+/** Shared checks of a signed import intent (API before storing it; worker again before importing it). */
+export function checkImportIntent(input: { message: string; signature: string; adminWallet: string; requestId: string; role: string; workerKey: string | null; site: string | null; now: number }): string | null {
+  const i = parseImportIntentMessage(input.message);
+  if (!i) return "malformed_import_intent";
+  if (i.requestId !== input.requestId) return "request_id_mismatch";
+  if (i.role !== input.role) return "wallet_role_mismatch";
+  if (input.site && i.site !== input.site) return "site_mismatch";
+  if (!input.workerKey) return "import_key_not_published";
+  if (i.workerKey !== input.workerKey) return "encrypted_to_an_unknown_key";
+  const exp = Date.parse(i.expiresAt);
+  if (exp <= input.now) return "import_intent_expired";
+  if (exp - input.now > EXPORT_MAX_TTL_MS + 5_000) return "import_intent_expiry_too_far";
+  if (!verifyAdminSignature(input.message, input.signature, input.adminWallet)) return "bad_admin_signature";
+  return null;
+}
+
+const SEALED_FIELD = /^[A-Za-z0-9+/=]{1,400}$/;
+
+/** API: store a signed, sealed import for the rewards worker. Never sees or stores the key in the clear. */
+export async function requestWalletImport(db: Models, cfg: Pick<AppConfig, "wallets">, role: string, input: ImportRequestInput) {
+  if (!(WALLET_ROLES as readonly string[]).includes(role)) throw new VaultError("unknown_role", `unknown wallet role ${role}`);
+  const r = role as WalletRole;
+  if (cfg.wallets[r].source === "env") throw new VaultError("wallet_configured_in_environment", `the ${r} wallet is configured in the environment (${cfg.wallets[r].address ?? "key only"}); remove it there to import one here`);
+  const existing: any = await db.WalletVault.findById(r).lean();
+  if (existing?.status === "active") throw new VaultError("wallet_exists", `a ${r} wallet already exists (${existing.address}); it is never replaced from the admin console`);
+  if (existing?.status === "requested") throw new VaultError("wallet_exists", `a ${r} wallet request is already pending`);
+  const s = input.sealed;
+  if (!s || !/^[0-9a-f]{64}$/.test(s.senderKey) || !SEALED_FIELD.test(s.iv) || !SEALED_FIELD.test(s.ciphertext)) return { accepted: false as const, reason: "malformed_sealed_key" };
+  const published: any = await db.SystemState.findById(IMPORT_KEY_STATE_ID).lean();
+  const now = input.now ?? Date.now();
+  const bad = checkImportIntent({ ...input, role: r, workerKey: published?.value?.publicKey ?? null, now });
+  if (bad) return { accepted: false as const, reason: bad };
+  const i = parseImportIntentMessage(input.message)!;
+  const other = await db.WalletVault.findOne({ _id: { $ne: r }, status: "active" }, { address: 1 }).lean();
+  if ((other as any)?.address === i.address || cfg.wallets[r === "payout" ? "creator" : "payout"].address === i.address) return { accepted: false as const, reason: "address_already_used_by_the_other_wallet" };
+  if (existing?.status === "refused") await db.WalletVault.deleteOne({ _id: r, status: "refused" });
+  try {
+    await db.WalletVault.create({ _id: r, status: "requested", origin: "imported", requestedBy: input.adminWallet, requestedAt: new Date(now), import: { adminWallet: input.adminWallet, message: input.message, signature: input.signature, requestId: input.requestId, sealed: { senderKey: s.senderKey, iv: s.iv, ciphertext: s.ciphertext } } });
+  } catch (err: any) {
+    if (err?.code === 11000) throw new VaultError("wallet_exists", `a ${r} wallet request is already pending`);
+    throw err;
+  }
+  return { accepted: true as const, role: r, address: i.address };
+}
+
+/**
+ * Rewards worker: decide one pending import. Re-checks the intent (including that the signer is in THIS
+ * process's ADMIN_WALLETS and that the browser encrypted to THIS worker's key), decrypts, checks the key
+ * really controls the signed address, then stores it encrypted at rest like a generated wallet. A refusal
+ * drops the sealed key. Returns true when the wallet became active.
+ */
+async function fulfilImport(db: Models, cfg: Pick<AppConfig, "api" | "instanceId">, vaultKey: Buffer, row: any, log: Logger, now: number): Promise<boolean> {
+  const imp = row.import ?? {};
+  const refuse = async (reason: string) => {
+    await db.WalletVault.updateOne({ _id: row._id, status: "requested", origin: "imported" }, { $set: { status: "refused", refusedReason: reason, refusedAt: new Date(now), import: null } });
+    log.warn({ role: row._id, admin: imp.adminWallet, reason }, "wallet import refused");
+    return false;
+  };
+  if (!cfg.api.adminWallets.length) return refuse("admin_wallets_not_configured_in_rewards_worker: set ADMIN_WALLETS in the rewards worker's environment to allow key import");
+  if (!cfg.api.adminWallets.includes(imp.adminWallet)) return refuse("signer_not_in_rewards_worker_admin_wallets");
+  const secret = importSecretOf(vaultKey);
+  const bad = checkImportIntent({ message: imp.message, signature: imp.signature, adminWallet: imp.adminWallet, requestId: imp.requestId, role: row._id, workerKey: importPublicKey(secret), site: null, now });
+  if (bad) {
+    secret.fill(0);
+    return refuse(bad);
+  }
+  const intent = parseImportIntentMessage(imp.message)!;
+  let plain: Uint8Array;
+  try {
+    plain = await openImport(secret, imp.sealed, imp.requestId);
+  } catch {
+    return refuse("cannot_decrypt_sealed_key");
+  } finally {
+    secret.fill(0);
+  }
+  let kp: Keypair;
+  try {
+    kp = Keypair.fromSecretKey(Uint8Array.from(plain)); // validates the public half against the seed
+  } catch {
+    plain.fill(0);
+    return refuse("not_a_valid_solana_secret_key");
+  }
+  plain.fill(0);
+  if (kp.publicKey.toBase58() !== intent.address) return refuse("key_does_not_control_the_signed_address");
+  const enc = encryptSecretKey(vaultKey, row._id, kp);
+  const r = await db.WalletVault.updateOne({ _id: row._id, status: "requested", origin: "imported" }, { $set: { status: "active", address: kp.publicKey.toBase58(), ...enc, generatedAt: new Date(now), generatedBy: cfg.instanceId, import: null } });
+  if (!r.modifiedCount) return false;
+  log.warn({ role: row._id, address: kp.publicKey.toBase58(), admin: imp.adminWallet }, "wallet imported and stored encrypted in the vault");
+  return true;
+}
+
 // ── status (admin) ───────────────────────────────────────────────────────────────────────────
 
 export async function walletsStatus(db: Models, cfg: Pick<AppConfig, "wallets">, balanceOf?: (address: string) => Promise<bigint | null>) {
@@ -196,7 +339,7 @@ export async function walletsStatus(db: Models, cfg: Pick<AppConfig, "wallets">,
     out[role] = {
       address,
       source: configured.source ?? (row?.status === "active" ? "vault" : null),
-      vault: row ? { status: row.status, requestedAt: row.requestedAt, requestedBy: row.requestedBy, generatedAt: row.generatedAt, lastExportedAt: row.lastExportedAt, exports: row.exports ?? 0 } : null,
+      vault: row ? { status: row.status, origin: row.origin ?? "generated", requestedAt: row.requestedAt, requestedBy: row.requestedBy, generatedAt: row.generatedAt, lastExportedAt: row.lastExportedAt, exports: row.exports ?? 0, refusedReason: row.refusedReason ?? null, refusedAt: row.refusedAt ?? null } : null,
       pendingRestart: row?.status === "active" && configured.source !== "env" && configured.address !== row.address,
       balanceLamports: address && balanceOf ? ((await balanceOf(address).catch(() => null))?.toString() ?? null) : null,
     };

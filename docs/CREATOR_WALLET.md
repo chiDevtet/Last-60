@@ -14,9 +14,9 @@ Code: `packages/engine/src/creator/creatorWallet.ts` (automation), `src/rewards/
 
 ## 1. One-time setup
 
-**Easiest: from the admin page** (docs/WALLETS.md) — generate the payout and creator wallets, export a
-backup, import the creator key into Phantom, fund it, launch from it, and set the token mint (the pool is
-derived). No key or address has to be put in an environment file.
+**Easiest: from the admin page** (docs/WALLETS.md) — generate the payout wallet; for the creator wallet
+either generate it (export → import into Phantom → fund → launch from it) or **import** the Phantom wallet
+you launch from; then set the token mint (the pool is derived). No key or address has to be put in an environment file.
 
 **Or with environment variables** — `.env.rewards` (chmod 600; the ONLY process that may hold the creator key):
 

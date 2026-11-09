@@ -218,3 +218,39 @@ describe("admin wallets & launch (docs/WALLETS.md)", () => {
     expect((await app.request("/api/admin/launch", { headers: H })).status).toBe(200);
   });
 });
+
+describe("admin wallet import (docs/WALLETS.md)", () => {
+  test("import the launch wallet over HTTP: the API relays only ciphertext and audits the address, never the key", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { fulfilWalletRequests, publishImportKey } = await import("@last60/engine");
+    const { importIntentMessage, newExportRequest, sealImport } = await import("@last60/shared");
+    const r = await rig({ env: { LAST60_WALLET_VAULT_KEY_PATH: join(mkdtempSync(join(tmpdir(), "l60imp-")), "k"), ADMIN_WALLETS: admin.publicKey.toBase58() } });
+    const { app } = api(r);
+    const n = await (await app.request("/api/admin/auth/nonce", { method: "POST", body: JSON.stringify({ wallet: admin.publicKey.toBase58() }), headers: { "content-type": "application/json" } })).json() as any;
+    const v = await (await app.request("/api/admin/auth/verify", { method: "POST", body: JSON.stringify({ wallet: admin.publicKey.toBase58(), nonce: n.nonce, signature: bs58.encode(ed25519.sign(new TextEncoder().encode(n.message), admin.secretKey.slice(0, 32))) }), headers: { "content-type": "application/json" } })).json() as any;
+    const H = { authorization: `Bearer ${v.token}`, "content-type": "application/json" };
+    expect((await app.request("/api/admin/wallets/import-key")).status).toBe(401);
+    expect(await (await app.request("/api/admin/wallets/import-key", { headers: H })).json()).toEqual({ status: "pending" });
+    await publishImportKey(r.db, r.cfg); // the rewards worker's pass
+    const k = await (await app.request("/api/admin/wallets/import-key", { headers: H })).json() as any;
+    expect(k).toMatchObject({ status: "ready", fingerprint: expect.stringMatching(/^[0-9a-f]{4}(:[0-9a-f]{4}){3}$/) });
+    const site = (await (await app.request("/api/admin/wallets", { headers: H })).json() as any).site;
+    const launched = Keypair.generate();
+    const requestId = newExportRequest().requestId;
+    const message = importIntentMessage({ site, role: "creator", address: launched.publicKey.toBase58(), requestId, workerKey: k.publicKey, expiresAt: new Date(r.clock.now() + 120_000).toISOString() });
+    const signature = bs58.encode(ed25519.sign(new TextEncoder().encode(message), admin.secretKey.slice(0, 32)));
+    const sealed = await sealImport(launched.secretKey, k.publicKey, requestId);
+    expect((await app.request("/api/admin/wallets/creator/import", { method: "POST", headers: H, body: JSON.stringify({ requestId, message, signature, sealed, privateKey: "x" }) })).status).toBe(400); // no extra fields (e.g. a plaintext key)
+    const res = await app.request("/api/admin/wallets/creator/import", { method: "POST", headers: H, body: JSON.stringify({ requestId, message, signature, sealed }) });
+    expect(await res.json()).toMatchObject({ accepted: true, address: launched.publicKey.toBase58() });
+    expect(await fulfilWalletRequests(r.db, r.cfg, undefined, r.clock.now())).toEqual(["creator"]);
+    const w = await (await app.request("/api/admin/wallets", { headers: H })).json() as any;
+    expect(w.wallets.creator).toMatchObject({ address: launched.publicKey.toBase58(), source: "vault", vault: { origin: "imported", status: "active" } });
+    const audits = JSON.stringify(await r.db.ConfigAudit.find({ action: "wallet_import_request" }).lean());
+    expect(audits).toContain(launched.publicKey.toBase58());
+    expect(audits.includes(sealed.ciphertext)).toBe(false);
+    expect(audits.includes(bs58.encode(launched.secretKey))).toBe(false);
+  });
+});

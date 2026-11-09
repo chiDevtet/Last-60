@@ -9,14 +9,15 @@ import { join } from "node:path";
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 import { ed25519 } from "@noble/curves/ed25519.js";
-import { exportIntentMessage, newExportRequest, openExport } from "@last60/shared";
+import { exportIntentMessage, importIntentMessage, importPublicKey, newExportRequest, openExport, sealImport } from "@last60/shared";
+import { x25519 } from "@noble/curves/ed25519.js";
 import { loadConfig } from "../src/config/env";
 import { resolveSettings, SettingsStore } from "../src/config/runtime";
 import { AwaitingLaunchError, createProvider } from "../src/providers";
 import { deriveLaunchLabPool } from "../src/providers/raydium/pda";
 import { RewardsWorker } from "../src/rewards/RewardsWorker";
 import { FakeChain } from "../src/testing/fakeChain";
-import { createExportRequest, fulfilExportRequests, fulfilWalletRequests, loadVaultKeypair, loadVaultKey, readVaultWallets, requestWalletGeneration, takeExport, VaultError } from "../src/wallets/vault";
+import { createExportRequest, fulfilExportRequests, fulfilWalletRequests, IMPORT_KEY_STATE_ID, loadVaultKeypair, loadVaultKey, publishImportKey, readVaultWallets, requestImportKey, requestWalletGeneration, requestWalletImport, takeExport, VaultError } from "../src/wallets/vault";
 import { freshDb, startDb, stopDb, testConfig } from "./harness";
 import { llFx, lM } from "./revenueLaunch";
 
@@ -222,5 +223,114 @@ describe("end-to-end encrypted key export, signed by an admin wallet", () => {
     await createExportRequest(none.db, none.cfg, "creator", { requestId: z.req.requestId, message: z.message, signature: none.sign(z.message), adminWallet: C, site: "last60.fun" });
     await fulfilExportRequests(none.db, none.cfg);
     expect(await takeExport(none.db, z.req.requestId, C)).toMatchObject({ status: "refused", reason: expect.stringContaining("admin_wallets_not_configured_in_rewards_worker") });
+  });
+});
+
+describe("import an existing wallet (sealed to the rewards worker, signed by an admin wallet)", () => {
+  async function setup(o: { rewardsAdmins?: string[] } = {}) {
+    const db = await freshDb();
+    const admin = Keypair.generate();
+    const env = { ...MAINNET, LAST60_WALLET_VAULT_KEY_PATH: vaultPath(), ADMIN_WALLETS: (o.rewardsAdmins ?? [admin.publicKey.toBase58()]).join(",") };
+    const cfg = loadConfig("rewards", env);
+    const A = admin.publicKey.toBase58();
+    const sign = (message: string, who = admin) => bs58.encode(ed25519.sign(new TextEncoder().encode(message), who.secretKey.subarray(0, 32)));
+    /** What the admin page does: seal `key` to `workerKey` and sign an intent for `address`. */
+    const prepare = async (o2: { key: Keypair; address?: string; workerKey: string; role?: "payout" | "creator"; site?: string; expiresIn?: number; sealTo?: string }) => {
+      const requestId = newExportRequest().requestId;
+      const message = importIntentMessage({ site: o2.site ?? "last60.fun", role: o2.role ?? "creator", address: o2.address ?? o2.key.publicKey.toBase58(), requestId, workerKey: o2.workerKey, expiresAt: new Date(Date.now() + (o2.expiresIn ?? 120_000)).toISOString() });
+      const sealed = await sealImport(o2.key.secretKey, o2.sealTo ?? o2.workerKey, requestId);
+      return { requestId, message, signature: sign(message), sealed, adminWallet: A, site: "last60.fun" };
+    };
+    const workerKey = async () => {
+      expect(await requestImportKey(db)).toEqual({ status: "pending" }); // asks the worker to publish it
+      await publishImportKey(db, cfg);
+      const k: any = await requestImportKey(db);
+      expect(k.status).toBe("ready");
+      return k.publicKey as string;
+    };
+    return { db, cfg, admin, A, sign, prepare, workerKey };
+  }
+
+  test("the Phantom wallet the token was launched from becomes the creator wallet; the server never holds it in the clear", async () => {
+    const { db, cfg, prepare, workerKey } = await setup();
+    const launched = Keypair.generate(); // e.g. exported from Phantom
+    const wk = await workerKey();
+    const req = await prepare({ key: launched, workerKey: wk });
+    expect(await requestWalletImport(db, cfg, "creator", req)).toMatchObject({ accepted: true, address: launched.publicKey.toBase58() });
+    const forms = [bs58.encode(launched.secretKey), JSON.stringify(Array.from(launched.secretKey)), Buffer.from(launched.secretKey).toString("base64"), Buffer.from(launched.secretKey).toString("hex")];
+    const pendingDump = JSON.stringify(await db.WalletVault.find({}).lean());
+    for (const f of forms) expect(pendingDump.includes(f)).toBe(false);
+    expect(await fulfilWalletRequests(db, cfg)).toEqual(["creator"]);
+    const row: any = await db.WalletVault.findById("creator").lean();
+    expect(row).toMatchObject({ status: "active", origin: "imported", address: launched.publicKey.toBase58(), import: null });
+    const after = JSON.stringify(await db.WalletVault.find({}).lean());
+    for (const f of forms) expect(after.includes(f)).toBe(false);
+    expect(Buffer.from((await loadVaultKeypair(db, cfg, "creator"))!.secretKey).equals(Buffer.from(launched.secretKey))).toBe(true);
+    const vault = await readVaultWallets(db);
+    expect(loadConfig("rewards", { ...MAINNET }, { vault }).wallets.creator).toEqual({ address: launched.publicKey.toBase58(), source: "vault" });
+    // Never replaced afterwards, by import or generation.
+    await expect(requestWalletImport(db, cfg, "creator", await prepare({ key: Keypair.generate(), workerKey: wk }))).rejects.toThrow(/never replaced/);
+    await expect(requestWalletGeneration(db, cfg, { role: "creator", actor: "admin" })).rejects.toThrow(/never replaced/);
+    // The same key cannot also become the payout wallet.
+    expect(await requestWalletImport(db, cfg, "payout", await prepare({ key: launched, role: "payout", workerKey: wk }))).toMatchObject({ accepted: false, reason: "address_already_used_by_the_other_wallet" });
+  });
+
+  test("refused before storing: no published key, a different worker key, bad signature, other site, expired, malformed ciphertext, environment wallet", async () => {
+    const { db, cfg, prepare, workerKey, sign } = await setup();
+    const key = Keypair.generate();
+    const bogusWorker = importPublicKey(x25519.utils.randomSecretKey());
+    expect(await requestWalletImport(db, cfg, "creator", await prepare({ key, workerKey: bogusWorker }))).toMatchObject({ accepted: false, reason: "import_key_not_published" });
+    const wk = await workerKey();
+    expect(await requestWalletImport(db, cfg, "creator", await prepare({ key, workerKey: bogusWorker }))).toMatchObject({ accepted: false, reason: "encrypted_to_an_unknown_key" });
+    const r = await prepare({ key, workerKey: wk });
+    expect(await requestWalletImport(db, cfg, "creator", { ...r, signature: sign(r.message, Keypair.generate()) })).toMatchObject({ accepted: false, reason: "bad_admin_signature" });
+    expect(await requestWalletImport(db, cfg, "creator", { ...r, site: "evil.example" })).toMatchObject({ accepted: false, reason: "site_mismatch" });
+    expect(await requestWalletImport(db, cfg, "creator", await prepare({ key, workerKey: wk, expiresIn: -1 }))).toMatchObject({ accepted: false, reason: "import_intent_expired" });
+    expect(await requestWalletImport(db, cfg, "creator", { ...r, sealed: { ...r.sealed, senderKey: "zz" } })).toMatchObject({ accepted: false, reason: "malformed_sealed_key" });
+    expect(await requestWalletImport(db, cfg, "payout", r)).toMatchObject({ accepted: false, reason: "wallet_role_mismatch" });
+    const envCfg = loadConfig("rewards", { ...MAINNET, LAST60_CREATOR_WALLET_ADDRESS: Keypair.generate().publicKey.toBase58() });
+    await expect(requestWalletImport(db, envCfg, "creator", r)).rejects.toBeInstanceOf(VaultError);
+    expect(await db.WalletVault.countDocuments()).toBe(0);
+  });
+
+  test("refused by the rewards worker: a key that does not control the signed address, a swapped ciphertext, a substituted worker key, a signer outside its own ADMIN_WALLETS — and a refused import can be retried", async () => {
+    const { db, cfg, prepare, workerKey } = await setup();
+    const wk = await workerKey();
+    const decide = async (req: any) => {
+      await db.WalletVault.deleteMany({});
+      expect(await requestWalletImport(db, cfg, "creator", req)).toMatchObject({ accepted: true });
+      expect(await fulfilWalletRequests(db, cfg)).toEqual([]);
+      const row: any = await db.WalletVault.findById("creator").lean();
+      expect(row).toMatchObject({ status: "refused", import: null });
+      return row.refusedReason as string;
+    };
+    // Signed for address A, but the sealed key is B's.
+    const a = Keypair.generate();
+    const b = Keypair.generate();
+    expect(await decide(await prepare({ key: b, address: a.publicKey.toBase58(), workerKey: wk }))).toBe("key_does_not_control_the_signed_address");
+    // Someone with database access swaps the sealed ciphertext for another one.
+    const good = await prepare({ key: a, workerKey: wk });
+    const other = await prepare({ key: b, workerKey: wk });
+    expect(await decide({ ...good, sealed: other.sealed })).toBe("cannot_decrypt_sealed_key");
+    // The published import key was replaced (e.g. a compromised API): the browser encrypted to the impostor key.
+    // The worker sees it was not its own key and refuses (the admin page also pins the key and warns on change).
+    const impostor = importPublicKey(x25519.utils.randomSecretKey());
+    await db.SystemState.updateOne({ _id: IMPORT_KEY_STATE_ID }, { $set: { "value.publicKey": impostor } });
+    expect(await decide(await prepare({ key: a, workerKey: impostor }))).toBe("encrypted_to_an_unknown_key");
+    await publishImportKey(db, cfg); // the worker restores its own key
+    expect(((await requestImportKey(db)) as any).publicKey).toBe(wk);
+    // After a refusal the admin can simply retry (import or generate).
+    await db.WalletVault.deleteMany({});
+    await requestWalletImport(db, cfg, "creator", await prepare({ key: b, address: a.publicKey.toBase58(), workerKey: wk }));
+    await fulfilWalletRequests(db, cfg);
+    expect(await requestWalletImport(db, cfg, "creator", await prepare({ key: a, workerKey: wk }))).toMatchObject({ accepted: true });
+    expect(await fulfilWalletRequests(db, cfg)).toEqual(["creator"]);
+    expect((await readVaultWallets(db)).creator).toBe(a.publicKey.toBase58());
+    // The worker trusts only its own admin list (a fresh database: the harness keeps one connection).
+    const strangers = await setup({ rewardsAdmins: [Keypair.generate().publicKey.toBase58()] });
+    const swk = await strangers.workerKey();
+    expect(await requestWalletImport(strangers.db, strangers.cfg, "creator", await strangers.prepare({ key: a, workerKey: swk }))).toMatchObject({ accepted: true });
+    await fulfilWalletRequests(strangers.db, strangers.cfg);
+    expect(((await strangers.db.WalletVault.findById("creator").lean()) as any).refusedReason).toBe("signer_not_in_rewards_worker_admin_wallets");
   });
 });

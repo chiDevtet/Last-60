@@ -28,7 +28,8 @@
  */
 import { randomBytes } from "node:crypto";
 import bs58 from "bs58";
-import { buildFundingPipeline, CREATOR_WALLET_STATUS_ID, resolveFundingActivation, readVaultWallets, walletsStatus, loadVaultKeypair, cancelCustodyRequest, createCustodyRequest, payoutWalletVerification, recoverAttribution, refreshCustodyFinality, renderFundingPipeline, submitCustodySignature, ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, buildRevenueReport, renderRevenueReport, reconcileFunding, forgeLaunchContextOf, revenueRuntimeOf, type ProcessRole } from "@last60/engine";
+import { importPublicKey, keyFingerprint } from "@last60/shared";
+import { buildFundingPipeline, CREATOR_WALLET_STATUS_ID, resolveFundingActivation, readVaultWallets, walletsStatus, loadVaultKeypair, loadVaultKey, importSecretOf, IMPORT_KEY_STATE_ID, cancelCustodyRequest, createCustodyRequest, payoutWalletVerification, recoverAttribution, refreshCustodyFinality, renderFundingPipeline, submitCustodySignature, ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, buildRevenueReport, renderRevenueReport, reconcileFunding, forgeLaunchContextOf, revenueRuntimeOf, type ProcessRole } from "@last60/engine";
 
 const [cmd, ...args] = process.argv.slice(2);
 const print = (v: unknown) => console.log(JSON.stringify(jsonSafe(v), null, 2));
@@ -138,7 +139,18 @@ try {
     case "wallets": {
       // Read-only: generated / configured wallets, their source and balance (never key material).
       const rpc = new RpcClient({ urls: cfg.solana.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
-      print(await walletsStatus(db, cfg, (a) => rpc.getBalance(a)));
+      // Import key fingerprint: computed from the vault key when run on the rewards host (authoritative —
+      // compare it with the one the admin page shows) and as published in the database.
+      let local: string | null = null;
+      try {
+        const k = loadVaultKey(cfg);
+        if (k) local = keyFingerprint(importPublicKey(importSecretOf(k)));
+      } catch {
+        local = null;
+      }
+      const pub: any = await db.SystemState.findById(IMPORT_KEY_STATE_ID).lean();
+      const published = pub?.value?.publicKey ? keyFingerprint(pub.value.publicKey) : null;
+      print({ wallets: await walletsStatus(db, cfg, (a) => rpc.getBalance(a)), importKey: { fingerprintFromVaultKey: local ?? "vault key not readable here (run on the rewards host)", publishedFingerprint: published, match: local && published ? local === published : null } });
       break;
     }
     case "wallet-export": {

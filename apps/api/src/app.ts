@@ -28,6 +28,8 @@ import {
   createExportRequest,
   deriveLaunchLabPool,
   requestWalletGeneration,
+  requestImportKey,
+  requestWalletImport,
   takeExport,
   VaultError,
   walletsStatus,
@@ -440,6 +442,25 @@ export function createApp(d: ApiDeps) {
     const site = signInSite(d.cfg, c.req.header("origin"))?.host ?? null;
     const r = await createExportRequest(d.db, d.cfg, c.req.param("role"), { ...body, adminWallet: c.get("admin"), site, now: now() });
     await audit(c, "wallet_export_request", c.req.param("role"), r, body.requestId);
+    return c.json(jsonSafe(r), r.accepted ? 200 : 422);
+  });
+  // Import an existing key: the browser seals it to the rewards worker's published import key; the admin
+  // wallet signs the intent (address, worker key). The API stores ciphertext only, never the key.
+  admin.get("/wallets/import-key", async (c) => c.json(jsonSafe(await requestImportKey(d.db, now()))));
+  admin.post("/wallets/:role/import", async (c) => {
+    const body = z
+      .object({
+        requestId: z.string().regex(/^[0-9a-f]{32}$/),
+        message: z.string().max(1000),
+        signature: z.string().min(80).max(100),
+        sealed: z.object({ senderKey: z.string().regex(/^[0-9a-f]{64}$/), iv: z.string().max(64), ciphertext: z.string().max(400) }).strict(),
+      })
+      .strict()
+      .parse(await c.req.json());
+    const site = signInSite(d.cfg, c.req.header("origin"))?.host ?? null;
+    const r = await requestWalletImport(d.db, d.cfg, c.req.param("role"), { ...body, adminWallet: c.get("admin"), site, now: now() });
+    // Audit the decision and the address, never the sealed key.
+    await audit(c, "wallet_import_request", c.req.param("role"), r, body.requestId);
     return c.json(jsonSafe(r), r.accepted ? 200 : 422);
   });
   admin.get("/wallets/exports/:id", async (c) => {
