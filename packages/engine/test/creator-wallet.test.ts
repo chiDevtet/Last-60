@@ -176,9 +176,14 @@ describe("creator wallet configuration", () => {
     const P = payout.publicKey.toBase58();
     expect(problems({ LAST60_PAYOUT_WALLET_ADDRESS: P, LAST60_CREATOR_WALLET_PRIVATE_KEY: "not-a-key" }).join("\n")).toContain("not a valid 64-byte secret key");
     expect(problems({ LAST60_PAYOUT_WALLET_ADDRESS: P, LAST60_CREATOR_WALLET_PRIVATE_KEY: secretOf(payout) }).join("\n")).toContain("is the payout wallet key");
-    expect(problems({ LAST60_PAYOUT_WALLET_ADDRESS: P, LAST60_CREATOR_WALLET_PRIVATE_KEY: secretOf(creator), REWARD_FUNDING_POLICY: "legacy_creator_fee_v1" }).join("\n")).toContain("requires REWARD_FUNDING_POLICY=forge_phase_aware_v2");
-    expect(problems({ LAST60_PAYOUT_WALLET_ADDRESS: P, LAST60_CREATOR_WALLET_PRIVATE_KEY: secretOf(creator), LAST60_CUSTODY_ENABLED: "false" }).join("\n")).toContain("requires the custody workflow");
-    expect(problems({ LAST60_CREATOR_WALLET_PRIVATE_KEY: secretOf(creator) }).join("\n")).toContain("requires LAST60_PAYOUT_WALLET_ADDRESS");
+    // Not explicitly enabled: an incompatible setup just leaves the automation off (never a startup failure).
+    expect(problems({ LAST60_PAYOUT_WALLET_ADDRESS: P, LAST60_CREATOR_WALLET_PRIVATE_KEY: secretOf(creator), REWARD_FUNDING_POLICY: "legacy_creator_fee_v1" })).toEqual([]);
+    expect(loadConfig("rewards", { ...base, LAST60_PAYOUT_WALLET_ADDRESS: P, LAST60_CREATOR_WALLET_PRIVATE_KEY: secretOf(creator), REWARD_FUNDING_POLICY: "legacy_creator_fee_v1" }).creatorWallet.automationEnabled).toBe(false);
+    expect(problems({ LAST60_PAYOUT_WALLET_ADDRESS: P, LAST60_CREATOR_WALLET_PRIVATE_KEY: secretOf(creator), LAST60_CREATOR_AUTOMATION_ENABLED: "true", REWARD_FUNDING_POLICY: "legacy_creator_fee_v1" }).join("\n")).toContain("requires REWARD_FUNDING_POLICY=forge_phase_aware_v2");
+    expect(problems({ LAST60_PAYOUT_WALLET_ADDRESS: P, LAST60_CREATOR_WALLET_PRIVATE_KEY: secretOf(creator), LAST60_CREATOR_AUTOMATION_ENABLED: "true", LAST60_CUSTODY_ENABLED: "false" }).join("\n")).toContain("requires the custody workflow");
+    // No payout wallet yet: not fatal — the automation stays idle until one is generated.
+    expect(problems({ LAST60_CREATOR_WALLET_PRIVATE_KEY: secretOf(creator) })).toEqual([]);
+    expect(loadConfig("rewards", { ...base, LAST60_CREATOR_WALLET_PRIVATE_KEY: secretOf(creator) }).creatorWallet.automationEnabled).toBe(true);
     expect(problems({ LAST60_PAYOUT_WALLET_ADDRESS: P, LAST60_CREATOR_WALLET_PRIVATE_KEY: secretOf(creator), LAST60_CREATOR_WALLET_KEYPAIR_PATH: "/tmp/x.json" }).join("\n")).toContain("Set only one of LAST60_CREATOR_WALLET_PRIVATE_KEY");
     expect(problems({ LAST60_PAYOUT_WALLET_ADDRESS: P, LAST60_CREATOR_WALLET_ADDRESS: P })).toContainEqual(expect.stringContaining("must not be LAST60_PAYOUT_WALLET_ADDRESS"));
   });

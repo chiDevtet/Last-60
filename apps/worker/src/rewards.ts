@@ -4,13 +4,24 @@
  * LAST60_PAYOUT_WALLET_ADDRESS (fail closed: a missing address, malformed key or a key deriving a
  * different address stops the process) and never logged. Only its sanitized status is published.
  */
-import { liveSigningBlockReason, loadKeypair, PayoutSigner, RewardsWorker } from "@last60/engine";
+import { liveSigningBlockReason, loadKeypair, loadVaultKeypair, PayoutSigner, RewardsWorker, VaultError } from "@last60/engine";
 import type { Keypair } from "@solana/web3.js";
 import { boot } from "./bootstrap";
 
 const { cfg, log, db, settings, signal } = await boot("rewards", "last60-rewards");
 
-const loaded = PayoutSigner.load({ privateKey: cfg.secrets.payoutWalletPrivateKey, keypairPath: cfg.secrets.payoutWalletKeypairPath }, cfg.payout.walletPublicKey);
+// A wallet generated in the admin console is decrypted from the vault and goes through exactly the same
+// loaders and checks as an environment key (docs/WALLETS.md).
+const fromVault = async (role: "payout" | "creator") => {
+  try {
+    return await loadVaultKeypair(db, cfg, role);
+  } catch (err) {
+    log.fatal({ role, code: err instanceof VaultError ? err.code : "vault_error", message: err instanceof VaultError ? err.message : "vault error" }, "generated wallet refused to load");
+    process.exit(78);
+  }
+};
+const vaultPayout = cfg.wallets.payout.source === "vault" ? await fromVault("payout") : null;
+const loaded = PayoutSigner.load(vaultPayout ? { privateKey: JSON.stringify(Array.from(vaultPayout.secretKey)) } : { privateKey: cfg.secrets.payoutWalletPrivateKey, keypairPath: cfg.secrets.payoutWalletKeypairPath }, cfg.payout.walletPublicKey);
 if (loaded.status.code !== "ok" && loaded.status.code !== "not_configured") {
   // Sanitized message only (never the key or a parser error that could quote it).
   log.fatal({ signer: loaded.status }, "payout signer refused to load; fix LAST60_PAYOUT_WALLET_* and restart");
@@ -19,8 +30,8 @@ if (loaded.status.code !== "ok" && loaded.status.code !== "not_configured") {
 const signer = loaded.signer;
 // Launch creator wallet (docs/CREATOR_WALLET.md): validated at config load (well-formed, matches
 // LAST60_CREATOR_WALLET_ADDRESS, not the payout wallet) and at runtime against the pool's on-chain creator.
-let creator: Keypair | null = null;
-if (cfg.secrets.creatorWalletPrivateKey || cfg.secrets.creatorWalletKeypairPath) {
+let creator: Keypair | null = cfg.wallets.creator.source === "vault" ? await fromVault("creator") : null;
+if (!creator && (cfg.secrets.creatorWalletPrivateKey || cfg.secrets.creatorWalletKeypairPath)) {
   try {
     creator = loadKeypair({ privateKey: cfg.secrets.creatorWalletPrivateKey, keypairPath: cfg.secrets.creatorWalletKeypairPath }, cfg.creatorWallet.address, "creator wallet");
   } catch {
@@ -40,6 +51,7 @@ delete process.env.LAST60_PAYOUT_WALLET_PRIVATE_KEY;
 delete process.env.PAYOUT_WALLET_PRIVATE_KEY;
 delete process.env.FEE_CLAIM_AUTHORITY_PRIVATE_KEY;
 delete process.env.LAST60_CREATOR_WALLET_PRIVATE_KEY;
+delete process.env.LAST60_WALLET_VAULT_KEY;
 
 const effective = await settings.get();
 const mode = effective.payoutMode;

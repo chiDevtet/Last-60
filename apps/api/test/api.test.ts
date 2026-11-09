@@ -170,3 +170,51 @@ describe("stream", () => {
     hub.stop();
   });
 });
+
+describe("admin wallets & launch (docs/WALLETS.md)", () => {
+  test("generate a creator wallet, export it end-to-end encrypted, derive the pool — the API never returns key material in the clear", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { fulfilWalletRequests, fulfilExportRequests, loadVaultKeypair, deriveLaunchLabPool } = await import("@last60/engine");
+    const { exportIntentMessage, newExportRequest, openExport } = await import("@last60/shared");
+    const r = await rig({ env: { LAST60_WALLET_VAULT_KEY_PATH: join(mkdtempSync(join(tmpdir(), "l60api-")), "k"), ADMIN_WALLETS: admin.publicKey.toBase58() } });
+    const { app } = api(r);
+    const n = await (await app.request("/api/admin/auth/nonce", { method: "POST", body: JSON.stringify({ wallet: admin.publicKey.toBase58() }), headers: { "content-type": "application/json" } })).json() as any;
+    const v = await (await app.request("/api/admin/auth/verify", { method: "POST", body: JSON.stringify({ wallet: admin.publicKey.toBase58(), nonce: n.nonce, signature: bs58.encode(ed25519.sign(new TextEncoder().encode(n.message), admin.secretKey.slice(0, 32))) }), headers: { "content-type": "application/json" } })).json() as any;
+    const H = { authorization: `Bearer ${v.token}`, "content-type": "application/json" };
+    expect((await app.request("/api/admin/wallets")).status).toBe(401);
+    const w0 = await (await app.request("/api/admin/wallets", { headers: H })).json() as any;
+    expect(w0.wallets.creator).toMatchObject({ address: null, source: null, vault: null });
+    expect(w0.wallets.payout.source).toBe("env");
+    // The payout wallet of this rig is configured in the environment: never shadowed by a generated one.
+    expect((await app.request("/api/admin/wallets/payout/generate", { method: "POST", headers: H, body: "{}" })).status).toBe(409);
+    expect((await (await app.request("/api/admin/wallets/creator/generate", { method: "POST", headers: H, body: JSON.stringify({ reason: "launch" }) })).json() as any).status).toBe("requested");
+    await fulfilWalletRequests(r.db, r.cfg); // the rewards worker's pass
+    const w1 = await (await app.request("/api/admin/wallets", { headers: H })).json() as any;
+    const address = w1.wallets.creator.address;
+    expect(w1.wallets.creator).toMatchObject({ source: "vault", pendingRestart: true, vault: { status: "active", exports: 0 } });
+    // Export: the browser's one-time key, signed by the admin wallet; the API relays ciphertext only.
+    const req = newExportRequest();
+    const message = exportIntentMessage({ site: w1.site, role: "creator", address, requestId: req.requestId, browserKey: req.browserKey, expiresAt: new Date(r.clock.now() + 120_000).toISOString() });
+    const signature = bs58.encode(ed25519.sign(new TextEncoder().encode(message), admin.secretKey.slice(0, 32)));
+    const e = await app.request("/api/admin/wallets/creator/export", { method: "POST", headers: H, body: JSON.stringify({ requestId: req.requestId, message, signature }) });
+    expect(await e.json() as any).toMatchObject({ accepted: true });
+    expect((await (await app.request(`/api/admin/wallets/exports/${req.requestId}`, { headers: H })).json() as any).status).toBe("pending");
+    await fulfilExportRequests(r.db, r.cfg, { now: r.clock.now() });
+    const t = await (await app.request(`/api/admin/wallets/exports/${req.requestId}`, { headers: H })).json() as any;
+    expect(t.status).toBe("ready");
+    const kp = (await loadVaultKeypair(r.db, r.cfg, "creator"))!;
+    expect(JSON.stringify(t).includes(bs58.encode(kp.secretKey))).toBe(false);
+    expect(Buffer.from(await openExport(req.secret, t.sealed, req.requestId)).equals(Buffer.from(kp.secretKey))).toBe(true);
+    expect((await (await app.request(`/api/admin/wallets/exports/${req.requestId}`, { headers: H })).json() as any).status).toBe("consumed");
+    // Every wallet action is audited.
+    const actions = (await r.db.ConfigAudit.find({ action: /^wallet_/ }).lean()).map((a: any) => a.action).sort();
+    expect(actions).toEqual(["wallet_export_delivered", "wallet_export_request", "wallet_generate"]);
+    // Pool derivation for a token known before launch.
+    const mint = Keypair.generate().publicKey.toBase58();
+    expect(await (await app.request(`/api/admin/launch/derive?mint=${mint}`, { headers: H })).json()).toMatchObject({ tokenMint: mint, poolAddress: deriveLaunchLabPool(mint), poolExists: false });
+    expect((await app.request(`/api/admin/launch/derive?mint=nope-nope-nope-nope-nope-nope-nope`, { headers: H })).status).toBe(400);
+    expect((await app.request("/api/admin/launch", { headers: H })).status).toBe(200);
+  });
+});

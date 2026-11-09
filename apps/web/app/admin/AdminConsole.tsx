@@ -2,7 +2,8 @@
 /**
  * Admin console. Authentication is a wallet signature over a server-issued, single-use,
  * domain-bound message; the session token lives in sessionStorage only. Every mutation is
- * validated server-side and written to the audit log. No secret is ever displayed or editable.
+ * validated server-side and written to the audit log. No secret is displayed or editable — except a
+ * generated wallet's key, on explicit request, end-to-end encrypted to this browser (WalletsPanel).
  */
 import { getWallets } from "@wallet-standard/app";
 import type { Wallet, WalletAccount } from "@wallet-standard/base";
@@ -11,6 +12,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { PUBLIC_API_URL } from "@/lib/config";
 import { shortAddress, sol, dateTime } from "@/lib/format";
 import { FundingPanel } from "./FundingPanel";
+import { WalletsPanel, type SignMessage } from "./WalletsPanel";
 
 type Field = { key: string; label: string; kind: "int" | "lamports" | "bps" | "text" | "select" | "bool" | "list"; options?: string[]; help?: string };
 const FIELDS: { group: string; fields: Field[] }[] = [
@@ -19,7 +21,7 @@ const FIELDS: { group: string; fields: Field[] }[] = [
     fields: [
       { key: "launchProvider", label: "Launch provider", kind: "select", options: ["meteora_dbc", "raydium_launchlab"] },
       { key: "tokenMint", label: "Token mint", kind: "text" },
-      { key: "poolAddress", label: "Pool address", kind: "text" },
+      { key: "poolAddress", label: "Pool address", kind: "text", help: "Raydium LaunchLab: leave empty — derived from the token mint (SOL quote), even before launch" },
       { key: "feeBeneficiaryRole", label: "Fee beneficiary role", kind: "select", options: ["creator", "partner", "platform"], help: "Whose fee share is distributed (DBC: creator|partner, LaunchLab: creator|platform)" },
     ],
   },
@@ -64,6 +66,7 @@ function toInput(f: Field, v: unknown): string {
 }
 function fromInput(f: Field, s: string): unknown {
   const t = s.trim();
+  if (f.kind === "text" && t === "") return null; // removes the override (e.g. pool address → derived again)
   if (f.kind === "int") return Number(t);
   if (f.kind === "bps") return Math.round(Number(t) * 100);
   if (f.kind === "bool") return t === "true";
@@ -159,10 +162,26 @@ export function AdminConsole() {
       </div>
     );
   }
-  return <Console call={call} me={account?.account.address ?? null} onSignOut={() => { setToken(null); try { sessionStorage.removeItem("last60.admin"); } catch {} }} notice={notice} setNotice={setNotice} />;
+  const signMessage: SignMessage = async (message) => {
+    let acc = account;
+    if (!acc) {
+      // Session restored from storage: reconnect a wallet to sign (the API checks it is the signed-in admin).
+      const w = wallets.find((x) => "solana:signMessage" in x.features);
+      if (!w) throw new Error("no wallet with message signing is available in this browser");
+      const { accounts } = await (w.features["standard:connect"] as any).connect();
+      const a: WalletAccount | undefined = accounts.find((x: WalletAccount) => x.chains.some((c) => c.startsWith("solana:"))) ?? accounts[0];
+      if (!a) throw new Error("wallet returned no account");
+      acc = { wallet: w, account: a };
+      setAccount(acc);
+    }
+    if (!("solana:signMessage" in acc.wallet.features)) throw new Error(`${acc.wallet.name} cannot sign messages`);
+    const [out] = await (acc.wallet.features["solana:signMessage"] as any).signMessage({ account: acc.account, message: new TextEncoder().encode(message) });
+    return { signature: bs58.encode(out.signature), address: acc.account.address };
+  };
+  return <Console call={call} signMessage={signMessage} me={account?.account.address ?? null} onSignOut={() => { setToken(null); try { sessionStorage.removeItem("last60.admin"); } catch {} }} notice={notice} setNotice={setNotice} />;
 }
 
-function Console({ call, me, onSignOut, notice, setNotice }: { call: (p: string, i?: RequestInit) => Promise<any>; me: string | null; onSignOut: () => void; notice: string | null; setNotice: (s: string | null) => void }) {
+function Console({ call, signMessage, me, onSignOut, notice, setNotice }: { call: (p: string, i?: RequestInit) => Promise<any>; signMessage: SignMessage; me: string | null; onSignOut: () => void; notice: string | null; setNotice: (s: string | null) => void }) {
   const [cfg, setCfg] = useState<any>(null);
   const [status, setStatus] = useState<any>(null);
   const [audit, setAudit] = useState<any[]>([]);
@@ -293,6 +312,8 @@ function Console({ call, me, onSignOut, notice, setNotice }: { call: (p: string,
           </table>
         </section>
       )}
+
+      <WalletsPanel call={call} signMessage={signMessage} />
 
       <FundingPanel call={call} />
 

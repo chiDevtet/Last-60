@@ -6,6 +6,7 @@
 |---|---|---|
 | Dedicated payout wallet key (`LAST60_PAYOUT_WALLET_KEYPAIR_PATH` preferred, chmod 600 enforced; or `LAST60_PAYOUT_WALLET_PRIVATE_KEY`; legacy `PAYOUT_WALLET_*` aliases) | `last60-rewards` only — loaded by the payout signer | API, web, logs, DB, admin UI, reports, error messages |
 | Fee claim authority key (optional) | `last60-rewards` only | same |
+| Wallet vault key (wallets generated in the admin console, docs/WALLETS.md): file `~/.last60/wallet-vault.key` (mode 600, created on first use) or `LAST60_WALLET_VAULT_KEY` | `last60-rewards` only; the encrypted keys are in MongoDB, the vault key never is | API, web, DB, logs; exports reach the admin's browser end-to-end encrypted, only for a browser key signed by a wallet in the rewards worker's own `ADMIN_WALLETS` |
 | Launch creator wallet key (optional, `LAST60_CREATOR_WALLET_KEYPAIR_PATH` preferred, chmod 600 enforced; or `LAST60_CREATOR_WALLET_PRIVATE_KEY`) — docs/CREATOR_WALLET.md | `last60-rewards` only — loaded by the creator wallet automation, validated against `LAST60_CREATOR_WALLET_ADDRESS` and the pool's on-chain creator | same; the API warns if present and never loads it |
 | `SCHEDULE_ENCRYPTION_KEY` | `last60-rewards` only (the API warns if it is set there) | API, web, logs |
 | `ADMIN_SESSION_SECRET` | `last60-api` | web |

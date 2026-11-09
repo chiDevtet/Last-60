@@ -79,7 +79,10 @@ describe("configuration", () => {
     const mm = problems({ LAST60_PAYOUT_WALLET_ADDRESS: kp.publicKey.toBase58(), LAST60_PAYOUT_WALLET_PRIVATE_KEY: secretOf(other) }).join("\n");
     expect(mm).toContain("derives a public key different from LAST60_PAYOUT_WALLET_ADDRESS");
     noLeak(mm, other);
-    expect(problems({ LAST60_PAYOUT_WALLET_PRIVATE_KEY: secretOf(kp) }).join("\n")).toContain("LAST60_PAYOUT_WALLET_ADDRESS: is required");
+    // A key without its address is still refused (by the signer's own check)…
+    expect(problems({ LAST60_PAYOUT_WALLET_PRIVATE_KEY: secretOf(kp) }).join("\n")).toContain("LAST60_PAYOUT_WALLET_ADDRESS is not; refusing to load it");
+    // …but no payout wallet at all is not an error: it is generated from the admin console (payouts stay queued until then).
+    expect(problems({})).toEqual([]);
   });
 
   test("custody requires the dedicated address; the payout wallet joins the funding destinations once under forge_phase_aware_v2; it may not be Forge's wallet", () => {

@@ -9,6 +9,7 @@ import type { AppConfig } from "./env";
 import { isValidPubkey } from "./env";
 import type { Models } from "../db/models";
 import { roleChangeBlockReason } from "../accounting/attribution";
+import { deriveLaunchLabPool } from "../providers/raydium/pda";
 
 const pubkey = z.string().trim().refine(isValidPubkey, "must be a Solana public key");
 const httpUrl = z.string().trim().refine((v) => /^https?:\/\//.test(v), "must be an http(s) URL");
@@ -56,6 +57,8 @@ export interface EffectiveSettings {
   launchProvider: AppConfig["provider"]["id"];
   tokenMint: string | null;
   poolAddress: string | null;
+  /** `configured` (override / environment) or `derived` (Raydium LaunchLab PDA of the token mint, SOL quote). */
+  poolAddressSource: "configured" | "derived" | null;
   feeBeneficiaryRole: AppConfig["provider"]["feeBeneficiaryRole"];
   buyerCount: number;
   minBuyQuote: bigint;
@@ -76,13 +79,30 @@ export interface EffectiveSettings {
   pauseScheduler: boolean;
 }
 
+/**
+ * The pool to index. An explicit pool override wins. Otherwise, for Raydium LaunchLab, a token mint set
+ * in the admin console is followed by its derived pool (never by an environment pool of another
+ * token); without a token override the environment pool (itself derived when only TOKEN_MINT is set).
+ */
+function resolvePool(cfg: AppConfig, o: RuntimeOverrides, launchProvider: EffectiveSettings["launchProvider"], tokenMint: string | null): Pick<EffectiveSettings, "poolAddress" | "poolAddressSource"> {
+  if (o.poolAddress) return { poolAddress: o.poolAddress, poolAddressSource: "configured" };
+  const launchLab = launchProvider === "raydium_launchlab";
+  const derive = (mint: string) => ({ poolAddress: deriveLaunchLabPool(mint), poolAddressSource: "derived" as const });
+  if (launchLab && o.tokenMint) return derive(o.tokenMint);
+  if (cfg.provider.poolAddress && launchProvider === cfg.provider.id) return { poolAddress: cfg.provider.poolAddress, poolAddressSource: cfg.provider.poolAddressSource ?? "configured" };
+  if (launchLab && tokenMint) return derive(tokenMint);
+  return { poolAddress: null, poolAddressSource: null };
+}
+
 export function resolveSettings(cfg: AppConfig, overrides: RuntimeOverrides, version: number): EffectiveSettings {
   const o = overrides;
+  const launchProvider = o.launchProvider ?? cfg.provider.id;
+  const tokenMint = o.tokenMint ?? cfg.provider.tokenMint;
   return {
     version,
-    launchProvider: o.launchProvider ?? cfg.provider.id,
-    tokenMint: o.tokenMint ?? cfg.provider.tokenMint,
-    poolAddress: o.poolAddress ?? cfg.provider.poolAddress,
+    launchProvider,
+    tokenMint,
+    ...resolvePool(cfg, o, launchProvider, tokenMint),
     feeBeneficiaryRole: o.feeBeneficiaryRole ?? cfg.provider.feeBeneficiaryRole,
     buyerCount: o.buyerCount ?? cfg.rewards.buyerCount,
     minBuyQuote: o.minBuyQuote !== undefined ? BigInt(o.minBuyQuote) : cfg.rewards.minBuyQuote,
@@ -107,12 +127,13 @@ export function resolveSettings(cfg: AppConfig, overrides: RuntimeOverrides, ver
 /** Cross-field rules that a patch must satisfy in combination with the environment. */
 export function validateEffective(cfg: AppConfig, s: EffectiveSettings): string[] {
   const p: string[] = [];
-  if (s.launchProvider !== "mock" && (!s.tokenMint || !s.poolAddress)) p.push("tokenMint and poolAddress are required for this provider");
+  if (s.launchProvider !== "mock" && !s.tokenMint) p.push("tokenMint is required for this provider");
+  else if (s.launchProvider !== "mock" && !s.poolAddress) p.push("poolAddress is required for this provider (only a Raydium LaunchLab pool is derived from the token mint)");
   if (s.launchProvider === "mock" && cfg.solana.cluster === "mainnet-beta") p.push("the mock provider (synthetic data) is refused on mainnet-beta");
   if (s.launchProvider === "meteora_dbc" && s.feeBeneficiaryRole === "platform") p.push('Meteora DBC supports roles "creator" or "partner"');
   if (s.launchProvider === "raydium_launchlab" && s.feeBeneficiaryRole === "partner") p.push('Raydium LaunchLab supports roles "creator" or "platform"');
   if (s.payoutMode === "live" && cfg.solana.cluster === "mainnet-beta" && !cfg.payout.allowMainnet) p.push("live payouts on mainnet-beta require ALLOW_MAINNET_PAYOUTS=true in the environment");
-  if (s.payoutMode === "live" && !cfg.secrets.payoutWalletPrivateKey && !cfg.secrets.payoutWalletKeypairPath) p.push("live payouts require a payout signing key in the environment");
+  if (s.payoutMode === "live" && !cfg.secrets.payoutWalletPrivateKey && !cfg.secrets.payoutWalletKeypairPath && cfg.wallets?.payout.source !== "vault") p.push("live payouts require a payout wallet: generate one in the admin console (Wallets) or set a payout signing key in the environment");
   if (s.payoutAssetMint === WSOL_MINT && s.minPayoutLamports < 890_880n) p.push("minPayoutLamports must be >= 890880 (rent-exempt minimum)");
   if (s.minBuyQuote <= 0n) p.push("minBuyQuote must be positive");
   return p;

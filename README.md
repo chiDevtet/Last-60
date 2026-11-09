@@ -45,7 +45,8 @@ SCHEDULE_ENCRYPTION_KEY=$(bun run cli gen-schedule-key)
 LAST60_PAYOUT_WALLET_ADDRESS=<dedicated payout wallet address>   # see docs/PAYOUT_WALLET.md
 INDEXER_BACKFILL=none
 # REWARD_FUNDING_POLICY defaults to forge_phase_aware_v2 (activation slot pinned at first start).
-# Hands-off creator flows: add LAST60_CREATOR_WALLET_ADDRESS (+ the key in .env.rewards only) — docs/CREATOR_WALLET.md
+# Wallets can instead be generated from the admin page (docs/WALLETS.md); TOKEN_MINT may be set there too,
+# and a LaunchLab POOL_ADDRESS is derived from the token mint. Hands-off creator flows: docs/CREATOR_WALLET.md
 ```
 `bun scripts/find-active-pool.ts raydium_launchlab` prints a busy pool to try.
 
@@ -79,6 +80,7 @@ bun run cli revenue | revenue-reconcile                   # same report / re-run
 | [Fee accounting](docs/FEE_ACCOUNTING.md) | formulas, periods, ledger, collection, reconciliation |
 | [Reward funding](docs/REWARD_FUNDING.md) | two-phase business model, revenue streams, claim ↔ transfer evidence, how Forge's existing post-migration creator payout is attributed (§4a), funding policy, Forgepad findings, runbook |
 | [Payout wallet](docs/PAYOUT_WALLET.md) | the dedicated payout wallet: key generation and installation, fail-closed signer, verification, funding for fees |
+| [Wallets & pre-launch](docs/WALLETS.md) | generate the payout / creator wallets from the admin page (encrypted vault, end-to-end encrypted export), pool derived from the token mint before launch |
 | [Creator wallet](docs/CREATOR_WALLET.md) | hands-off creator wallet automation: claim bonding fees, send 75 % to the payout wallet, sweep Forge's post-migration creator payouts |
 | [Providers](docs/PROVIDERS.md) | Meteora DBC & Raydium LaunchLab internals, graduation support matrix |
 | [Database](docs/DATABASE.md) | collections, constraints, state machines, reconstruction |

@@ -11,6 +11,9 @@
  *   custody_transfers (custodyId), (transferKey), one open request per contribution — physical custody sweeps
  *   transfer_uses    (key = signature:ordinal) — one on-chain transfer is EITHER a contribution OR a custody transfer
  *   attribution_recoveries (requestId) — append-only audit of operator re-evaluations
+ *   wallet_vault     (_id = role) — wallets generated from the admin console; secret keys AES-256-GCM encrypted
+ *                    by the rewards worker under a key that is never in the database
+ *   wallet_exports   (_id = request id) — end-to-end encrypted, admin-wallet-signed one-time key exports
  *   creator_wallet_transfers (signature), one in-flight transfer per claim / contribution — automated
  *                    creator-wallet settlements (bonding 75 %) and custody sweeps (Forge creator payouts)
  *   rounds           (roundNumber), (roundIndex)
@@ -548,6 +551,59 @@ creatorWalletTransferSchema.index({ sourcePool: 1, status: 1, effectRecorded: 1 
 guardImmutable(creatorWalletTransferSchema, ["signature", "kind", "ref", "sourcePool", "collectionKey", "collectionSignature", "fundingKey", "custodyId", "from", "to", "lamports", "memo", "serializedTx", "lastValidBlockHeight"]);
 
 /**
+ * Wallets generated from the admin console (docs/WALLETS.md). The API only inserts a `requested` row; the
+ * rewards worker (the only process holding the vault key) generates the key pair, encrypts the secret key
+ * with AES-256-GCM (AAD binds role and address) and compare-and-sets the row to `active`. No plaintext key
+ * is ever written anywhere; `keyId` identifies the vault key without revealing it.
+ */
+export const WALLET_ROLES = ["payout", "creator"] as const;
+const walletVaultSchema = new Schema(
+  {
+    _id: { type: String, enum: WALLET_ROLES, required: true },
+    status: { type: String, enum: ["requested", "active"], required: true },
+    address: { type: String, default: null },
+    alg: { type: String, default: null },
+    keyId: { type: String, default: null },
+    iv: { type: String, default: null },
+    ciphertext: { type: String, default: null },
+    requestedBy: { type: String, required: true },
+    requestedAt: { type: Date, required: true },
+    reason: { type: String, default: null },
+    generatedAt: { type: Date, default: null },
+    generatedBy: { type: String, default: null },
+    lastExportedAt: { type: Date, default: null },
+    exports: { type: Number, default: 0 },
+  },
+  { collection: "wallet_vault", versionKey: false },
+);
+
+/** One-time key export requests. The API relays them; only the rewards worker can fulfil one (ciphertext only). */
+const walletExportSchema = new Schema(
+  {
+    _id: { type: String, required: true },
+    role: { type: String, enum: WALLET_ROLES, required: true },
+    address: { type: String, required: true },
+    adminWallet: { type: String, required: true },
+    message: { type: String, required: true },
+    signature: { type: String, required: true },
+    browserKey: { type: String, required: true },
+    status: { type: String, enum: ["requested", "ready", "refused", "consumed"], required: true },
+    refusedReason: { type: String, default: null },
+    workerKey: { type: String, default: null },
+    iv: { type: String, default: null },
+    ciphertext: { type: String, default: null },
+    expiresAt: { type: Date, required: true },
+    createdAt: { type: Date, default: Date.now },
+    readyAt: { type: Date, default: null },
+    consumedAt: { type: Date, default: null },
+  },
+  { collection: "wallet_exports", versionKey: false },
+);
+walletExportSchema.index({ status: 1, createdAt: 1 });
+// Rows (and any ciphertext) disappear an hour after their intent expired.
+walletExportSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 3_600 });
+
+/**
  * One row per on-chain transfer (signature + instruction ordinal) that Last-60 has USED: either as a
  * reward contribution (`reward_funding`) or as a custody transfer. Inserted before the use is
  * recorded; the unique key makes the two uses mutually exclusive, so a custody sweep can never be
@@ -915,6 +971,8 @@ export const schemas = {
   FundingAttribution: fundingAttributionSchema,
   CustodyTransfer: custodyTransferSchema,
   CreatorWalletTransfer: creatorWalletTransferSchema,
+  WalletVault: walletVaultSchema,
+  WalletExport: walletExportSchema,
   TransferUse: transferUseSchema,
   AttributionRecovery: attributionRecoverySchema,
   BuyerActivity: buyerActivitySchema,

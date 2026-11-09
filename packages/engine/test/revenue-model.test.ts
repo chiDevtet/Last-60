@@ -290,7 +290,8 @@ describe("configuration", () => {
     expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v1", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "5", LAST60_FUNDING_DESTINATIONS: DEST, FORGE_PLATFORM_LP_BENEFICIARY: FORGE }).join("\n")).toContain("forge_phase_aware_v1 is retired");
     // No activation slot is no longer an error: it is pinned automatically at the first boot.
     expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", LAST60_FUNDING_DESTINATIONS: DEST, FORGE_PLATFORM_LP_BENEFICIARY: FORGE })).toEqual([]);
-    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "5" }).join("\n")).toContain("LAST60_FUNDING_DESTINATIONS");
+    // No destination yet (no payout wallet generated) is reported at boot, not fatal; the Forge wallet still is (off mainnet).
+    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "5" }).join("\n")).not.toContain("LAST60_FUNDING_DESTINATIONS");
     expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "5", LAST60_FUNDING_DESTINATIONS: DEST }).join("\n")).toContain("FORGE_PLATFORM_LP_BENEFICIARY: is required");
     expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "x", LAST60_FUNDING_DESTINATIONS: DEST }).join("\n")).toContain("non-negative integer");
     // The approved percentages cannot be changed, under any policy.

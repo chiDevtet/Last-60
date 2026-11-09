@@ -37,3 +37,4 @@ export * from "./custody/custody";
 export * from "./custody/report";
 export * from "./creator/creatorWallet";
 export * from "./recovery/attributionRecovery";
+export * from "./wallets/vault";

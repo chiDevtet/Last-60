@@ -62,7 +62,9 @@ describe("environment validation", () => {
   test("provider/role combinations are validated", () => {
     expect(() => loadConfig("indexer", { ...base, FEE_BENEFICIARY_ROLE: "platform" })).toThrow(/platform/);
     expect(() => loadConfig("indexer", { ...base, LAUNCH_PROVIDER: "raydium_launchlab", FEE_BENEFICIARY_ROLE: "partner" })).toThrow(/partner/);
-    expect(() => loadConfig("indexer", { ...base, TOKEN_MINT: "" })).toThrow(/TOKEN_MINT/);
+    // No token yet is not an error (set it in the admin console; workers wait). A DBC pool cannot be derived.
+    expect(loadConfig("indexer", { ...base, TOKEN_MINT: "", POOL_ADDRESS: "" }).provider.tokenMint).toBeNull();
+    expect(() => loadConfig("indexer", { ...base, POOL_ADDRESS: "" })).toThrow(/POOL_ADDRESS: is required for meteora_dbc/);
     expect(loadConfig("indexer", { ...base, LAUNCH_PROVIDER: "raydium_launchlab" }).provider.id).toBe("raydium_launchlab");
   });
 

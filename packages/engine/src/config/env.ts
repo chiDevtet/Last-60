@@ -9,6 +9,9 @@ import { jsonSafe } from "../util/json";
 import { PayoutSigner } from "../signer/payoutSigner";
 import { APPROVED_SHARES, makeFundingPolicy, type FundingCorrelationMode, type FundingPolicy } from "../accounting/revenueStreams";
 import { loadKeypair } from "../chain/keys";
+import { homedir } from "node:os";
+import { join as joinPath } from "node:path";
+import { deriveLaunchLabPool } from "../providers/raydium/pda";
 
 /** Forgepad's PlatformConfig `platform_nft_wallet` (owner of Forge's platform LP Fee Key) on mainnet-beta. */
 export const FORGEPAD_PLATFORM_NFT_WALLET = "8KXqQwtrgtKxNfTWYsN34XNKXVQQR78JZfgbLorNL2n1";
@@ -242,6 +245,14 @@ const RawEnv = z.object({
   /** SOL always left in the creator wallet for network fees. */
   LAST60_CREATOR_FEE_RESERVE_LAMPORTS: bigintStr(2_000_000n),
 
+  /**
+   * Wallet vault (docs/WALLETS.md): wallets generated from the admin console are encrypted by the rewards
+   * worker with this 32-byte key. Default: a key FILE created on first use (chmod 600, outside the
+   * repository) at LAST60_WALLET_VAULT_KEY_PATH; LAST60_WALLET_VAULT_KEY (base64) overrides it.
+   */
+  LAST60_WALLET_VAULT_KEY: z.string().optional(),
+  LAST60_WALLET_VAULT_KEY_PATH: z.string().optional(),
+
   SCHEDULE_ENCRYPTION_KEY: z.string().optional(),
 
   MONGODB_URI: z.string().min(1, "is required"),
@@ -323,6 +334,24 @@ export interface RevenueConfig {
   activation: { source: "configured" | "auto" | "not_applicable"; pending: boolean };
 }
 
+/** Where a wallet's address (and, in the rewards worker, its key) comes from. */
+export interface WalletSourceConfig {
+  address: string | null;
+  /** `env`: LAST60_*_ADDRESS / key variables; `vault`: generated from the admin console; null: none yet. */
+  source: "env" | "vault" | null;
+}
+export interface WalletsConfig {
+  payout: WalletSourceConfig;
+  creator: WalletSourceConfig;
+  /** File holding the vault key (unless LAST60_WALLET_VAULT_KEY is set). */
+  vaultKeyPath: string;
+}
+/** Addresses of active vault wallets, read from the database at boot (`readVaultWallets`). */
+export interface VaultAddresses {
+  payout?: string | null;
+  creator?: string | null;
+}
+
 export interface CreatorWalletConfig {
   /** Declared public address of the launch creator wallet (cross-checked against the key and the pool's on-chain creator). */
   address: string | null;
@@ -351,6 +380,8 @@ export interface AppConfig {
     id: "meteora_dbc" | "raydium_launchlab" | "mock";
     tokenMint: string | null;
     poolAddress: string | null;
+    /** `derived`: POOL_ADDRESS was unset and the LaunchLab pool was derived from TOKEN_MINT. */
+    poolAddressSource: "configured" | "derived" | null;
     feeBeneficiaryRole: "creator" | "partner" | "platform";
     expected: ExpectedAllocation;
   };
@@ -390,6 +421,7 @@ export interface AppConfig {
   };
   feeCollection: { mode: "manual" | "auto_claim"; minClaimLamports: bigint };
   creatorWallet: CreatorWalletConfig;
+  wallets: WalletsConfig;
   mongo: { uri: string; dbName: string };
   indexer: {
     pollIntervalMs: number;
@@ -427,6 +459,7 @@ export interface SecretSources {
   feeClaimAuthorityKeypairPath?: string;
   creatorWalletPrivateKey?: string;
   creatorWalletKeypairPath?: string;
+  walletVaultKey?: string;
 }
 
 export class ConfigError extends Error {
@@ -441,6 +474,7 @@ const SECRET_KEYS = [
   "PAYOUT_WALLET_PRIVATE_KEY",
   "FEE_CLAIM_AUTHORITY_PRIVATE_KEY",
   "LAST60_CREATOR_WALLET_PRIVATE_KEY",
+  "LAST60_WALLET_VAULT_KEY",
   "SCHEDULE_ENCRYPTION_KEY",
   "ADMIN_SESSION_SECRET",
   "HELIUS_API_KEY",
@@ -480,7 +514,11 @@ export function deriveWsUrl(httpUrl: string): string {
   return u.toString();
 }
 
-export function loadConfig(role: ProcessRole, env: Record<string, string | undefined> = process.env): AppConfig {
+/**
+ * `opts.vault`: addresses of wallets generated from the admin console (read from the database at boot).
+ * They are used when the corresponding LAST60_*_ADDRESS is not set in the environment.
+ */
+export function loadConfig(role: ProcessRole, env: Record<string, string | undefined> = process.env, opts: { vault?: VaultAddresses } = {}): AppConfig {
   const parsed = RawEnv.safeParse(env);
   const problems: string[] = [];
   if (!parsed.success) {
@@ -497,12 +535,21 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     if (a !== undefined && b !== undefined && a.trim() !== b.trim()) problems.push(`${name}: also set under the legacy name ${legacy} with a different value; set only ${name}`);
     return a ?? b;
   };
-  const payoutWalletAddress = alias("LAST60_PAYOUT_WALLET_ADDRESS", raw.LAST60_PAYOUT_WALLET_ADDRESS, "PAYOUT_WALLET_PUBLIC_KEY", raw.PAYOUT_WALLET_PUBLIC_KEY);
+  const envPayoutAddress = alias("LAST60_PAYOUT_WALLET_ADDRESS", raw.LAST60_PAYOUT_WALLET_ADDRESS, "PAYOUT_WALLET_PUBLIC_KEY", raw.PAYOUT_WALLET_PUBLIC_KEY);
+  const vaultPayout = opts.vault?.payout ?? null;
+  const vaultCreator = opts.vault?.creator ?? null;
+  if (envPayoutAddress && vaultPayout && envPayoutAddress !== vaultPayout) problems.push(`LAST60_PAYOUT_WALLET_ADDRESS: differs from the payout wallet generated in the admin console (${vaultPayout}); remove the environment value to use the generated wallet`);
+  const payoutWalletAddress = envPayoutAddress ?? vaultPayout ?? undefined;
+  const payoutFromVault = !envPayoutAddress && !!vaultPayout;
   const payoutKey = alias("LAST60_PAYOUT_WALLET_PRIVATE_KEY", raw.LAST60_PAYOUT_WALLET_PRIVATE_KEY, "PAYOUT_WALLET_PRIVATE_KEY", raw.PAYOUT_WALLET_PRIVATE_KEY);
   const payoutKeyPath = alias("LAST60_PAYOUT_WALLET_KEYPAIR_PATH", raw.LAST60_PAYOUT_WALLET_KEYPAIR_PATH, "PAYOUT_WALLET_KEYPAIR_PATH", raw.PAYOUT_WALLET_KEYPAIR_PATH);
   const creatorKey = raw.LAST60_CREATOR_WALLET_PRIVATE_KEY?.trim() ? raw.LAST60_CREATOR_WALLET_PRIVATE_KEY : undefined;
   const creatorKeyPath = raw.LAST60_CREATOR_WALLET_KEYPAIR_PATH?.trim() ? raw.LAST60_CREATOR_WALLET_KEYPAIR_PATH : undefined;
-  const creatorKeySet = !!(creatorKey || creatorKeyPath);
+  const envCreatorKeySet = !!(creatorKey || creatorKeyPath);
+  if (raw.LAST60_CREATOR_WALLET_ADDRESS && vaultCreator && raw.LAST60_CREATOR_WALLET_ADDRESS !== vaultCreator) problems.push(`LAST60_CREATOR_WALLET_ADDRESS: differs from the creator wallet generated in the admin console (${vaultCreator}); remove the environment value to use the generated wallet`);
+  const creatorFromVault = !raw.LAST60_CREATOR_WALLET_ADDRESS && !envCreatorKeySet && !!vaultCreator;
+  /** A creator key is available: in the environment, or generated (decrypted by the rewards worker). */
+  const creatorKeySet = envCreatorKeySet || creatorFromVault;
 
   const rpcUrl = deriveRpcUrl(raw);
   if (!rpcUrl) problems.push("SOLANA_RPC_URL: is required (or set HELIUS_API_KEY)");
@@ -564,11 +611,13 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
   }
 
   // Role-specific requirements
+  // The token and pool may be set later from the admin console: until then the indexer and rewards
+  // worker wait ("waiting for launch"). A Raydium LaunchLab pool is derived from the token mint
+  // (PDA ["pool", mint, WSOL]); a Meteora DBC pool also depends on its config and must be given.
   const needsChainTarget = role === "indexer" || role === "rewards";
-  if (needsChainTarget && raw.LAUNCH_PROVIDER !== "mock") {
-    if (!raw.TOKEN_MINT) problems.push("TOKEN_MINT: is required");
-    if (!raw.POOL_ADDRESS) problems.push("POOL_ADDRESS: is required");
-  }
+  if (needsChainTarget && raw.LAUNCH_PROVIDER === "meteora_dbc" && raw.TOKEN_MINT && !raw.POOL_ADDRESS) problems.push("POOL_ADDRESS: is required for meteora_dbc (it cannot be derived from the token mint)");
+  let derivedPool: string | null = null;
+  if (raw.LAUNCH_PROVIDER === "raydium_launchlab" && raw.TOKEN_MINT && !raw.POOL_ADDRESS) derivedPool = deriveLaunchLabPool(raw.TOKEN_MINT);
   if (raw.LAUNCH_PROVIDER === "mock" && raw.NODE_ENV === "production") {
     problems.push("LAUNCH_PROVIDER: mock is synthetic test data and is refused in production");
   }
@@ -580,8 +629,9 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
   }
   if (role === "rewards") {
     if (!encryptionKey) problems.push("SCHEDULE_ENCRYPTION_KEY: is required for the rewards worker");
-    if (!payoutWalletAddress) problems.push("LAST60_PAYOUT_WALLET_ADDRESS: is required for the rewards worker (legacy name PAYOUT_WALLET_PUBLIC_KEY)");
-    if (raw.PAYOUT_MODE === "live" && !payoutKey && !payoutKeyPath) {
+    // No payout wallet yet is not an error: generate one from the admin console. Until then live payouts
+    // stay queued (no signer) and the creator wallet automation stays idle.
+    if (raw.PAYOUT_MODE === "live" && !payoutKey && !payoutKeyPath && !payoutFromVault) {
       problems.push("LAST60_PAYOUT_WALLET_PRIVATE_KEY or LAST60_PAYOUT_WALLET_KEYPAIR_PATH: required when PAYOUT_MODE=live (legacy names PAYOUT_WALLET_PRIVATE_KEY / PAYOUT_WALLET_KEYPAIR_PATH)");
     }
     if (raw.PAYOUT_MODE === "live" && raw.SOLANA_CLUSTER === "mainnet-beta" && !raw.ALLOW_MAINNET_PAYOUTS) {
@@ -662,20 +712,21 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
   const custodyEnabled = raw.LAST60_CUSTODY_ENABLED ?? (phaseAware && !!payoutWalletAddress);
   // Launch creator wallet automation.
   if (creatorKey && creatorKeyPath) problems.push("Set only one of LAST60_CREATOR_WALLET_PRIVATE_KEY / LAST60_CREATOR_WALLET_KEYPAIR_PATH");
-  const creatorAutomation = raw.LAST60_CREATOR_AUTOMATION_ENABLED ?? creatorKeySet;
+  // Default: on when a creator wallet exists AND its prerequisites hold (so generating a wallet in the admin
+  // console can never stop a process from starting). Explicitly enabled: every unmet prerequisite is an error.
+  const creatorAutomation = raw.LAST60_CREATOR_AUTOMATION_ENABLED ?? (creatorKeySet && phaseAware && raw.LAST60_CUSTODY_ENABLED !== false && raw.FEE_BENEFICIARY_ROLE === "creator");
   if (creatorAutomation && role === "rewards") {
-    if (!creatorKeySet) problems.push("LAST60_CREATOR_AUTOMATION_ENABLED: requires LAST60_CREATOR_WALLET_KEYPAIR_PATH or LAST60_CREATOR_WALLET_PRIVATE_KEY in the rewards worker");
+    if (!creatorKeySet) problems.push("LAST60_CREATOR_AUTOMATION_ENABLED: requires a creator wallet (generate one from the admin console, or set LAST60_CREATOR_WALLET_KEYPAIR_PATH / LAST60_CREATOR_WALLET_PRIVATE_KEY in the rewards worker)");
     if (!phaseAware) problems.push("LAST60_CREATOR_AUTOMATION_ENABLED: requires REWARD_FUNDING_POLICY=forge_phase_aware_v2 (the 75 % / custody flows only fund rounds under the approved model)");
-    if (!payoutWalletAddress) problems.push("LAST60_CREATOR_AUTOMATION_ENABLED: requires LAST60_PAYOUT_WALLET_ADDRESS (the creator wallet only ever sends to the dedicated payout wallet)");
     if (raw.LAST60_CUSTODY_ENABLED === false) problems.push("LAST60_CREATOR_AUTOMATION_ENABLED: requires the custody workflow (unset LAST60_CUSTODY_ENABLED or set it to true)");
     if (raw.FEE_BENEFICIARY_ROLE !== "creator") problems.push('LAST60_CREATOR_AUTOMATION_ENABLED: requires FEE_BENEFICIARY_ROLE=creator');
   }
-  const creatorAddress = raw.LAST60_CREATOR_WALLET_ADDRESS ?? null;
+  const creatorAddress = raw.LAST60_CREATOR_WALLET_ADDRESS ?? (creatorFromVault ? vaultCreator : null);
   for (const [name, a] of [["LAST60_PAYOUT_WALLET_ADDRESS", payoutWalletAddress], ["FORGE_PLATFORM_LP_BENEFICIARY", forgeBeneficiary]] as const) {
     if (creatorAddress && a && creatorAddress === a) problems.push(`LAST60_CREATOR_WALLET_ADDRESS: must not be ${name} (the creator wallet sends TO the payout wallet)`);
   }
   // Startup validation of the creator key (rewards worker only). Messages never quote the key.
-  if (role === "rewards" && creatorKeySet && !(creatorKey && creatorKeyPath)) {
+  if (role === "rewards" && envCreatorKeySet && !(creatorKey && creatorKeyPath)) {
     const keyVar = creatorKeyPath ? "LAST60_CREATOR_WALLET_KEYPAIR_PATH" : "LAST60_CREATOR_WALLET_PRIVATE_KEY";
     try {
       const kp = loadKeypair({ privateKey: creatorKey, keypairPath: creatorKeyPath }, null, "creator wallet");
@@ -692,7 +743,8 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
   const fundingDestinations = [...new Set([...raw.LAST60_FUNDING_DESTINATIONS, ...(phaseAware && payoutWalletAddress ? [payoutWalletAddress] : [])])];
   // Required where funding is recorded / consumed (indexer, rewards); the API and CLI only report.
   const fundingRole = role === "indexer" || role === "rewards" || role === "test";
-  if (phaseAware && fundingRole && fundingDestinations.length === 0) problems.push("LAST60_FUNDING_DESTINATIONS: at least one destination wallet is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 (the dedicated LAST60_PAYOUT_WALLET_ADDRESS counts)");
+  // forge_phase_aware_v2 with no destination yet (no payout wallet generated): nothing can fund a round
+  // until there is one; reported at boot, not fatal (the payout wallet is generated from the admin console).
   if (phaseAware && fundingRole && !forgeBeneficiary) problems.push("FORGE_PLATFORM_LP_BENEFICIARY: is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 outside mainnet-beta (the creator's 50 % LP allocation is only verifiable against Forge's platform Fee Key owner; on mainnet-beta it defaults to Forgepad's)");
   if (forgeBeneficiary && raw.LAST60_FUNDING_DESTINATIONS.includes(forgeBeneficiary)) problems.push("LAST60_FUNDING_DESTINATIONS: must not include FORGE_PLATFORM_LP_BENEFICIARY (a self-transfer is not a contribution)");
   const bondingBps = raw.BONDING_CREATOR_FEE_LAST60_PERCENTAGE.trim() === "0" ? 0 : share("BONDING_CREATOR_FEE_LAST60_PERCENTAGE", raw.BONDING_CREATOR_FEE_LAST60_PERCENTAGE);
@@ -737,7 +789,8 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     provider: {
       id: raw.LAUNCH_PROVIDER,
       tokenMint: raw.TOKEN_MINT ?? null,
-      poolAddress: raw.POOL_ADDRESS ?? null,
+      poolAddress: raw.POOL_ADDRESS ?? derivedPool,
+      poolAddressSource: raw.POOL_ADDRESS ? "configured" : derivedPool ? "derived" : null,
       feeBeneficiaryRole: raw.FEE_BENEFICIARY_ROLE,
       expected,
     },
@@ -774,14 +827,19 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
       concurrency: raw.PAYOUT_CONCURRENCY,
       memo: raw.PAYOUT_MEMO,
     },
-    feeCollection: { mode: raw.FEE_COLLECTION_MODE ?? (creatorAutomation || creatorAddress ? "auto_claim" : "manual"), minClaimLamports: raw.FEE_CLAIM_MIN_LAMPORTS },
+    feeCollection: { mode: raw.FEE_COLLECTION_MODE ?? (creatorAutomation || (creatorAddress && phaseAware) ? "auto_claim" : "manual"), minClaimLamports: raw.FEE_CLAIM_MIN_LAMPORTS },
     creatorWallet: {
       address: creatorAddress,
       keyConfigured: creatorKeySet,
-      automationEnabled: creatorAutomation && creatorKeySet && phaseAware && !!payoutWalletAddress,
+      automationEnabled: creatorAutomation && creatorKeySet && phaseAware,
       intervalMs: raw.LAST60_CREATOR_AUTOMATION_INTERVAL_SECONDS * 1000,
       minTransferLamports: raw.LAST60_CREATOR_MIN_TRANSFER_LAMPORTS,
       feeReserveLamports: raw.LAST60_CREATOR_FEE_RESERVE_LAMPORTS,
+    },
+    wallets: {
+      payout: { address: payoutWalletAddress ?? null, source: envPayoutAddress || payoutKey || payoutKeyPath ? "env" : payoutFromVault ? "vault" : null },
+      creator: { address: creatorAddress, source: raw.LAST60_CREATOR_WALLET_ADDRESS || envCreatorKeySet ? "env" : creatorFromVault ? "vault" : null },
+      vaultKeyPath: raw.LAST60_WALLET_VAULT_KEY_PATH?.trim() || joinPath(homedir(), ".last60", "wallet-vault.key"),
     },
     mongo: { uri: raw.MONGODB_URI, dbName: raw.MONGODB_DB_NAME },
     indexer: {
@@ -827,6 +885,7 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
       feeClaimAuthorityKeypairPath: raw.FEE_CLAIM_AUTHORITY_KEYPAIR_PATH,
       creatorWalletPrivateKey: creatorKey,
       creatorWalletKeypairPath: creatorKeyPath,
+      walletVaultKey: raw.LAST60_WALLET_VAULT_KEY?.trim() || undefined,
     },
   };
 }
@@ -854,6 +913,7 @@ export function redactConfig(cfg: AppConfig) {
       payoutWalletKey: secrets.payoutWalletPrivateKey ? "[env]" : secrets.payoutWalletKeypairPath ? "[file]" : null,
       feeClaimKey: secrets.feeClaimAuthorityPrivateKey ? "[env]" : secrets.feeClaimAuthorityKeypairPath ? "[file]" : null,
       creatorWalletKey: secrets.creatorWalletPrivateKey ? "[env]" : secrets.creatorWalletKeypairPath ? "[file]" : null,
+      walletVaultKey: secrets.walletVaultKey ? "[env]" : "[file]",
     },
   });
 }

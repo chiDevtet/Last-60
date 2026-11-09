@@ -8,7 +8,7 @@ import type { AppConfig } from "../config/env";
 import type { EffectiveSettings, SettingsStore } from "../config/runtime";
 import { RpcClient, type ChainRpc } from "../chain/rpc";
 import type { Models } from "../db/models";
-import { attachStoredMigration, createProvider, providerTargetFor, type LaunchProvider } from "../providers";
+import { AwaitingLaunchError, attachStoredMigration, createProvider, providerTargetFor, type LaunchProvider } from "../providers";
 import { basesOf, roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
@@ -21,6 +21,7 @@ import { FeeCollector } from "./feeCollector";
 import { Reconciler } from "./reconciliation";
 import { readMint } from "../providers/mint";
 import { CreatorWalletAutomation } from "../creator/creatorWallet";
+import { fulfilExportRequests, fulfilWalletRequests } from "../wallets/vault";
 
 export interface RewardsWorkerDeps {
   db: Models;
@@ -127,7 +128,7 @@ export class RewardsWorker {
           const halted = await this.payouts.isHalted();
           const paused = s.pauseScheduler || s.pausePayouts;
           await heartbeat(this.d.db, "rewards", {
-            status: this.status.status === "degraded" ? "degraded" : paused ? "paused" : halted ? "degraded" : "running",
+            status: this.status.status === "degraded" ? "degraded" : this.status.status === "waiting" ? "waiting" : paused ? "paused" : halted ? "degraded" : "running",
             detail: this.status.detail ?? (halted ? `payouts halted: ${halted}` : s.pausePayouts ? "payouts paused by admin" : s.pauseScheduler ? "scheduler paused by admin" : null),
             instance: this.d.cfg.instanceId,
             metrics: { payoutMode: s.payoutMode, payer: this.signer?.address ?? null },
@@ -161,6 +162,9 @@ export class RewardsWorker {
           await this.clock.sleep(2000, signal);
           continue;
         }
+        // Wallet generation / export requests from the admin console: served before the provider is
+        // loaded, so they work before launch (no token / pool yet).
+        await this.walletPass(now);
         const s = await this.d.settings.get();
         await this.ensureProvider(s);
         const wake = await this.scheduler.tick(now);
@@ -199,6 +203,13 @@ export class RewardsWorker {
         const sleepFor = Math.max(0, Math.min(wake - this.clock.now(), 500));
         await this.clock.sleep(sleepFor, signal);
       } catch (err: any) {
+        if (err instanceof AwaitingLaunchError) {
+          // Before launch: nothing to schedule yet; wallet requests (above) are still served.
+          this.status = { status: "waiting", detail: `waiting for launch: ${err.message}` };
+          await this.terminal.system(`Reward engine waiting for launch: ${err.message}.`, `awaiting-launch:rewards:${err.message}`).catch(() => undefined);
+          await this.clock.sleep(2_000, signal);
+          continue;
+        }
         failures++;
         const delay = backoffDelay(failures, { baseMs: 500, maxMs: 15_000 });
         this.log.error({ err: String(err?.message ?? err), delay }, "rewards loop error");
@@ -216,6 +227,21 @@ export class RewardsWorker {
 
   stop() {
     this.stopped = true;
+  }
+
+  private lastWalletPass = 0;
+  /** Generate requested wallets and fulfil signed key exports (docs/WALLETS.md). Never throws. */
+  async walletPass(now = this.clock.now()) {
+    if (now - this.lastWalletPass < 2_000) return;
+    this.lastWalletPass = now;
+    try {
+      const made = await fulfilWalletRequests(this.d.db, this.d.cfg, this.log);
+      for (const role of made) await this.terminal.system(`New ${role} wallet generated and stored encrypted. Processes restart to load it; export a backup from the admin console.`, `wallet-generated:${role}`);
+      await fulfilExportRequests(this.d.db, this.d.cfg, { now, log: this.log });
+    } catch (err: any) {
+      this.log.error({ err: String(err?.message ?? err) }, "wallet vault request failed");
+      await this.terminal.error(`Wallet vault: ${String(err?.message ?? err).slice(0, 200)}`, `wallet-vault-error:${Math.floor(now / 600_000)}`).catch(() => undefined);
+    }
   }
 
   /**

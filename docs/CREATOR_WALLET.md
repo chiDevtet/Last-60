@@ -14,7 +14,11 @@ Code: `packages/engine/src/creator/creatorWallet.ts` (automation), `src/rewards/
 
 ## 1. One-time setup
 
-`.env.rewards` (chmod 600; the ONLY process that may hold the creator key):
+**Easiest: from the admin page** (docs/WALLETS.md) — generate the payout and creator wallets, export a
+backup, import the creator key into Phantom, fund it, launch from it, and set the token mint (the pool is
+derived). No key or address has to be put in an environment file.
+
+**Or with environment variables** — `.env.rewards` (chmod 600; the ONLY process that may hold the creator key):
 
 ```
 SOLANA_CLUSTER=mainnet-beta

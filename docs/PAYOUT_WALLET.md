@@ -4,7 +4,10 @@ The payout wallet is a separate Solana keypair, controlled by the operator, that
 pays buyer rewards from. It is the destination of every custody transfer (docs/REWARD_FUNDING.md §14)
 and the only wallet reward payouts are signed from.
 
-> This repository never generates, stores or ships a production key. The operator generates the
+> Alternatively, generate the payout wallet from the admin page: the rewards worker creates it and keeps it
+> encrypted in its vault (docs/WALLETS.md); §4–§5 below then do not apply.
+>
+> This repository never ships a production key. The operator generates the
 > keypair, installs it on the rewards server, and supplies only its **public address** to the rest of
 > the configuration. No key appears in this repository, its documentation or its test fixtures (tests
 > generate throwaway keys at runtime).

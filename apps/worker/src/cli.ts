@@ -27,7 +27,8 @@
  * The CLI runs with the server's database credentials: its operator identity is `cli:$USER`.
  */
 import { randomBytes } from "node:crypto";
-import { buildFundingPipeline, CREATOR_WALLET_STATUS_ID, resolveFundingActivation, cancelCustodyRequest, createCustodyRequest, payoutWalletVerification, recoverAttribution, refreshCustodyFinality, renderFundingPipeline, submitCustodySignature, ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, buildRevenueReport, renderRevenueReport, reconcileFunding, forgeLaunchContextOf, revenueRuntimeOf, type ProcessRole } from "@last60/engine";
+import bs58 from "bs58";
+import { buildFundingPipeline, CREATOR_WALLET_STATUS_ID, resolveFundingActivation, readVaultWallets, walletsStatus, loadVaultKeypair, cancelCustodyRequest, createCustodyRequest, payoutWalletVerification, recoverAttribution, refreshCustodyFinality, renderFundingPipeline, submitCustodySignature, ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, buildRevenueReport, renderRevenueReport, reconcileFunding, forgeLaunchContextOf, revenueRuntimeOf, type ProcessRole } from "@last60/engine";
 
 const [cmd, ...args] = process.argv.slice(2);
 const print = (v: unknown) => console.log(JSON.stringify(jsonSafe(v), null, 2));
@@ -50,8 +51,12 @@ if (cmd === "check-config") {
   process.exit(failed ? 1 : 0);
 }
 
-const cfg = loadConfig("cli");
+let cfg = loadConfig("cli");
 const db = await connectDatabase(cfg.mongo.uri, cfg.mongo.dbName, { syncIndexes: false });
+{
+  const vault = await readVaultWallets(db);
+  if (vault.payout || vault.creator) cfg = loadConfig("cli", process.env, { vault });
+}
 await resolveFundingActivation(cfg, db, new RpcClient({ urls: cfg.solana.rpcUrls, timeoutMs: cfg.solana.timeoutMs, maxRps: 5 })).catch((err) => {
   console.error(`warning: funding policy activation slot unresolved (${String(err?.message ?? err)}); revenue commands are unavailable until the RPC is reachable`);
 });
@@ -130,6 +135,27 @@ try {
       print(await payoutWalletVerification(db, { address: cfg.payout.walletPublicKey, runtimeExpectedAddress: s.expectedPayoutPublicKey, rpc, payoutMode: s.payoutMode }));
       break;
     }
+    case "wallets": {
+      // Read-only: generated / configured wallets, their source and balance (never key material).
+      const rpc = new RpcClient({ urls: cfg.solana.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
+      print(await walletsStatus(db, cfg, (a) => rpc.getBalance(a)));
+      break;
+    }
+    case "wallet-export": {
+      // Backup on the REWARDS HOST (needs the vault key): prints the secret key of a generated wallet.
+      const role = args[0];
+      if (role !== "payout" && role !== "creator") throw new Error("usage: wallet-export <payout|creator> --yes");
+      if (!args.includes("--yes")) {
+        console.error(`This prints the PRIVATE KEY of the ${role} wallet. Anyone who sees it controls the wallet. Re-run with --yes.`);
+        process.exitCode = 2;
+        break;
+      }
+      const kp = await loadVaultKeypair(db, cfg, role);
+      if (!kp) throw new Error(`no generated ${role} wallet in the vault`);
+      console.log(JSON.stringify({ role, address: kp.publicKey.toBase58(), secretKeyBase58: bs58.encode(kp.secretKey), solanaKeypairJson: Array.from(kp.secretKey) }, null, 2));
+      await db.WalletVault.updateOne({ _id: role }, { $set: { lastExportedAt: new Date() }, $inc: { exports: 1 } });
+      break;
+    }
     case "creator-wallet": {
       // Read-only: what the rewards worker's creator wallet automation is doing (never key material).
       const [status, recent] = await Promise.all([
@@ -198,7 +224,7 @@ try {
       print(await db.AttributionRecovery.find(args[0] ? { attributionKey: args[0] } : {}).sort({ requestedAt: -1 }).limit(100).lean());
       break;
     default:
-      console.log("commands: status | check-config | pause <c> | resume <c> | requeue <id> | clear-halt <reason> | reconcile | round <n> | revenue [--json] | revenue-reconcile | payout-wallet | creator-wallet [n] | funding [--json] | custody-request <fundingKey> | custody-submit <custodyId> <signature> | custody-cancel <custodyId> <reason> | custody-refresh | attributions [status] | recover <attributionKey> [note] | recoveries [key] | gen-schedule-key");
+      console.log("commands: status | check-config | pause <c> | resume <c> | requeue <id> | clear-halt <reason> | reconcile | round <n> | revenue [--json] | revenue-reconcile | payout-wallet | wallets | wallet-export <role> --yes | creator-wallet [n] | funding [--json] | custody-request <fundingKey> | custody-submit <custodyId> <signature> | custody-cancel <custodyId> <reason> | custody-refresh | attributions [status] | recover <attributionKey> [note] | recoveries [key] | gen-schedule-key");
   }
 } finally {
   await db.close();
