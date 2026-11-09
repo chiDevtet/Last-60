@@ -1,5 +1,5 @@
 /** API entrypoint (PM2: last60-api). Holds no signing keys and no schedule key. */
-import { attachStoredMigration, ConfigError, connectDatabase, createLogger, createProvider, loadConfig, providerTargetFor, PublicData, RpcClient, SettingsStore, setRootLogger } from "@last60/engine";
+import { attachStoredMigration, ConfigError, connectDatabase, createLogger, createProvider, loadConfig, providerTargetFor, PublicData, resolveFundingActivation, RpcClient, SettingsStore, setRootLogger } from "@last60/engine";
 import { createApp } from "./app";
 import { AdminAuth } from "./auth";
 import { StreamHub } from "./stream";
@@ -17,15 +17,21 @@ try {
 const log = createLogger({ level: cfg.logLevel, name: "last60-api" });
 setRootLogger(log);
 if (cfg.schedule.encryptionKey) log.warn("SCHEDULE_ENCRYPTION_KEY is set in the API environment; it is not needed here — remove it to keep scheduling secrets out of this process");
+if (cfg.secrets.creatorWalletPrivateKey || cfg.secrets.creatorWalletKeypairPath) log.warn("a creator wallet key is configured in the API environment; remove it — only the rewards worker may hold it (it is never loaded here)");
 if (cfg.secrets.payoutWalletPrivateKey || cfg.secrets.payoutWalletKeypairPath) log.warn("a payout signing key is configured in the API environment; remove it — only the rewards worker's payout signer may hold it (it is never loaded here)");
 
 const db = await connectDatabase(cfg.mongo.uri, cfg.mongo.dbName, { syncIndexes: true });
+const rpc = new RpcClient({ urls: cfg.solana.rpcUrls, timeoutMs: cfg.solana.timeoutMs, maxRps: 5, logger: log });
+// The automatic forge_phase_aware_v2 activation slot is shared through the database (pinned by whichever process starts first).
+await resolveFundingActivation(cfg, db, rpc).catch((err) => {
+  log.fatal({ err: String(err?.message ?? err) }, "cannot resolve the funding policy activation slot");
+  process.exit(1);
+});
 const settings = new SettingsStore(db, cfg);
 const data = new PublicData(db, cfg, settings);
 const hub = new StreamHub(data, cfg.api.streamSnapshotIntervalMs);
 await hub.start();
 const auth = new AdminAuth(db, { appName: cfg.public.appName, adminWallets: cfg.api.adminWallets, secret: cfg.api.adminSessionSecret, ttlSeconds: cfg.api.adminSessionTtlSeconds });
-const rpc = new RpcClient({ urls: cfg.solana.rpcUrls, timeoutMs: cfg.solana.timeoutMs, maxRps: 5, logger: log });
 // Operator recovery re-runs the attribution against the configured launch (read-only provider load).
 const providerFor = async () => {
   const s = await settings.get(true);

@@ -172,6 +172,9 @@ export class RoundScheduler {
     const b = boundsOf(index, this.params);
     if (index < genesis) return boundsOf(genesis, this.params).startsAt;
     if (s.pauseScheduler) return now + 1000;
+    // The automatic activation slot is pinned at boot (resolveFundingActivation); until then the policy
+    // holds a placeholder and no round may be planned under it.
+    if (this.d.cfg.revenue?.activation?.pending) throw new Error("funding policy activation slot not resolved (resolveFundingActivation must run at boot)");
 
     await this.ensureRound(index);
     await this.markMissed(index, now);

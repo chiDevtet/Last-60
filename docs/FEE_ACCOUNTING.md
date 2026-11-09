@@ -295,10 +295,12 @@ Append-only, one row per economic fact, unique idempotency `key`:
 
 ## 8. Collection
 
-`FEE_COLLECTION_MODE=manual` (default, and required until the actual Forgepad signer, authority,
-beneficiary and claim permissions are independently verified): operators claim fees and fund the
-payout wallet. `auto_claim` (live mode only, bonding-curve claims) is gated by the same signer-side
-live/mainnet checks as payouts. Post-migration collection (DAMM v2 position claims, CPMM creator-fee
+`FEE_COLLECTION_MODE=manual` (default without a creator wallet key): operators claim fees and fund the
+payout wallet. `auto_claim` (live mode only, bonding-curve claims; the default when the launch creator
+wallet is configured, docs/CREATOR_WALLET.md) is gated by the same signer-side live/mainnet checks as
+payouts. Under `forge_phase_aware_v2` the claim lands in the creator's own wallet and the creator
+wallet automation sends the 75 % Last-60 share to the payout wallet (memo-correlated); under the legacy
+policy the claim is unwrapped into the payout wallet. Post-migration collection (DAMM v2 position claims, CPMM creator-fee
 collection, LP-lock fee collection) is manual; LAST60 observes and accounts it.
 
 ## 9. Reconciliation (`rewards/reconciliation.ts`)

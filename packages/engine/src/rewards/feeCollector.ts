@@ -1,9 +1,16 @@
 /**
  * Optional automatic fee collection (FEE_COLLECTION_MODE=auto_claim, live mode only).
- * Claims the beneficiary's accrued fees through the provider's official claim instruction and
- * unwraps WSOL straight into the payout wallet in the same transaction. Claiming is naturally
- * idempotent (a second claim simply claims the remainder), and the claimed amount is recorded
+ * Claims the beneficiary's accrued fees through the provider's official claim instruction. Claiming is
+ * naturally idempotent (a second claim simply claims the remainder), and the claimed amount is recorded
  * from the program's own event / vault delta when the transaction is ingested.
+ *
+ * Where the claim lands depends on the funding policy:
+ *   legacy_creator_fee_v1 — WSOL is unwrapped straight into the payout wallet (unchanged);
+ *   forge_phase_aware_v2  — WSOL is unwrapped into the CLAIMER's own wallet (the creator). The approved
+ *                           model splits what was collected 75 / 25, and only a memo- or
+ *                           same-transaction-correlated transfer is a contribution: the creator wallet
+ *                           automation (creator/creatorWallet.ts) then sends exactly the 75 % to the
+ *                           payout wallet, and the creator keeps 25 %.
  */
 import { ComputeBudgetProgram, Transaction, type Keypair, type PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
@@ -15,6 +22,8 @@ import { big, dec } from "../db/decimal";
 import type { LaunchProvider } from "../providers/LaunchProvider";
 import type { TerminalWriter } from "../terminal/terminal";
 import { ingestRawTransaction } from "../indexer/ingest";
+import { revenueRuntimeOf } from "../revenue/ingest";
+import { CURRENT_PHASE_AWARE_VERSION } from "../accounting/revenueStreams";
 import type { Clock } from "../util/time";
 import { rootLogger, type Logger } from "../util/logger";
 
@@ -42,7 +51,8 @@ export class FeeCollector {
     const s = await this.d.settings.get();
     // Claims are mainnet transactions too: the same signer-side live/mainnet gate applies.
     if (s.feeCollectionMode !== "auto_claim" || s.pausePayouts || liveSigningBlockReason(this.d.cfg, s)) return null;
-    if (!this.d.claimer || !this.d.payoutWallet) {
+    const phaseAware = this.d.cfg.revenue?.policy?.version === CURRENT_PHASE_AWARE_VERSION;
+    if (!this.d.claimer || (!phaseAware && !this.d.payoutWallet)) {
       if (!this.warned) this.log.warn("auto_claim enabled but no claim signer / payout wallet loaded");
       this.warned = true;
       return null;
@@ -53,7 +63,8 @@ export class FeeCollector {
     const state = await provider.getFeeSourceState();
     if (state.unclaimedQuote < this.d.cfg.feeCollection.minClaimLamports) return null;
 
-    const plan = await provider.buildClaimInstructions(this.d.claimer.publicKey, this.d.payoutWallet);
+    const destination = phaseAware ? this.d.claimer.publicKey : this.d.payoutWallet!;
+    const plan = await provider.buildClaimInstructions(this.d.claimer.publicKey, destination);
     const { blockhash, lastValidBlockHeight } = await this.d.rpc.getLatestBlockhash("confirmed");
     const tx = new Transaction({ feePayer: this.d.claimer.publicKey, recentBlockhash: blockhash }).add(
       ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 }),
@@ -80,9 +91,9 @@ export class FeeCollector {
       }
       if (st && (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized")) {
         const raw = await this.d.rpc.getTransactionRaw(signature, "confirmed");
-        if (raw) await ingestRawTransaction({ db: this.d.db, provider, terminal: this.d.terminal, minBuyQuote: s.minBuyQuote, log: this.log }, raw, { source: "catchup", commitment: "confirmed" });
+        if (raw) await ingestRawTransaction({ db: this.d.db, provider, terminal: this.d.terminal, minBuyQuote: s.minBuyQuote, log: this.log, revenue: revenueRuntimeOf(this.d.cfg) }, raw, { source: "catchup", commitment: "confirmed" });
         const claim: any = await this.d.db.FeeClaim.findOne({ signature }).lean();
-        if (claim) await this.d.terminal.feeClaimed(big(claim.quoteAmount), signature);
+        if (claim) await this.d.terminal.feeClaimed(big(claim.quoteAmount), signature, phaseAware ? "the creator wallet (the Last-60 share follows to the payout wallet)" : "the payout wallet");
         return signature;
       }
       if ((await this.d.rpc.getBlockHeight("confirmed")) > lastValidBlockHeight) break;

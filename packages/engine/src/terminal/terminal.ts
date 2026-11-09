@@ -87,8 +87,8 @@ export class TerminalWriter {
   missed(roundNumber: number) {
     return this.write("WARN", `Round #${roundNumber} window missed (engine unavailable); its buys and fees carry into the next round.`, { roundNumber, dedupeKey: `missed:${roundNumber}` });
   }
-  feeClaimed(amount: bigint, signature: string) {
-    return this.write("FEES", `Collected ${this.fmt(amount)} ${this.asset.symbol} of trading fees into the payout wallet.`, { signature, dedupeKey: `claim:${signature}` });
+  feeClaimed(amount: bigint, signature: string, into = "the payout wallet") {
+    return this.write("FEES", `Collected ${this.fmt(amount)} ${this.asset.symbol} of trading fees into ${into}.`, { signature, dedupeKey: `claim:${signature}` });
   }
   warn(message: string, dedupeKey?: string, roundNumber?: number) {
     return this.write("WARN", message, { dedupeKey, roundNumber });

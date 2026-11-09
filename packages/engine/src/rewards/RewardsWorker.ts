@@ -1,6 +1,6 @@
 /**
- * The rewards process: scheduler + payout executor + fee collector + reconciler, under a single
- * leader lease. It never depends on the API or the frontend being up.
+ * The rewards process: scheduler + payout executor + fee collector + creator wallet automation +
+ * reconciler, under a single leader lease. It never depends on the API or the frontend being up.
  */
 import type { Keypair } from "@solana/web3.js";
 import { PayoutSigner, type PayoutSignerStatus } from "../signer/payoutSigner";
@@ -20,6 +20,7 @@ import { PayoutExecutor } from "./payouts";
 import { FeeCollector } from "./feeCollector";
 import { Reconciler } from "./reconciliation";
 import { readMint } from "../providers/mint";
+import { CreatorWalletAutomation } from "../creator/creatorWallet";
 
 export interface RewardsWorkerDeps {
   db: Models;
@@ -30,6 +31,8 @@ export interface RewardsWorkerDeps {
   /** Sanitized signer status published for operators (wallet verification). */
   signerStatus?: PayoutSignerStatus | null;
   claimer: Keypair | null;
+  /** The launch creator's keypair for the creator wallet automation (docs/CREATOR_WALLET.md); null: idle. */
+  creator?: Keypair | null;
   rpc?: ChainRpc;
   provider?: LaunchProvider;
   clock?: Clock;
@@ -49,8 +52,10 @@ export class RewardsWorker {
   readonly payouts: PayoutExecutor;
   readonly fees: FeeCollector;
   readonly reconciler: Reconciler;
+  readonly creatorWallet: CreatorWalletAutomation;
   readonly signer: PayoutSigner | null;
   private plannedSinceClaim = false;
+  private claimedSinceCreatorPass = false;
   private stopped = false;
   /**
    * Fee claims (which wait for confirmation) and reconciliation (which can ingest thousands of
@@ -58,7 +63,7 @@ export class RewardsWorker {
    * inline they blocked the scheduler loop: a round whose private execution instant fell inside a
    * slow claim/reconciliation was executed late or, past the grace period, recorded as missed.
    */
-  private background: { claim: Promise<unknown> | null; recon: Promise<unknown> | null } = { claim: null, recon: null };
+  private background: { claim: Promise<unknown> | null; recon: Promise<unknown> | null; creator: Promise<unknown> | null } = { claim: null, recon: null, creator: null };
 
   constructor(private readonly d: RewardsWorkerDeps) {
     this.log = (d.log ?? rootLogger()).child({ component: "rewards" });
@@ -77,6 +82,7 @@ export class RewardsWorker {
     this.scheduler = new RoundScheduler({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, payer: signer, terminal: this.terminal, clock: this.clock, random: d.random, log: this.log, onRoundPlanned: () => (this.plannedSinceClaim = true) });
     this.payouts = new PayoutExecutor({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, signer, terminal: this.terminal, clock: this.clock, log: this.log, tokenInfo: (mint) => readMint(this.rpc, mint) });
     this.fees = new FeeCollector({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, claimer: d.claimer, payoutWallet, terminal: this.terminal, clock: this.clock, log: this.log });
+    this.creatorWallet = new CreatorWalletAutomation({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, creator: d.creator ?? null, terminal: this.terminal, clock: this.clock, log: this.log });
     this.reconciler = new Reconciler({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, payoutWallet: payoutWallet?.toBase58() ?? null, terminal: this.terminal, log: this.log });
   }
 
@@ -138,7 +144,7 @@ export class RewardsWorker {
 
   async run(signal: AbortSignal) {
     let failures = 0;
-    const t = { payouts: 0, recon: 0, claim: 0 };
+    const t = { payouts: 0, recon: 0, claim: 0, creator: 0 };
     const hb = this.startHeartbeat();
     while (!signal.aborted && !this.stopped) {
       const now = this.clock.now();
@@ -167,8 +173,19 @@ export class RewardsWorker {
           t.claim = now;
           this.background.claim = Promise.resolve()
             .then(() => this.fees.maybeClaim())
+            .then((sig) => {
+              if (sig) this.claimedSinceCreatorPass = true; // settle the new claim's Last-60 share promptly
+            })
             .catch((err) => this.log.warn({ err: String(err) }, "fee claim failed"))
             .finally(() => (this.background.claim = null));
+        }
+        if (this.d.cfg.creatorWallet?.automationEnabled && !this.background.creator && (this.claimedSinceCreatorPass || now - t.creator >= this.d.cfg.creatorWallet.intervalMs)) {
+          this.claimedSinceCreatorPass = false;
+          t.creator = now;
+          this.background.creator = Promise.resolve()
+            .then(() => this.creatorWallet.run())
+            .catch((err) => this.log.warn({ err: String(err?.message ?? err) }, "creator wallet pass failed"))
+            .finally(() => (this.background.creator = null));
         }
         if (!this.background.recon && now - t.recon >= this.d.cfg.reconciliation.intervalMs) {
           t.recon = now;
@@ -190,7 +207,7 @@ export class RewardsWorker {
       }
     }
     // Let in-flight background work settle (bounded) before giving up the lease.
-    const pending = [this.background.claim, this.background.recon].filter((x): x is Promise<unknown> => !!x);
+    const pending = [this.background.claim, this.background.recon, this.background.creator].filter((x): x is Promise<unknown> => !!x);
     if (pending.length) await Promise.race([Promise.allSettled(pending), new Promise((r) => setTimeout(r, 10_000))]);
     clearInterval(hb);
     if (this.leader) await heartbeat(this.d.db, "rewards", { status: "stopped" }).catch(() => undefined);

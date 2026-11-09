@@ -8,6 +8,16 @@ import { parseUnits, WSOL_MINT } from "@last60/shared";
 import { jsonSafe } from "../util/json";
 import { PayoutSigner } from "../signer/payoutSigner";
 import { APPROVED_SHARES, makeFundingPolicy, type FundingCorrelationMode, type FundingPolicy } from "../accounting/revenueStreams";
+import { loadKeypair } from "../chain/keys";
+
+/** Forgepad's PlatformConfig `platform_nft_wallet` (owner of Forge's platform LP Fee Key) on mainnet-beta. */
+export const FORGEPAD_PLATFORM_NFT_WALLET = "8KXqQwtrgtKxNfTWYsN34XNKXVQQR78JZfgbLorNL2n1";
+/**
+ * Placeholder activation slot of a forge_phase_aware_v2 policy whose slot is pinned at boot
+ * (`resolveFundingActivation`). Nothing is after it, and `revenueRuntimeOf` refuses to record revenue
+ * while it is pending, so an unresolved policy can never write a credit or fund a round.
+ */
+export const PENDING_ACTIVATION_SLOT = Number.MAX_SAFE_INTEGER;
 
 export type ProcessRole = "indexer" | "rewards" | "api" | "cli" | "test";
 
@@ -17,6 +27,19 @@ const bool = (def: boolean) =>
     .optional()
     .transform((v, ctx) => {
       if (v === undefined || v === "") return def;
+      if (/^(1|true|yes|on)$/i.test(v)) return true;
+      if (/^(0|false|no|off)$/i.test(v)) return false;
+      ctx.addIssue({ code: "custom", message: `expected boolean, got "${v}"` });
+      return z.NEVER;
+    });
+
+/** Like `bool` but `undefined` when unset, so a default can depend on other settings. */
+const optBool = () =>
+  z
+    .string()
+    .optional()
+    .transform((v, ctx): boolean | undefined => {
+      if (v === undefined || v === "") return undefined;
       if (/^(1|true|yes|on)$/i.test(v)) return true;
       if (/^(0|false|no|off)$/i.test(v)) return false;
       ctx.addIssue({ code: "custom", message: `expected boolean, got "${v}"` });
@@ -130,10 +153,14 @@ const RawEnv = z.object({
   /** CPMM AmmConfig.creator_fee_rate the migrated pool must use (millionths of swap value; Forgepad 500 = 0.05 %). */
   EXPECTED_CPMM_CREATOR_FEE_RATE: z.string().optional(),
 
-  // Phase-aware reward funding (docs/REWARD_FUNDING.md). Default: the legacy policy, unchanged.
-  // forge_phase_aware_v1 (PR #6) is retired and rejected; forge_phase_aware_v2 is the approved model.
-  REWARD_FUNDING_POLICY: z.enum(["legacy_creator_fee_v1", "forge_phase_aware_v1", "forge_phase_aware_v2"]).default("legacy_creator_fee_v1"),
-  /** Phase-aware policy governs slots strictly after this slot (required with forge_phase_aware_v2). */
+  // Phase-aware reward funding (docs/REWARD_FUNDING.md). Default: forge_phase_aware_v2, the approved model.
+  // legacy_creator_fee_v1 stays selectable; forge_phase_aware_v1 (PR #6) is retired and rejected.
+  REWARD_FUNDING_POLICY: z.enum(["legacy_creator_fee_v1", "forge_phase_aware_v1", "forge_phase_aware_v2"]).default("forge_phase_aware_v2"),
+  /**
+   * Phase-aware policy governs slots strictly after this slot. Unset (or "auto") under forge_phase_aware_v2:
+   * pinned ONCE to the finalized slot at the first start of any process and persisted in
+   * system_state.funding_policy_activation, so every process uses the same slot across restarts.
+   */
   REWARD_FUNDING_POLICY_ACTIVATION_SLOT: z.string().optional(),
   /** Wallets that receive Last-60 funding (native SOL to the wallet, SPL to token accounts it owns). */
   LAST60_FUNDING_DESTINATIONS: csv(pubkey),
@@ -178,8 +205,8 @@ const RawEnv = z.object({
   PAYOUT_WALLET_PUBLIC_KEY: optionalPubkey,
   PAYOUT_WALLET_PRIVATE_KEY: z.string().optional(),
   PAYOUT_WALLET_KEYPAIR_PATH: z.string().optional(),
-  /** Operator custody workflow (sweep requests and their verification). Disabled by default. */
-  LAST60_CUSTODY_ENABLED: bool(false),
+  /** Custody workflow (sweep requests and their verification). Default: on under forge_phase_aware_v2 with a payout wallet. */
+  LAST60_CUSTODY_ENABLED: optBool(),
   /** Hours an open custody (sweep) request stays bindable before it expires. */
   LAST60_CUSTODY_REQUEST_TTL_HOURS: int(168, 1, 8_760),
   /** Operator re-evaluation of unresolved Forge attributions. Disabled by default. */
@@ -192,10 +219,28 @@ const RawEnv = z.object({
   PAYOUT_CONCURRENCY: int(3, 1, 20),
   PAYOUT_MEMO: bool(true),
 
-  FEE_COLLECTION_MODE: z.enum(["manual", "auto_claim"]).default("manual"),
+  /** Default: auto_claim when the creator wallet is configured (LAST60_CREATOR_WALLET_*), else manual. */
+  FEE_COLLECTION_MODE: z.enum(["manual", "auto_claim"]).optional(),
   FEE_CLAIM_AUTHORITY_PRIVATE_KEY: z.string().optional(),
   FEE_CLAIM_AUTHORITY_KEYPAIR_PATH: z.string().optional(),
   FEE_CLAIM_MIN_LAMPORTS: bigintStr(10_000_000n),
+
+  /**
+   * Launch creator wallet automation (docs/CREATOR_WALLET.md). With the creator's key loaded in the
+   * rewards worker, Last-60 claims the bonding-curve creator fees, sends the 75 % Last-60 share to the
+   * payout wallet (memo-correlated to its claim) and sweeps Forge's post-migration creator payouts into
+   * the payout wallet (custody transfers) — no manual step. The key is loaded ONLY by the rewards worker.
+   */
+  LAST60_CREATOR_WALLET_ADDRESS: optionalPubkey,
+  LAST60_CREATOR_WALLET_PRIVATE_KEY: z.string().optional(),
+  LAST60_CREATOR_WALLET_KEYPAIR_PATH: z.string().optional(),
+  /** Default: on whenever the creator key is configured (requires forge_phase_aware_v2). */
+  LAST60_CREATOR_AUTOMATION_ENABLED: optBool(),
+  LAST60_CREATOR_AUTOMATION_INTERVAL_SECONDS: int(30, 5, 3_600),
+  /** Smaller outstanding amounts are left (a transfer would cost more in fees than it moves). */
+  LAST60_CREATOR_MIN_TRANSFER_LAMPORTS: bigintStr(10_000n),
+  /** SOL always left in the creator wallet for network fees. */
+  LAST60_CREATOR_FEE_RESERVE_LAMPORTS: bigintStr(2_000_000n),
 
   SCHEDULE_ENCRYPTION_KEY: z.string().optional(),
 
@@ -270,6 +315,24 @@ export interface RevenueConfig {
   custody: CustodyConfig;
   /** Operator recovery of unresolved Forge attributions (docs/REWARD_FUNDING.md §15). */
   recoveryEnabled: boolean;
+  /**
+   * Where the activation slot comes from: `configured` (REWARD_FUNDING_POLICY_ACTIVATION_SLOT), `auto`
+   * (pinned at first boot and persisted; `pending` until `resolveFundingActivation` ran) or
+   * `not_applicable` (legacy policy).
+   */
+  activation: { source: "configured" | "auto" | "not_applicable"; pending: boolean };
+}
+
+export interface CreatorWalletConfig {
+  /** Declared public address of the launch creator wallet (cross-checked against the key and the pool's on-chain creator). */
+  address: string | null;
+  /** The creator key is configured in this process (rewards worker only). */
+  keyConfigured: boolean;
+  /** Claim, 75 % settlement and post-migration sweeps run automatically (needs the key and forge_phase_aware_v2). */
+  automationEnabled: boolean;
+  intervalMs: number;
+  minTransferLamports: bigint;
+  feeReserveLamports: bigint;
 }
 
 export interface AppConfig {
@@ -326,6 +389,7 @@ export interface AppConfig {
     memo: boolean;
   };
   feeCollection: { mode: "manual" | "auto_claim"; minClaimLamports: bigint };
+  creatorWallet: CreatorWalletConfig;
   mongo: { uri: string; dbName: string };
   indexer: {
     pollIntervalMs: number;
@@ -361,6 +425,8 @@ export interface SecretSources {
   payoutWalletKeypairPath?: string;
   feeClaimAuthorityPrivateKey?: string;
   feeClaimAuthorityKeypairPath?: string;
+  creatorWalletPrivateKey?: string;
+  creatorWalletKeypairPath?: string;
 }
 
 export class ConfigError extends Error {
@@ -374,6 +440,7 @@ const SECRET_KEYS = [
   "LAST60_PAYOUT_WALLET_PRIVATE_KEY",
   "PAYOUT_WALLET_PRIVATE_KEY",
   "FEE_CLAIM_AUTHORITY_PRIVATE_KEY",
+  "LAST60_CREATOR_WALLET_PRIVATE_KEY",
   "SCHEDULE_ENCRYPTION_KEY",
   "ADMIN_SESSION_SECRET",
   "HELIUS_API_KEY",
@@ -433,6 +500,9 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
   const payoutWalletAddress = alias("LAST60_PAYOUT_WALLET_ADDRESS", raw.LAST60_PAYOUT_WALLET_ADDRESS, "PAYOUT_WALLET_PUBLIC_KEY", raw.PAYOUT_WALLET_PUBLIC_KEY);
   const payoutKey = alias("LAST60_PAYOUT_WALLET_PRIVATE_KEY", raw.LAST60_PAYOUT_WALLET_PRIVATE_KEY, "PAYOUT_WALLET_PRIVATE_KEY", raw.PAYOUT_WALLET_PRIVATE_KEY);
   const payoutKeyPath = alias("LAST60_PAYOUT_WALLET_KEYPAIR_PATH", raw.LAST60_PAYOUT_WALLET_KEYPAIR_PATH, "PAYOUT_WALLET_KEYPAIR_PATH", raw.PAYOUT_WALLET_KEYPAIR_PATH);
+  const creatorKey = raw.LAST60_CREATOR_WALLET_PRIVATE_KEY?.trim() ? raw.LAST60_CREATOR_WALLET_PRIVATE_KEY : undefined;
+  const creatorKeyPath = raw.LAST60_CREATOR_WALLET_KEYPAIR_PATH?.trim() ? raw.LAST60_CREATOR_WALLET_KEYPAIR_PATH : undefined;
+  const creatorKeySet = !!(creatorKey || creatorKeyPath);
 
   const rpcUrl = deriveRpcUrl(raw);
   if (!rpcUrl) problems.push("SOLANA_RPC_URL: is required (or set HELIUS_API_KEY)");
@@ -519,8 +589,8 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     }
     if (raw.FEE_COLLECTION_MODE === "auto_claim" && raw.LAUNCH_PROVIDER !== "mock") {
       // The payout signer never signs fee claims (narrow scope): auto_claim needs its own key.
-      const hasClaimKey = raw.FEE_CLAIM_AUTHORITY_PRIVATE_KEY || raw.FEE_CLAIM_AUTHORITY_KEYPAIR_PATH;
-      if (!hasClaimKey) problems.push("FEE_CLAIM_AUTHORITY_PRIVATE_KEY or FEE_CLAIM_AUTHORITY_KEYPAIR_PATH: auto_claim needs the fee beneficiary's own signing key (the payout wallet key never signs fee claims)");
+      const hasClaimKey = raw.FEE_CLAIM_AUTHORITY_PRIVATE_KEY || raw.FEE_CLAIM_AUTHORITY_KEYPAIR_PATH || (raw.FEE_BENEFICIARY_ROLE === "creator" && creatorKeySet);
+      if (!hasClaimKey) problems.push("FEE_CLAIM_AUTHORITY_PRIVATE_KEY or FEE_CLAIM_AUTHORITY_KEYPAIR_PATH (or, for FEE_BENEFICIARY_ROLE=creator, LAST60_CREATOR_WALLET_*): auto_claim needs the fee beneficiary's own signing key (the payout wallet key never signs fee claims)");
     }
   }
   if (role === "api" && raw.ADMIN_WALLETS.length > 0) {
@@ -540,7 +610,7 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     const st = PayoutSigner.load({ privateKey: payoutKey, keypairPath: payoutKeyPath }, payoutWalletAddress ?? null).status;
     if (st.code !== "ok") problems.push(`LAST60_PAYOUT_WALLET_PRIVATE_KEY: ${st.message}`);
   }
-  if (raw.LAST60_CUSTODY_ENABLED && !payoutWalletAddress) problems.push("LAST60_CUSTODY_ENABLED: requires LAST60_PAYOUT_WALLET_ADDRESS (custody transfers must reach the dedicated payout wallet)");
+  if (raw.LAST60_CUSTODY_ENABLED === true && !payoutWalletAddress) problems.push("LAST60_CUSTODY_ENABLED: requires LAST60_PAYOUT_WALLET_ADDRESS (custody transfers must reach the dedicated payout wallet)");
 
   const expectedInt = (name: string, v: string | undefined, max: number): number | null => {
     if (v === undefined || v.trim() === "") return null;
@@ -576,19 +646,55 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     }
   };
   let activationSlot: number | null = null;
-  if (raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT !== undefined && raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT.trim() !== "") {
+  if (raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT !== undefined && !["", "auto"].includes(raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT.trim().toLowerCase())) {
     if (!/^\d+$/.test(raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT.trim())) problems.push("REWARD_FUNDING_POLICY_ACTIVATION_SLOT: must be a non-negative integer slot");
     else activationSlot = Number(raw.REWARD_FUNDING_POLICY_ACTIVATION_SLOT.trim());
   }
   if (raw.REWARD_FUNDING_POLICY === "forge_phase_aware_v1") problems.push("REWARD_FUNDING_POLICY: forge_phase_aware_v1 is retired (it treated the creator's 50 % LP allocation as Forge-funded, allowed other percentages and payable exclusive_window links); use forge_phase_aware_v2 — see docs/REWARD_FUNDING.md");
   const phaseAware = raw.REWARD_FUNDING_POLICY === "forge_phase_aware_v2";
-  if (phaseAware && activationSlot === null) problems.push("REWARD_FUNDING_POLICY_ACTIVATION_SLOT: is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 (rounds snapshotting after it are funded by verified contributions only)");
+  // No slot under v2: pinned at the first boot and persisted (resolveFundingActivation), i.e. "at the
+  // deployment that enables it" — never a historical slot, so legacy-distributed fees are never re-funded.
+  const activationAuto = phaseAware && activationSlot === null;
+  // Forgepad's platform Fee Key owner is a known mainnet fact; it is still verified against the
+  // PlatformConfig `platform_nft_wallet` on chain (a mismatch leaves Forge LP claims unresolved).
+  const forgeBeneficiary = raw.FORGE_PLATFORM_LP_BENEFICIARY ?? (phaseAware && raw.SOLANA_CLUSTER === "mainnet-beta" ? FORGEPAD_PLATFORM_NFT_WALLET : undefined);
+  if (payoutWalletAddress && !raw.FORGE_PLATFORM_LP_BENEFICIARY && forgeBeneficiary && payoutWalletAddress === forgeBeneficiary) problems.push("LAST60_PAYOUT_WALLET_ADDRESS: must be a dedicated wallet, not Forge's platform wallet");
+  const custodyEnabled = raw.LAST60_CUSTODY_ENABLED ?? (phaseAware && !!payoutWalletAddress);
+  // Launch creator wallet automation.
+  if (creatorKey && creatorKeyPath) problems.push("Set only one of LAST60_CREATOR_WALLET_PRIVATE_KEY / LAST60_CREATOR_WALLET_KEYPAIR_PATH");
+  const creatorAutomation = raw.LAST60_CREATOR_AUTOMATION_ENABLED ?? creatorKeySet;
+  if (creatorAutomation && role === "rewards") {
+    if (!creatorKeySet) problems.push("LAST60_CREATOR_AUTOMATION_ENABLED: requires LAST60_CREATOR_WALLET_KEYPAIR_PATH or LAST60_CREATOR_WALLET_PRIVATE_KEY in the rewards worker");
+    if (!phaseAware) problems.push("LAST60_CREATOR_AUTOMATION_ENABLED: requires REWARD_FUNDING_POLICY=forge_phase_aware_v2 (the 75 % / custody flows only fund rounds under the approved model)");
+    if (!payoutWalletAddress) problems.push("LAST60_CREATOR_AUTOMATION_ENABLED: requires LAST60_PAYOUT_WALLET_ADDRESS (the creator wallet only ever sends to the dedicated payout wallet)");
+    if (raw.LAST60_CUSTODY_ENABLED === false) problems.push("LAST60_CREATOR_AUTOMATION_ENABLED: requires the custody workflow (unset LAST60_CUSTODY_ENABLED or set it to true)");
+    if (raw.FEE_BENEFICIARY_ROLE !== "creator") problems.push('LAST60_CREATOR_AUTOMATION_ENABLED: requires FEE_BENEFICIARY_ROLE=creator');
+  }
+  const creatorAddress = raw.LAST60_CREATOR_WALLET_ADDRESS ?? null;
+  for (const [name, a] of [["LAST60_PAYOUT_WALLET_ADDRESS", payoutWalletAddress], ["FORGE_PLATFORM_LP_BENEFICIARY", forgeBeneficiary]] as const) {
+    if (creatorAddress && a && creatorAddress === a) problems.push(`LAST60_CREATOR_WALLET_ADDRESS: must not be ${name} (the creator wallet sends TO the payout wallet)`);
+  }
+  // Startup validation of the creator key (rewards worker only). Messages never quote the key.
+  if (role === "rewards" && creatorKeySet && !(creatorKey && creatorKeyPath)) {
+    const keyVar = creatorKeyPath ? "LAST60_CREATOR_WALLET_KEYPAIR_PATH" : "LAST60_CREATOR_WALLET_PRIVATE_KEY";
+    try {
+      const kp = loadKeypair({ privateKey: creatorKey, keypairPath: creatorKeyPath }, null, "creator wallet");
+      const derived = kp.publicKey.toBase58();
+      if (creatorAddress && derived !== creatorAddress) problems.push(`${keyVar}: the key derives a different address than LAST60_CREATOR_WALLET_ADDRESS`);
+      if (payoutWalletAddress && derived === payoutWalletAddress) problems.push(`${keyVar}: is the payout wallet key; the creator wallet must be the launch creator's own wallet`);
+    } catch (e) {
+      const m = String((e as Error)?.message ?? "");
+      problems.push(`${keyVar}: ${/readable by group|ENOENT|EACCES/.test(m) ? (m.includes("readable by group") ? "keypair file is group/other readable (chmod 600)" : "keypair file cannot be read") : "not a valid 64-byte secret key (base58 or JSON array)"}`);
+    }
+  }
   // Under the approved policy the dedicated payout wallet is itself a funding destination (a bonding-curve
   // contribution sent straight to it needs no custody transfer); it is added once, never duplicated.
   const fundingDestinations = [...new Set([...raw.LAST60_FUNDING_DESTINATIONS, ...(phaseAware && payoutWalletAddress ? [payoutWalletAddress] : [])])];
-  if (phaseAware && fundingDestinations.length === 0) problems.push("LAST60_FUNDING_DESTINATIONS: at least one destination wallet is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 (the dedicated LAST60_PAYOUT_WALLET_ADDRESS counts)");
-  if (phaseAware && !raw.FORGE_PLATFORM_LP_BENEFICIARY) problems.push("FORGE_PLATFORM_LP_BENEFICIARY: is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 (the creator's 50 % LP allocation is only verifiable against Forge's platform Fee Key owner)");
-  if (raw.FORGE_PLATFORM_LP_BENEFICIARY && raw.LAST60_FUNDING_DESTINATIONS.includes(raw.FORGE_PLATFORM_LP_BENEFICIARY)) problems.push("LAST60_FUNDING_DESTINATIONS: must not include FORGE_PLATFORM_LP_BENEFICIARY (a self-transfer is not a contribution)");
+  // Required where funding is recorded / consumed (indexer, rewards); the API and CLI only report.
+  const fundingRole = role === "indexer" || role === "rewards" || role === "test";
+  if (phaseAware && fundingRole && fundingDestinations.length === 0) problems.push("LAST60_FUNDING_DESTINATIONS: at least one destination wallet is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 (the dedicated LAST60_PAYOUT_WALLET_ADDRESS counts)");
+  if (phaseAware && fundingRole && !forgeBeneficiary) problems.push("FORGE_PLATFORM_LP_BENEFICIARY: is required with REWARD_FUNDING_POLICY=forge_phase_aware_v2 outside mainnet-beta (the creator's 50 % LP allocation is only verifiable against Forge's platform Fee Key owner; on mainnet-beta it defaults to Forgepad's)");
+  if (forgeBeneficiary && raw.LAST60_FUNDING_DESTINATIONS.includes(forgeBeneficiary)) problems.push("LAST60_FUNDING_DESTINATIONS: must not include FORGE_PLATFORM_LP_BENEFICIARY (a self-transfer is not a contribution)");
   const bondingBps = raw.BONDING_CREATOR_FEE_LAST60_PERCENTAGE.trim() === "0" ? 0 : share("BONDING_CREATOR_FEE_LAST60_PERCENTAGE", raw.BONDING_CREATOR_FEE_LAST60_PERCENTAGE);
   const lpBps = raw.FORGE_PLATFORM_LP_LAST60_PERCENTAGE.trim() === "0" ? 0 : share("FORGE_PLATFORM_LP_LAST60_PERCENTAGE", raw.FORGE_PLATFORM_LP_LAST60_PERCENTAGE);
   // The approved economic model is fixed; the variables exist only to make the values explicit.
@@ -596,7 +702,7 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
   if (lpBps !== APPROVED_SHARES.forgeLpLast60Bps) problems.push(`FORGE_PLATFORM_LP_LAST60_PERCENTAGE: the approved model is 50 (the creator's allocation of each claimed Forge LP fee); got ${raw.FORGE_PLATFORM_LP_LAST60_PERCENTAGE}`);
   let policy: FundingPolicy | null = null;
   try {
-    policy = makeFundingPolicy({ version: raw.REWARD_FUNDING_POLICY, activationSlot: phaseAware ? activationSlot : null, bondingCreatorFeeLast60Bps: bondingBps, forgeLpLast60Bps: lpBps });
+    policy = makeFundingPolicy({ version: raw.REWARD_FUNDING_POLICY, activationSlot: phaseAware ? (activationSlot ?? PENDING_ACTIVATION_SLOT) : null, bondingCreatorFeeLast60Bps: bondingBps, forgeLpLast60Bps: lpBps });
   } catch (e) {
     if (!problems.length) problems.push(`REWARD_FUNDING_POLICY: ${(e as Error).message}`);
   }
@@ -668,7 +774,15 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
       concurrency: raw.PAYOUT_CONCURRENCY,
       memo: raw.PAYOUT_MEMO,
     },
-    feeCollection: { mode: raw.FEE_COLLECTION_MODE, minClaimLamports: raw.FEE_CLAIM_MIN_LAMPORTS },
+    feeCollection: { mode: raw.FEE_COLLECTION_MODE ?? (creatorAutomation || creatorAddress ? "auto_claim" : "manual"), minClaimLamports: raw.FEE_CLAIM_MIN_LAMPORTS },
+    creatorWallet: {
+      address: creatorAddress,
+      keyConfigured: creatorKeySet,
+      automationEnabled: creatorAutomation && creatorKeySet && phaseAware && !!payoutWalletAddress,
+      intervalMs: raw.LAST60_CREATOR_AUTOMATION_INTERVAL_SECONDS * 1000,
+      minTransferLamports: raw.LAST60_CREATOR_MIN_TRANSFER_LAMPORTS,
+      feeReserveLamports: raw.LAST60_CREATOR_FEE_RESERVE_LAMPORTS,
+    },
     mongo: { uri: raw.MONGODB_URI, dbName: raw.MONGODB_DB_NAME },
     indexer: {
       pollIntervalMs: raw.INDEXER_POLL_INTERVAL_MS,
@@ -698,10 +812,11 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     revenue: {
       policy: policy!,
       fundingDestinations,
-      forgePlatformLpBeneficiary: raw.FORGE_PLATFORM_LP_BENEFICIARY ?? null,
+      forgePlatformLpBeneficiary: forgeBeneficiary ?? null,
       correlationMode: raw.FUNDING_CORRELATION_MODE,
-      custody: { enabled: raw.LAST60_CUSTODY_ENABLED, payoutWallet: payoutWalletAddress ?? null, requestTtlMs: raw.LAST60_CUSTODY_REQUEST_TTL_HOURS * 3_600_000 },
+      custody: { enabled: custodyEnabled, payoutWallet: payoutWalletAddress ?? null, requestTtlMs: raw.LAST60_CUSTODY_REQUEST_TTL_HOURS * 3_600_000 },
       recoveryEnabled: raw.LAST60_ATTRIBUTION_RECOVERY_ENABLED,
+      activation: { source: !phaseAware ? "not_applicable" : activationAuto ? "auto" : "configured", pending: activationAuto },
     },
     terminal: { retentionDays: raw.TERMINAL_RETENTION_DAYS },
     public: { appName: raw.NEXT_PUBLIC_APP_NAME, explorer: raw.NEXT_PUBLIC_SOLANA_EXPLORER },
@@ -710,6 +825,8 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
       payoutWalletKeypairPath: payoutKeyPath,
       feeClaimAuthorityPrivateKey: raw.FEE_CLAIM_AUTHORITY_PRIVATE_KEY,
       feeClaimAuthorityKeypairPath: raw.FEE_CLAIM_AUTHORITY_KEYPAIR_PATH,
+      creatorWalletPrivateKey: creatorKey,
+      creatorWalletKeypairPath: creatorKeyPath,
     },
   };
 }
@@ -736,6 +853,7 @@ export function redactConfig(cfg: AppConfig) {
     secrets: {
       payoutWalletKey: secrets.payoutWalletPrivateKey ? "[env]" : secrets.payoutWalletKeypairPath ? "[file]" : null,
       feeClaimKey: secrets.feeClaimAuthorityPrivateKey ? "[env]" : secrets.feeClaimAuthorityKeypairPath ? "[file]" : null,
+      creatorWalletKey: secrets.creatorWalletPrivateKey ? "[env]" : secrets.creatorWalletKeypairPath ? "[file]" : null,
     },
   });
 }

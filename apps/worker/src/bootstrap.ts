@@ -1,5 +1,5 @@
 /** Shared process bootstrap: validated config, structured logging, DB, settings, health port. */
-import { ConfigError, connectDatabase, createLogger, loadConfig, SettingsStore, setRootLogger, type ProcessRole, type Database, type AppConfig, type Logger } from "@last60/engine";
+import { ConfigError, connectDatabase, createLogger, loadConfig, resolveFundingActivation, RpcClient, SettingsStore, setRootLogger, type ProcessRole, type Database, type AppConfig, type Logger } from "@last60/engine";
 
 export interface Booted {
   cfg: AppConfig;
@@ -23,6 +23,15 @@ export async function boot(role: ProcessRole, name: string): Promise<Booted> {
   const log = createLogger({ level: cfg.logLevel, name });
   setRootLogger(log);
   const db = await connectDatabase(cfg.mongo.uri, cfg.mongo.dbName, { syncIndexes: true });
+  // forge_phase_aware_v2 without an explicit activation slot: pin it once (first start of any process)
+  // and share it through the database. Nothing is recorded or planned until this has succeeded.
+  try {
+    const act = await resolveFundingActivation(cfg, db, new RpcClient({ urls: cfg.solana.rpcUrls, timeoutMs: cfg.solana.timeoutMs, maxRps: 5, logger: log }));
+    if (act.source === "auto") log[act.pinnedNow ? "warn" : "info"]({ activationSlot: act.slot, pinnedAt: act.pinnedAt }, act.pinnedNow ? "forge_phase_aware_v2 activation slot pinned now (first start); rounds after it are funded by verified contributions" : "forge_phase_aware_v2 activation slot (auto, pinned earlier)");
+  } catch (err) {
+    log.fatal({ err: String((err as Error)?.message ?? err) }, "cannot resolve the funding policy activation slot; retrying on restart (or set REWARD_FUNDING_POLICY_ACTIVATION_SLOT)");
+    process.exit(1);
+  }
   const settings = new SettingsStore(db, cfg);
   const ctrl = new AbortController();
   const stop = (sig: string) => {

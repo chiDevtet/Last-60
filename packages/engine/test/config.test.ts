@@ -14,6 +14,8 @@ const base = {
   MONGODB_URI: "mongodb://localhost/x",
   TOKEN_MINT: "So11111111111111111111111111111111111111112",
   POOL_ADDRESS: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+  // A devnet setup has no Forge platform wallet: it selects the legacy policy (the default is forge_phase_aware_v2).
+  REWARD_FUNDING_POLICY: "legacy_creator_fee_v1",
 };
 
 describe("environment validation", () => {

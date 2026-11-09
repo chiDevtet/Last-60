@@ -25,7 +25,7 @@ import { rig, startDb, stopDb, wallet } from "./harness";
 beforeAll(startDb, 120_000);
 afterAll(stopDb);
 
-const base = { SOLANA_CLUSTER: "devnet", SOLANA_RPC_URL: "https://api.devnet.solana.com", MONGODB_URI: "mongodb://localhost/x", TOKEN_MINT: "So11111111111111111111111111111111111111112", POOL_ADDRESS: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin", SCHEDULE_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64") };
+const base = { SOLANA_CLUSTER: "devnet", SOLANA_RPC_URL: "https://api.devnet.solana.com", MONGODB_URI: "mongodb://localhost/x", TOKEN_MINT: "So11111111111111111111111111111111111111112", POOL_ADDRESS: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin", SCHEDULE_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"), REWARD_FUNDING_POLICY: "legacy_creator_fee_v1" };
 const secretOf = (kp: Keypair) => bs58.encode(kp.secretKey);
 /** Every textual form of a secret key that must never appear anywhere. */
 const forms = (kp: Keypair) => [secretOf(kp), JSON.stringify([...kp.secretKey]), Buffer.from(kp.secretKey).toString("base64"), Buffer.from(kp.secretKey).toString("hex"), secretOf(kp).slice(0, 24)];

@@ -52,9 +52,9 @@ idempotent ATA create + one `TransferChecked` (SPL), and an optional memo; recip
 exactly as authorized. Anything else — a second transfer, another recipient, another amount, any other
 program or System instruction — is refused.
 
-It never signs fee claims (`FEE_COLLECTION_MODE=auto_claim` now requires its own
-`FEE_CLAIM_AUTHORITY_*` key), custody sweeps (Last-60 cannot sign for creator wallets and never stores
-their keys), or arbitrary transfers, and it cannot change allocations, attribution, eligibility,
+It never signs fee claims (`FEE_COLLECTION_MODE=auto_claim` requires its own key: `FEE_CLAIM_AUTHORITY_*`
+or the creator wallet key), custody sweeps (those are signed by the custodian — or, when configured, by
+the separate creator wallet automation with the creator's own key, docs/CREATOR_WALLET.md), or arbitrary transfers, and it cannot change allocations, attribution, eligibility,
 ownership or custody records. No API accepts a recipient or amount to pay.
 
 The key lives in a JS private field; `JSON.stringify`, `String()` and `util.inspect` render only the

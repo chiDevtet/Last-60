@@ -325,7 +325,7 @@ Ownership is always read from the actual migration transaction's lock records �
 
 `REWARD_FUNDING_POLICY` selects a versioned policy; every round stores its snapshot (`fundingPolicy`).
 
-| | `legacy_creator_fee_v1` (default) | `forge_phase_aware_v2` (snapshot slot > activation slot) |
+| | `legacy_creator_fee_v1` | `forge_phase_aware_v2` (default; snapshot slot > activation slot) |
 |---|---|---|
 | Creator-allocated fees | `REWARD_PERCENTAGE` of the period's verified fees (unchanged) | counted only up to the activation slot (the round's `legacyFeeSlotCap`); later ones are recorded and reported (`creatorFeesRecordedNotDistributed`), never distributed |
 | Contributions | recorded, reported, never consumed | payable v2 credits in the payout asset, not yet consumed, linked by same transaction, memo or `forge_distribution_sequence`, whose **transfer and original claim transactions are both finalized and successful**, within the **per-claim cap** → 100 % to the reward pool (`REWARD_PERCENTAGE` is not applied: they already are the reward share) |
@@ -351,14 +351,14 @@ recorded and reported, never converted).
 
 | Variable | Meaning |
 |---|---|
-| `REWARD_FUNDING_POLICY` | `legacy_creator_fee_v1` (default) or `forge_phase_aware_v2` (approved model); `forge_phase_aware_v1` is rejected |
-| `REWARD_FUNDING_POLICY_ACTIVATION_SLOT` | required for v2; set it to a slot **at or after** the deployment that enables it (credits recorded before activation are permanently ineligible — fail closed) |
+| `REWARD_FUNDING_POLICY` | `forge_phase_aware_v2` (default, approved model) or `legacy_creator_fee_v1`; `forge_phase_aware_v1` is rejected |
+| `REWARD_FUNDING_POLICY_ACTIVATION_SLOT` | unset / `auto` (default): pinned **once** to the finalized slot at the first start of any process, stored in `system_state.funding_policy_activation` and read by every later start of every process (`config/activation.ts`) — i.e. exactly "at the deployment that enables it". Until it is resolved nothing is recorded and no round is planned. An explicit slot overrides it (at or after the switch-over; credits recorded before activation are permanently ineligible — fail closed) |
 | `LAST60_FUNDING_DESTINATIONS` | Last-60 funding wallets (comma separated); also watched by the indexer. Under v2 the dedicated `LAST60_PAYOUT_WALLET_ADDRESS` is added automatically (once), so a contribution sent straight to it needs no custody transfer; v2 requires at least one destination (the payout wallet counts) |
 | `LAST60_PAYOUT_WALLET_ADDRESS` (+ `…_KEYPAIR_PATH` / `…_PRIVATE_KEY`, rewards only) | the dedicated payout wallet (§16, docs/PAYOUT_WALLET.md); legacy `PAYOUT_WALLET_*` names are aliases |
-| `LAST60_CUSTODY_ENABLED` | `false` (default): no custody request can be opened or bound. Rounds still require verified custody (direct contributions into the payout wallet are verified by their own transfer) |
+| `LAST60_CUSTODY_ENABLED` | default **on** under v2 with a payout wallet, off otherwise; `false`: no custody request can be opened or bound. Rounds still require verified custody (direct contributions into the payout wallet are verified by their own transfer) |
 | `LAST60_CUSTODY_REQUEST_TTL_HOURS` | how long an open custody request can be bound (default 168) |
 | `LAST60_ATTRIBUTION_RECOVERY_ENABLED` | `false` (default): every recovery request is refused (and audited) |
-| `FORGE_PLATFORM_LP_BENEFICIARY` | Forge's platform Fee Key owner; must equal PlatformConfig `platform_nft_wallet` (Forgepad `8KXqQwtr…`); **required** for v2. Also the source wallet of Forge's creator distributions (§4a): once a LaunchLab → CPMM migration is verified, the indexer watches this wallet's associated token account for the launch token from the migration slot |
+| `FORGE_PLATFORM_LP_BENEFICIARY` | Forge's platform Fee Key owner; must equal PlatformConfig `platform_nft_wallet` (Forgepad `8KXqQwtr…`, the default on mainnet-beta under v2 — still verified on chain); **required** for v2 by the indexer / rewards worker outside mainnet-beta. Also the source wallet of Forge's creator distributions (§4a): once a LaunchLab → CPMM migration is verified, the indexer watches this wallet's associated token account for the launch token from the migration slot |
 | `BONDING_CREATOR_FEE_LAST60_PERCENTAGE` | must be 75 (approved model; any other value is a config error) |
 | `FORGE_PLATFORM_LP_LAST60_PERCENTAGE` | must be 50 (approved model; any other value is a config error) |
 | `FUNDING_CORRELATION_MODE` | `strict` (default: same tx or memo) or `exclusive_window` (extra links recorded, never payable) |
@@ -415,7 +415,8 @@ What remains outside this stream:
 1. **Bonding curve (75 %).** The creator claims 100 % of bonding creator fees to their own wallet; the
    75 % Last-60 contribution is a transfer the **creator** makes (same transaction as the claim, or
    with a `last60:v1:<claim>` memo) into a Last-60 funding destination. Until then those collections
-   reconcile as `awaiting_distribution`. (Not part of Forge's claimer.)
+   reconcile as `awaiting_distribution`. (Not part of Forge's claimer.) With the creator wallet
+   automation Last-60 makes both the claim and that memo transfer itself (docs/CREATOR_WALLET.md).
 2. **Optional, never required** — things on Forge's side that would let Last-60 credit more of what it
    already pays: a SOL basis measured from the harvest transaction instead of the API estimate (the
    SOL leg would then never exceed the half), and paying in the claimed mint instead of swapping a
@@ -454,7 +455,12 @@ bun run cli recoveries [attributionKey]         # append-only recovery audit
 
 Rollout:
 
-1. Deploy with the default legacy policy; set `LAST60_FUNDING_DESTINATIONS`,
+Since the creator wallet change, `forge_phase_aware_v2` is the default and its activation slot is pinned
+automatically at the first start; with the creator key configured, claims, the 75 % settlement and the
+post-migration sweeps are automatic (docs/CREATOR_WALLET.md). The staged rollout below is still
+available: start with `REWARD_FUNDING_POLICY=legacy_creator_fee_v1` and switch later.
+
+1. Deploy with `REWARD_FUNDING_POLICY=legacy_creator_fee_v1`; set `LAST60_FUNDING_DESTINATIONS`,
    `FORGE_PLATFORM_LP_BENEFICIARY`, `EXPECTED_CPMM_CREATOR_FEE_RATE`. Revenue events, reconciliations,
    Forge creator-distribution attributions and (ineligible) links are recorded; rounds are unchanged.
 2. Confirm with `bun run cli revenue` on real Forge harvests that LP claims reconcile, Forge's creator
@@ -462,9 +468,9 @@ Rollout:
    (`allocationOwner: creator`, source = the Fee Key holder, destination = the creator), and review every
    `unresolved` reason. Install the dedicated payout wallet (docs/PAYOUT_WALLET.md) and, when you are
    ready to collect creators' custody transfers, set `LAST60_CUSTODY_ENABLED=true` (§14).
-3. Choose an activation slot at or after the switch-over and set `REWARD_FUNDING_POLICY=forge_phase_aware_v2`
-   with `REWARD_FUNDING_POLICY_ACTIVATION_SLOT` on **both** workers (and the CLI). Rounds whose
-   snapshot is after it are funded by verified contributions only.
+3. Remove `REWARD_FUNDING_POLICY` (or set `forge_phase_aware_v2`) on **every** process and restart; leave
+   `REWARD_FUNDING_POLICY_ACTIVATION_SLOT` unset to pin it at that restart, or set a slot at or after the
+   switch-over. Rounds whose snapshot is after it are funded by verified contributions only.
 4. Watch the reconciler (`FUNDING_CREDITED` vs consumed credits) and the revenue report.
 
 ## 13. Known limitations
@@ -492,8 +498,9 @@ Rollout:
 * Reconciliation passes for `last60_destination` inflows are per launch and scan that launch's unlinked
   inflows / unreconciled claims (bounded to 500 per pass); the Forge creator route uses its own indexed
   queue (§4a). At very high claim counts consider archiving fully reconciled claims.
-* Custody (§14) is creator-initiated: Last-60 cannot move SOL out of a creator's wallet. A creator who
-  never sends the custody transfer leaves the contribution attributed but unfunded (reported as
+* Without the creator wallet automation (docs/CREATOR_WALLET.md), custody (§14) is creator-initiated:
+  Last-60 cannot move SOL out of a creator's wallet. A creator who never sends the custody transfer
+  leaves the contribution attributed but unfunded (reported as
   "attributed, awaiting custody"; it never funds a round).
 * A contribution funds a round only when custody covers its whole creditable amount; partial custody is
   recorded and the contribution waits for the remainder.
@@ -507,8 +514,10 @@ Rollout:
 An attributed contribution says **who contributed**; it does not put SOL in the wallet that pays
 rewards. Forge's existing collector pays the creator's 50 % to the **creator's** wallet (§4a) — that
 receipt is the contribution and is credited once (`reward_funding`, route `forge_creator_distribution`).
-Last-60 cannot sign for the creator's wallet and never stores creator keys, so the creator (or whoever
-holds the contribution) must send it to the dedicated payout wallet. That transfer is a **custody
+Unless the operator installs the creator's key for the creator wallet automation (docs/CREATOR_WALLET.md —
+it then opens the request and signs the sweep itself, through exactly this workflow, method
+`creator_wallet_sweep`), Last-60 cannot sign for the creator's wallet, so the creator (or whoever holds
+the contribution) must send it to the dedicated payout wallet. That transfer is a **custody
 transfer**: it moves the existing contribution; it never creates another `reward_funding` credit.
 
 ### Custody modes (`custodyRequirement`)
@@ -520,7 +529,7 @@ transfer**: it moves the existing contribution; it never creates another `reward
 | `last60_destination` credit into another funding destination | that destination wallet | `transfer` | a verified custody transfer destination → payout wallet |
 | not payable, not native SOL, no destination recorded, or no payout wallet configured | — | `not_applicable` | never funds a round |
 
-### Workflow (operator-authorized, creator-initiated)
+### Workflow (operator-authorized, creator-initiated — or fully automatic with the creator wallet automation)
 
 1. **Request** (operator, `LAST60_CUSTODY_ENABLED=true`): `custody-request <fundingKey>` or admin
    "Open sweep request". It names ONE credit; the amount (the credit's **outstanding**, not yet

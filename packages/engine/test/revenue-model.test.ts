@@ -22,7 +22,9 @@ import {
   type TransferFact,
 } from "../src/accounting/revenueStreams";
 import { extractRevenue, fundingMemoOf, type RevenueLaunchFacts } from "../src/revenue/decode";
-import { ConfigError, loadConfig } from "../src/config/env";
+import { ConfigError, FORGEPAD_PLATFORM_NFT_WALLET, loadConfig, PENDING_ACTIVATION_SLOT } from "../src/config/env";
+import { revenueRuntimeOf } from "../src/revenue/ingest";
+import { Keypair } from "@solana/web3.js";
 import { addr, buildTx, memo, sig, splTransfer, splTransferChecked, systemTransfer } from "./revenueTx";
 
 const SOL = 1_000_000_000n;
@@ -254,22 +256,40 @@ describe("configuration", () => {
       return (e as ConfigError).problems;
     }
   };
-  test("default: legacy policy, REWARD_PERCENTAGE semantics unchanged, Forge's 75 / 50 recorded as policy parameters", () => {
-    const c = loadConfig("test", base);
+  test("default: forge_phase_aware_v2 with an automatic activation slot; Forgepad's Fee Key owner and custody default on mainnet", () => {
+    const payout = Keypair.generate().publicKey.toBase58();
+    const m = loadConfig("test", { ...base, SOLANA_CLUSTER: "mainnet-beta", SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com", LAST60_PAYOUT_WALLET_ADDRESS: payout });
+    expect(m.revenue.policy.version).toBe("forge_phase_aware_v2");
+    expect(m.revenue.activation).toEqual({ source: "auto", pending: true });
+    expect(m.revenue.policy.activationSlot).toBe(PENDING_ACTIVATION_SLOT); // placeholder until pinned at boot
+    expect(revenueRuntimeOf(m)).toBeNull(); // nothing is recorded under the placeholder
+    expect(m.revenue.forgePlatformLpBeneficiary).toBe(FORGEPAD_PLATFORM_NFT_WALLET);
+    expect(m.revenue.fundingDestinations).toEqual([payout]);
+    expect(m.revenue.custody).toMatchObject({ enabled: true, payoutWallet: payout });
+    expect(m.feeCollection.mode).toBe("manual"); // no creator wallet configured
+    // An explicit slot is used as is; "auto" is the same as unset; an explicit Forge wallet wins.
+    expect(loadConfig("test", { ...base, SOLANA_CLUSTER: "mainnet-beta", SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com", LAST60_PAYOUT_WALLET_ADDRESS: payout, REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "466000000" }).revenue).toMatchObject({ activation: { source: "configured", pending: false }, policy: { activationSlot: 466_000_000 } });
+    expect(loadConfig("test", { ...base, SOLANA_CLUSTER: "mainnet-beta", SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com", LAST60_PAYOUT_WALLET_ADDRESS: payout, REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "auto", FORGE_PLATFORM_LP_BENEFICIARY: FORGE, LAST60_CUSTODY_ENABLED: "false" }).revenue).toMatchObject({ activation: { source: "auto" }, forgePlatformLpBeneficiary: FORGE, custody: { enabled: false } });
+  });
+  test("legacy policy stays selectable: REWARD_PERCENTAGE semantics unchanged, Forge's 75 / 50 recorded as policy parameters", () => {
+    const c = loadConfig("test", { ...base, REWARD_FUNDING_POLICY: "legacy_creator_fee_v1" });
     expect(c.revenue.policy.version).toBe("legacy_creator_fee_v1");
     expect(c.revenue.policy.activationSlot).toBeNull();
+    expect(c.revenue.activation).toEqual({ source: "not_applicable", pending: false });
+    expect(c.revenue.custody.enabled).toBe(false);
     expect(c.rewards.rewardBps).toBe(7_500);
     expect(c.revenue.policy.bondingCreatorFeeLast60Bps).toBe(7_500);
     expect(c.revenue.policy.forgeLpLast60Bps).toBe(5_000);
     expect(c.revenue.correlationMode).toBe("strict");
     // Changing REWARD_PERCENTAGE never changes the source-specific allocation (and vice versa).
-    const d = loadConfig("test", { ...base, REWARD_PERCENTAGE: "40" });
+    const d = loadConfig("test", { ...base, REWARD_FUNDING_POLICY: "legacy_creator_fee_v1", REWARD_PERCENTAGE: "40" });
     expect(d.rewards.rewardBps).toBe(4_000);
     expect(d.revenue.policy.bondingCreatorFeeLast60Bps).toBe(7_500);
   });
-  test("phase-aware policy requires an activation slot, a destination and the Forge Fee Key owner; fails closed otherwise; v1 is retired", () => {
+  test("phase-aware policy requires a destination and the Forge Fee Key owner (outside mainnet-beta); fails closed otherwise; v1 is retired", () => {
     expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v1", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "5", LAST60_FUNDING_DESTINATIONS: DEST, FORGE_PLATFORM_LP_BENEFICIARY: FORGE }).join("\n")).toContain("forge_phase_aware_v1 is retired");
-    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2" }).join("\n")).toContain("REWARD_FUNDING_POLICY_ACTIVATION_SLOT");
+    // No activation slot is no longer an error: it is pinned automatically at the first boot.
+    expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", LAST60_FUNDING_DESTINATIONS: DEST, FORGE_PLATFORM_LP_BENEFICIARY: FORGE })).toEqual([]);
     expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "5" }).join("\n")).toContain("LAST60_FUNDING_DESTINATIONS");
     expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "5", LAST60_FUNDING_DESTINATIONS: DEST }).join("\n")).toContain("FORGE_PLATFORM_LP_BENEFICIARY: is required");
     expect(problems({ REWARD_FUNDING_POLICY: "forge_phase_aware_v2", REWARD_FUNDING_POLICY_ACTIVATION_SLOT: "x", LAST60_FUNDING_DESTINATIONS: DEST }).join("\n")).toContain("non-negative integer");
