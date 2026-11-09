@@ -12,8 +12,11 @@
  * credits more than that credit's outstanding (not yet custodied) amount, and its on-chain transfer is
  * reserved in `transfer_uses` so it can never also be counted as a contribution (or vice versa).
  *
- * Last-60 does not control creator wallets and never stores creator keys: a custody transfer is
- * creator- (or custodian-) initiated. The operator opens a sweep request for one credit; the custodian
+ * By default Last-60 does not control creator wallets: a custody transfer is creator- (or custodian-)
+ * initiated. When the operator configures the launch creator's own key in the rewards worker
+ * (creator/creatorWallet.ts), the creator wallet automation opens the request and signs the sweep itself —
+ * through exactly the same request, verification and binding below. Otherwise the operator opens a sweep
+ * request for one credit; the custodian
  * sends exactly that SOL to the payout wallet (ideally with the memo `last60:custody:v1:<custodyId>`,
  * which the indexer matches automatically); or the operator submits the transaction signature. Either
  * way the transfer is verified from the chain: finalized, successful, native SOL System transfer, from
@@ -302,7 +305,7 @@ class Abort extends Error {}
  * request from `requested`. Credited = min(observed, outstanding); any excess is recorded, never
  * credited. Funds count for rounds only once the transfer is FINALIZED (status reconciled / partial).
  */
-export async function bindCustodyTransfer(db: Models, input: { custodyId: string; tx: NormalizedTx; commitment: "confirmed" | "finalized"; method: "memo_observed" | "operator_signature"; actor: string; payoutWallet: string | null; requireMemo: boolean; now?: number }): Promise<BindResult> {
+export async function bindCustodyTransfer(db: Models, input: { custodyId: string; tx: NormalizedTx; commitment: "confirmed" | "finalized"; method: "memo_observed" | "operator_signature" | "creator_wallet_sweep"; actor: string; payoutWallet: string | null; requireMemo: boolean; now?: number }): Promise<BindResult> {
   const now = new Date(input.now ?? Date.now());
   const { tx } = input;
   const reject = async (reason: string): Promise<BindResult> => {

@@ -69,8 +69,11 @@ export interface RevenueRuntime {
 }
 
 /** Revenue runtime from the application configuration (null when the config predates PR #6, e.g. tests). */
-export function revenueRuntimeOf(cfg: { solana: { cluster: string }; revenue?: { policy: FundingPolicy; fundingDestinations: string[]; forgePlatformLpBeneficiary: string | null; correlationMode: FundingCorrelationMode; custody?: RevenueRuntime["custody"] } }): RevenueRuntime | null {
+export function revenueRuntimeOf(cfg: { solana: { cluster: string }; revenue?: { policy: FundingPolicy; fundingDestinations: string[]; forgePlatformLpBeneficiary: string | null; correlationMode: FundingCorrelationMode; custody?: RevenueRuntime["custody"]; activation?: { pending: boolean } } }): RevenueRuntime | null {
   if (!cfg.revenue?.policy) return null;
+  // An automatic activation slot not yet pinned (resolveFundingActivation runs at boot): record nothing
+  // rather than stamp records with a placeholder policy (fail closed).
+  if (cfg.revenue.activation?.pending) return null;
   return { cluster: cfg.solana.cluster, policy: cfg.revenue.policy, fundingDestinations: cfg.revenue.fundingDestinations, forgePlatformLpBeneficiary: cfg.revenue.forgePlatformLpBeneficiary, correlationMode: cfg.revenue.correlationMode, custody: cfg.revenue.custody };
 }
 

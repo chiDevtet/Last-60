@@ -25,6 +25,14 @@ import {
   RecoveryError,
   revenueRuntimeOf,
   submitCustodySignature,
+  createExportRequest,
+  deriveLaunchLabPool,
+  requestWalletGeneration,
+  requestImportKey,
+  requestWalletImport,
+  takeExport,
+  VaultError,
+  walletsStatus,
   type AppConfig,
   type Models,
   type ChainRpc,
@@ -176,6 +184,7 @@ export function createApp(d: ApiDeps) {
     if (err instanceof AuthError) return c.json({ error: err.message }, err.status);
     if (err instanceof CustodyError) return c.json({ error: err.message, code: err.code }, 409);
     if (err instanceof RecoveryError) return c.json({ error: err.message, code: err.code }, 400);
+    if (err instanceof VaultError) return c.json({ error: err.message, code: err.code }, 409);
     if (err instanceof z.ZodError) return c.json({ error: "invalid request", issues: err.issues.map((i) => `${i.path.join(".")}: ${i.message}`) }, 400);
     console.error(err);
     return c.json({ error: "internal error" }, 500);
@@ -414,6 +423,70 @@ export function createApp(d: ApiDeps) {
     await audit(c, "attribution_recovery", body.attributionKey, { requestId: out.requestId, outcome: out.outcome, rewardFundingKey: out.rewardFundingKey ?? null }, body.note ?? null);
     return c.json(jsonSafe(out), out.outcome === "rejected" ? 409 : 200);
   });
+  // ── wallets generated from the admin console (docs/WALLETS.md) ──
+  // The API never holds or returns key material: generation and export are fulfilled by the rewards worker
+  // (the only process with the vault key); an export reaches the browser end-to-end encrypted, and only for
+  // a browser key the admin wallet signed.
+  admin.get("/wallets", async (c) => {
+    const status = await walletsStatus(d.db, d.cfg, d.rpc ? (a) => d.rpc!.getBalance(a) : undefined);
+    return c.json(jsonSafe({ wallets: status, site: signInSite(d.cfg, c.req.header("origin"))?.host ?? null }));
+  });
+  admin.post("/wallets/:role/generate", async (c) => {
+    const body = z.object({ reason: z.string().max(300).optional() }).strict().parse(await c.req.json().catch(() => ({})));
+    const r = await requestWalletGeneration(d.db, d.cfg, { role: c.req.param("role"), actor: c.get("admin"), reason: body.reason ?? null, now: now() });
+    await audit(c, "wallet_generate", c.req.param("role"), { status: r.status, created: r.created }, body.reason ?? null);
+    return c.json(jsonSafe(r));
+  });
+  admin.post("/wallets/:role/export", async (c) => {
+    const body = z.object({ requestId: z.string().regex(/^[0-9a-f]{32}$/), message: z.string().max(1000), signature: z.string().min(80).max(100) }).strict().parse(await c.req.json());
+    const site = signInSite(d.cfg, c.req.header("origin"))?.host ?? null;
+    const r = await createExportRequest(d.db, d.cfg, c.req.param("role"), { ...body, adminWallet: c.get("admin"), site, now: now() });
+    await audit(c, "wallet_export_request", c.req.param("role"), r, body.requestId);
+    return c.json(jsonSafe(r), r.accepted ? 200 : 422);
+  });
+  // Import an existing key: the browser seals it to the rewards worker's published import key; the admin
+  // wallet signs the intent (address, worker key). The API stores ciphertext only, never the key.
+  admin.get("/wallets/import-key", async (c) => c.json(jsonSafe(await requestImportKey(d.db, now()))));
+  admin.post("/wallets/:role/import", async (c) => {
+    const body = z
+      .object({
+        requestId: z.string().regex(/^[0-9a-f]{32}$/),
+        message: z.string().max(1000),
+        signature: z.string().min(80).max(100),
+        sealed: z.object({ senderKey: z.string().regex(/^[0-9a-f]{64}$/), iv: z.string().max(64), ciphertext: z.string().max(400) }).strict(),
+      })
+      .strict()
+      .parse(await c.req.json());
+    const site = signInSite(d.cfg, c.req.header("origin"))?.host ?? null;
+    const r = await requestWalletImport(d.db, d.cfg, c.req.param("role"), { ...body, adminWallet: c.get("admin"), site, now: now() });
+    // Audit the decision and the address, never the sealed key.
+    await audit(c, "wallet_import_request", c.req.param("role"), r, body.requestId);
+    return c.json(jsonSafe(r), r.accepted ? 200 : 422);
+  });
+  admin.get("/wallets/exports/:id", async (c) => {
+    const r = await takeExport(d.db, c.req.param("id"), c.get("admin"), now());
+    if (r.status === "ready") await audit(c, "wallet_export_delivered", r.role, { requestId: c.req.param("id"), address: r.address }, null);
+    return c.json(jsonSafe(r), r.status === "not_found" ? 404 : 200);
+  });
+
+  // ── launch: the pool derived from the token mint, and whether it exists yet ──
+  admin.get("/launch", async (c) => {
+    const s = await d.settings.get(true);
+    const info = s.poolAddress && d.rpc ? await d.rpc.getAccountInfo(s.poolAddress).catch(() => null) : null;
+    return c.json(jsonSafe({ provider: s.launchProvider, tokenMint: s.tokenMint, poolAddress: s.poolAddress, poolAddressSource: s.poolAddressSource, poolExists: info ? !!info.value : null, poolOwner: info?.value?.owner ?? null }));
+  });
+  admin.get("/launch/derive", async (c) => {
+    const mint = z.string().trim().min(32).max(44).parse(c.req.query("mint"));
+    let poolAddress: string;
+    try {
+      poolAddress = deriveLaunchLabPool(mint);
+    } catch {
+      return c.json({ error: "not a valid token mint address" }, 400);
+    }
+    const info = d.rpc ? await d.rpc.getAccountInfo(poolAddress).catch(() => null) : null;
+    return c.json({ tokenMint: mint, quote: "SOL", poolAddress, poolExists: info ? !!info.value : null });
+  });
+
   admin.get("/funding/recoveries", async (c) => {
     const key = c.req.query("attributionKey");
     return c.json(jsonSafe(await d.db.AttributionRecovery.find(key ? { attributionKey: key } : {}).sort({ requestedAt: -1 }).limit(100).lean()));

@@ -15,7 +15,7 @@ import { RpcClient } from "../chain/rpc";
 import { LogsSubscriber } from "../chain/ws";
 import type { Models } from "../db/models";
 import { big } from "../db/decimal";
-import { attachStoredMigration, createProvider, providerTargetFor, resolveAndAttachMigration, type LaunchProvider, type PoolInfo } from "../providers";
+import { AwaitingLaunchError, attachStoredMigration, createProvider, providerTargetFor, resolveAndAttachMigration, type LaunchProvider, type PoolInfo } from "../providers";
 import { basesOf, roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
@@ -501,6 +501,14 @@ export class Indexer {
         failures = 0;
         if (!this.backlog) await sleep(Math.min(250, s.indexerPollIntervalMs), signal);
       } catch (err: any) {
+        if (err instanceof AwaitingLaunchError) {
+          // Before launch (no token yet, or its pool not created yet): a normal state, retried quietly.
+          this.status = { status: "waiting", detail: `waiting for launch: ${err.message}` };
+          await this.terminal.system(`Indexer waiting for launch: ${err.message}.`, `awaiting-launch:indexer:${err.message}`).catch(() => undefined);
+          this.provider = null;
+          await sleep(5_000, signal);
+          continue;
+        }
         failures++;
         this.metrics.errors++;
         const delay = backoffDelay(failures, { baseMs: 500, maxMs: 30_000 });

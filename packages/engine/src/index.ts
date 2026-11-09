@@ -1,5 +1,6 @@
 export * from "./config/env";
 export * from "./config/runtime";
+export * from "./config/activation";
 export * from "./db/models";
 export * from "./db/decimal";
 export * from "./db/connection";
@@ -34,4 +35,6 @@ export * from "./revenue/ingest";
 export * from "./revenue/report";
 export * from "./custody/custody";
 export * from "./custody/report";
+export * from "./creator/creatorWallet";
 export * from "./recovery/attributionRecovery";
+export * from "./wallets/vault";

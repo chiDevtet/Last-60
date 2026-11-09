@@ -363,7 +363,7 @@ describe("immutable snapshots and process consistency (MongoDB)", () => {
   });
 
   test("indexer and rewards worker build the same provider target and resolve the same verified basis", () => {
-    const env = { SOLANA_CLUSTER: "devnet", SOLANA_RPC_URL: "https://api.devnet.solana.com", MONGODB_URI: "mongodb://localhost/x", LAUNCH_PROVIDER: "raydium_launchlab", TOKEN_MINT: WSOL, POOL_ADDRESS: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin", EXPECTED_LAUNCHLAB_PLATFORM_CONFIG: FORGEPAD_LAUNCHLAB_PLATFORM_CONFIG, EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE: "5000", SCHEDULE_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"), PAYOUT_WALLET_PUBLIC_KEY: Keypair.generate().publicKey.toBase58() };
+    const env = { SOLANA_CLUSTER: "devnet", SOLANA_RPC_URL: "https://api.devnet.solana.com", MONGODB_URI: "mongodb://localhost/x", LAUNCH_PROVIDER: "raydium_launchlab", TOKEN_MINT: WSOL, POOL_ADDRESS: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin", EXPECTED_LAUNCHLAB_PLATFORM_CONFIG: FORGEPAD_LAUNCHLAB_PLATFORM_CONFIG, EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE: "5000", SCHEDULE_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"), PAYOUT_WALLET_PUBLIC_KEY: Keypair.generate().publicKey.toBase58(), REWARD_FUNDING_POLICY: "legacy_creator_fee_v1" /* devnet: no Forge platform wallet */ };
     const settings = { launchProvider: "raydium_launchlab" as const, poolAddress: env.POOL_ADDRESS, tokenMint: WSOL, feeBeneficiaryRole: "creator" as const, payoutAssetMint: WSOL };
     const targets = (["indexer", "rewards", "cli"] as const).map((role) => providerTargetFor(settings, loadConfig(role, env)));
     expect(targets[1]).toEqual(targets[0]!);

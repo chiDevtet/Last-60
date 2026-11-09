@@ -31,7 +31,7 @@ Start from `.env.example`. Recommended split (all chmod 600):
 | File | Contains |
 |---|---|
 | `.env.indexer` | Solana, provider, rewards params, Mongo, indexer settings. **No keys.** |
-| `.env.rewards` | Same + `SCHEDULE_ENCRYPTION_KEY`, `PAYOUT_WALLET_*`, payout/fee-collection settings. |
+| `.env.rewards` | Same + `SCHEDULE_ENCRYPTION_KEY`, `PAYOUT_WALLET_*`, payout/fee-collection settings, and (optional) the creator wallet key `LAST60_CREATOR_WALLET_KEYPAIR_PATH` (docs/CREATOR_WALLET.md). Only `LAST60_CREATOR_WALLET_ADDRESS` goes in the other files. Wallets generated from the admin page need none of these (docs/WALLETS.md); for key export add `ADMIN_WALLETS` here too, and back up `~/.last60/wallet-vault.key` (or export the keys). |
 | `.env.api` | Solana (read-only), provider, Mongo, API/admin settings, `ADMIN_SESSION_SECRET`. **No keys, no schedule key.** |
 | `.env.web` | `NEXT_PUBLIC_*`, `API_INTERNAL_URL`, `NODE_ENV=production`. |
 | `.env.mongo` | `MONGO_PORT` only (for the local `last60-mongo` app). **No secrets.** |

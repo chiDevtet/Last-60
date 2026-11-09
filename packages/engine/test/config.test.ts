@@ -14,6 +14,8 @@ const base = {
   MONGODB_URI: "mongodb://localhost/x",
   TOKEN_MINT: "So11111111111111111111111111111111111111112",
   POOL_ADDRESS: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+  // A devnet setup has no Forge platform wallet: it selects the legacy policy (the default is forge_phase_aware_v2).
+  REWARD_FUNDING_POLICY: "legacy_creator_fee_v1",
 };
 
 describe("environment validation", () => {
@@ -60,7 +62,9 @@ describe("environment validation", () => {
   test("provider/role combinations are validated", () => {
     expect(() => loadConfig("indexer", { ...base, FEE_BENEFICIARY_ROLE: "platform" })).toThrow(/platform/);
     expect(() => loadConfig("indexer", { ...base, LAUNCH_PROVIDER: "raydium_launchlab", FEE_BENEFICIARY_ROLE: "partner" })).toThrow(/partner/);
-    expect(() => loadConfig("indexer", { ...base, TOKEN_MINT: "" })).toThrow(/TOKEN_MINT/);
+    // No token yet is not an error (set it in the admin console; workers wait). A DBC pool cannot be derived.
+    expect(loadConfig("indexer", { ...base, TOKEN_MINT: "", POOL_ADDRESS: "" }).provider.tokenMint).toBeNull();
+    expect(() => loadConfig("indexer", { ...base, POOL_ADDRESS: "" })).toThrow(/POOL_ADDRESS: is required for meteora_dbc/);
     expect(loadConfig("indexer", { ...base, LAUNCH_PROVIDER: "raydium_launchlab" }).provider.id).toBe("raydium_launchlab");
   });
 

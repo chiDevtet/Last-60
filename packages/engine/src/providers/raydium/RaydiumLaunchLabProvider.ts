@@ -41,6 +41,7 @@ import { verifyDeclared } from "../meteora/MeteoraDBCProvider";
 import type { ChainRpc } from "../../chain/rpc";
 import { readMint } from "../mint";
 import {
+  AwaitingLaunchError,
   ProviderValidationError,
   resolveTrader,
   type ClaimPlan,
@@ -96,6 +97,8 @@ export function launchLabFeeSplit(amount: bigint, rates: { protocol: bigint; pla
   const creatorFee = part(rates.creator);
   return { total, platformFee, shareFee, creatorFee, protocolFee: total - platformFee - shareFee - creatorFee };
 }
+
+export { deriveLaunchLabPool } from "./pda";
 
 export function creatorFeeVault(creator: PublicKey, quoteMint: PublicKey): PublicKey {
   return PublicKey.findProgramAddressSync([creator.toBuffer(), quoteMint.toBuffer()], PROGRAM)[0];
@@ -376,7 +379,7 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
   async load(): Promise<PoolInfo> {
     if (!this.rpc) throw new Error("RaydiumLaunchLabProvider.load requires an RPC client");
     const { slot, value } = await this.rpc.getAccountInfo(this.opts.poolAddress);
-    if (!value) throw new ProviderValidationError(`Pool ${this.opts.poolAddress} does not exist on this cluster`);
+    if (!value) throw new AwaitingLaunchError(`pool ${this.opts.poolAddress} does not exist yet (waiting for the launch)`);
     if (value.owner !== LAUNCHLAB_PROGRAM_ID) throw new ProviderValidationError(`Pool ${this.opts.poolAddress} is owned by ${value.owner}, not Raydium LaunchLab`);
     const pool = decodeLaunchLabPool(value.data);
     if (pool.baseMint !== this.opts.tokenMint) throw new ProviderValidationError(`Pool base mint ${pool.baseMint} does not match TOKEN_MINT ${this.opts.tokenMint}`);

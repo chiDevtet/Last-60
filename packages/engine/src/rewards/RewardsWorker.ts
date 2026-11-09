@@ -1,6 +1,6 @@
 /**
- * The rewards process: scheduler + payout executor + fee collector + reconciler, under a single
- * leader lease. It never depends on the API or the frontend being up.
+ * The rewards process: scheduler + payout executor + fee collector + creator wallet automation +
+ * reconciler, under a single leader lease. It never depends on the API or the frontend being up.
  */
 import type { Keypair } from "@solana/web3.js";
 import { PayoutSigner, type PayoutSignerStatus } from "../signer/payoutSigner";
@@ -8,7 +8,7 @@ import type { AppConfig } from "../config/env";
 import type { EffectiveSettings, SettingsStore } from "../config/runtime";
 import { RpcClient, type ChainRpc } from "../chain/rpc";
 import type { Models } from "../db/models";
-import { attachStoredMigration, createProvider, providerTargetFor, type LaunchProvider } from "../providers";
+import { AwaitingLaunchError, attachStoredMigration, createProvider, providerTargetFor, type LaunchProvider } from "../providers";
 import { basesOf, roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
 import { heartbeat, Lease } from "../util/lease";
@@ -20,6 +20,8 @@ import { PayoutExecutor } from "./payouts";
 import { FeeCollector } from "./feeCollector";
 import { Reconciler } from "./reconciliation";
 import { readMint } from "../providers/mint";
+import { CreatorWalletAutomation } from "../creator/creatorWallet";
+import { fulfilExportRequests, fulfilWalletRequests, publishImportKey } from "../wallets/vault";
 
 export interface RewardsWorkerDeps {
   db: Models;
@@ -30,6 +32,8 @@ export interface RewardsWorkerDeps {
   /** Sanitized signer status published for operators (wallet verification). */
   signerStatus?: PayoutSignerStatus | null;
   claimer: Keypair | null;
+  /** The launch creator's keypair for the creator wallet automation (docs/CREATOR_WALLET.md); null: idle. */
+  creator?: Keypair | null;
   rpc?: ChainRpc;
   provider?: LaunchProvider;
   clock?: Clock;
@@ -49,8 +53,10 @@ export class RewardsWorker {
   readonly payouts: PayoutExecutor;
   readonly fees: FeeCollector;
   readonly reconciler: Reconciler;
+  readonly creatorWallet: CreatorWalletAutomation;
   readonly signer: PayoutSigner | null;
   private plannedSinceClaim = false;
+  private claimedSinceCreatorPass = false;
   private stopped = false;
   /**
    * Fee claims (which wait for confirmation) and reconciliation (which can ingest thousands of
@@ -58,7 +64,7 @@ export class RewardsWorker {
    * inline they blocked the scheduler loop: a round whose private execution instant fell inside a
    * slow claim/reconciliation was executed late or, past the grace period, recorded as missed.
    */
-  private background: { claim: Promise<unknown> | null; recon: Promise<unknown> | null } = { claim: null, recon: null };
+  private background: { claim: Promise<unknown> | null; recon: Promise<unknown> | null; creator: Promise<unknown> | null } = { claim: null, recon: null, creator: null };
 
   constructor(private readonly d: RewardsWorkerDeps) {
     this.log = (d.log ?? rootLogger()).child({ component: "rewards" });
@@ -77,6 +83,7 @@ export class RewardsWorker {
     this.scheduler = new RoundScheduler({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, payer: signer, terminal: this.terminal, clock: this.clock, random: d.random, log: this.log, onRoundPlanned: () => (this.plannedSinceClaim = true) });
     this.payouts = new PayoutExecutor({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, signer, terminal: this.terminal, clock: this.clock, log: this.log, tokenInfo: (mint) => readMint(this.rpc, mint) });
     this.fees = new FeeCollector({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, claimer: d.claimer, payoutWallet, terminal: this.terminal, clock: this.clock, log: this.log });
+    this.creatorWallet = new CreatorWalletAutomation({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, creator: d.creator ?? null, terminal: this.terminal, clock: this.clock, log: this.log });
     this.reconciler = new Reconciler({ db: d.db, cfg: d.cfg, settings: d.settings, rpc: this.rpc, provider: providerFn, payoutWallet: payoutWallet?.toBase58() ?? null, terminal: this.terminal, log: this.log });
   }
 
@@ -121,7 +128,7 @@ export class RewardsWorker {
           const halted = await this.payouts.isHalted();
           const paused = s.pauseScheduler || s.pausePayouts;
           await heartbeat(this.d.db, "rewards", {
-            status: this.status.status === "degraded" ? "degraded" : paused ? "paused" : halted ? "degraded" : "running",
+            status: this.status.status === "degraded" ? "degraded" : this.status.status === "waiting" ? "waiting" : paused ? "paused" : halted ? "degraded" : "running",
             detail: this.status.detail ?? (halted ? `payouts halted: ${halted}` : s.pausePayouts ? "payouts paused by admin" : s.pauseScheduler ? "scheduler paused by admin" : null),
             instance: this.d.cfg.instanceId,
             metrics: { payoutMode: s.payoutMode, payer: this.signer?.address ?? null },
@@ -138,7 +145,7 @@ export class RewardsWorker {
 
   async run(signal: AbortSignal) {
     let failures = 0;
-    const t = { payouts: 0, recon: 0, claim: 0 };
+    const t = { payouts: 0, recon: 0, claim: 0, creator: 0 };
     const hb = this.startHeartbeat();
     while (!signal.aborted && !this.stopped) {
       const now = this.clock.now();
@@ -155,6 +162,9 @@ export class RewardsWorker {
           await this.clock.sleep(2000, signal);
           continue;
         }
+        // Wallet generation / export requests from the admin console: served before the provider is
+        // loaded, so they work before launch (no token / pool yet).
+        await this.walletPass(now);
         const s = await this.d.settings.get();
         await this.ensureProvider(s);
         const wake = await this.scheduler.tick(now);
@@ -167,8 +177,19 @@ export class RewardsWorker {
           t.claim = now;
           this.background.claim = Promise.resolve()
             .then(() => this.fees.maybeClaim())
+            .then((sig) => {
+              if (sig) this.claimedSinceCreatorPass = true; // settle the new claim's Last-60 share promptly
+            })
             .catch((err) => this.log.warn({ err: String(err) }, "fee claim failed"))
             .finally(() => (this.background.claim = null));
+        }
+        if (this.d.cfg.creatorWallet?.automationEnabled && !this.background.creator && (this.claimedSinceCreatorPass || now - t.creator >= this.d.cfg.creatorWallet.intervalMs)) {
+          this.claimedSinceCreatorPass = false;
+          t.creator = now;
+          this.background.creator = Promise.resolve()
+            .then(() => this.creatorWallet.run())
+            .catch((err) => this.log.warn({ err: String(err?.message ?? err) }, "creator wallet pass failed"))
+            .finally(() => (this.background.creator = null));
         }
         if (!this.background.recon && now - t.recon >= this.d.cfg.reconciliation.intervalMs) {
           t.recon = now;
@@ -182,6 +203,13 @@ export class RewardsWorker {
         const sleepFor = Math.max(0, Math.min(wake - this.clock.now(), 500));
         await this.clock.sleep(sleepFor, signal);
       } catch (err: any) {
+        if (err instanceof AwaitingLaunchError) {
+          // Before launch: nothing to schedule yet; wallet requests (above) are still served.
+          this.status = { status: "waiting", detail: `waiting for launch: ${err.message}` };
+          await this.terminal.system(`Reward engine waiting for launch: ${err.message}.`, `awaiting-launch:rewards:${err.message}`).catch(() => undefined);
+          await this.clock.sleep(2_000, signal);
+          continue;
+        }
         failures++;
         const delay = backoffDelay(failures, { baseMs: 500, maxMs: 15_000 });
         this.log.error({ err: String(err?.message ?? err), delay }, "rewards loop error");
@@ -190,7 +218,7 @@ export class RewardsWorker {
       }
     }
     // Let in-flight background work settle (bounded) before giving up the lease.
-    const pending = [this.background.claim, this.background.recon].filter((x): x is Promise<unknown> => !!x);
+    const pending = [this.background.claim, this.background.recon, this.background.creator].filter((x): x is Promise<unknown> => !!x);
     if (pending.length) await Promise.race([Promise.allSettled(pending), new Promise((r) => setTimeout(r, 10_000))]);
     clearInterval(hb);
     if (this.leader) await heartbeat(this.d.db, "rewards", { status: "stopped" }).catch(() => undefined);
@@ -199,6 +227,32 @@ export class RewardsWorker {
 
   stop() {
     this.stopped = true;
+  }
+
+  private lastWalletPass = 0;
+  /** Generate requested wallets and fulfil signed key exports (docs/WALLETS.md). Never throws. */
+  async walletPass(now = this.clock.now()) {
+    if (now - this.lastWalletPass < 2_000) return;
+    this.lastWalletPass = now;
+    try {
+      await publishImportKey(this.d.db, this.d.cfg);
+      const made = await fulfilWalletRequests(this.d.db, this.d.cfg, this.log, now);
+      for (const role of made) {
+        const row: any = await this.d.db.WalletVault.findById(role, { origin: 1 }).lean();
+        await this.terminal.system(row?.origin === "imported" ? `Existing ${role} wallet imported and stored encrypted. Processes restart to load it.` : `New ${role} wallet generated and stored encrypted. Processes restart to load it; export a backup from the admin console.`, `wallet-ready:${role}`);
+      }
+      // A refused import is surfaced; one encrypted to a key that is not this worker's is a tampering signal.
+      const refused: any[] = await this.d.db.WalletVault.find({ status: "refused", refusedAt: { $gt: new Date(now - 600_000) } }, { refusedReason: 1, refusedAt: 1 }).lean();
+      for (const r of refused) {
+        const tamper = /encrypted_to_an_unknown_key|bad_admin_signature|signer_not_in/.test(r.refusedReason ?? "");
+        const text = `Import of the ${r._id} wallet refused: ${r.refusedReason}.${tamper ? " This can mean the request was tampered with in transit — check the API server before retrying." : ""}`;
+        await (tamper ? this.terminal.error(text, `wallet-import-refused:${r._id}:${new Date(r.refusedAt).getTime()}`) : this.terminal.warn(text, `wallet-import-refused:${r._id}:${new Date(r.refusedAt).getTime()}`));
+      }
+      await fulfilExportRequests(this.d.db, this.d.cfg, { now, log: this.log });
+    } catch (err: any) {
+      this.log.error({ err: String(err?.message ?? err) }, "wallet vault request failed");
+      await this.terminal.error(`Wallet vault: ${String(err?.message ?? err).slice(0, 200)}`, `wallet-vault-error:${Math.floor(now / 600_000)}`).catch(() => undefined);
+    }
   }
 
   /**

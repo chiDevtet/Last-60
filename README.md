@@ -44,6 +44,9 @@ MONGODB_URI='mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true'
 SCHEDULE_ENCRYPTION_KEY=$(bun run cli gen-schedule-key)
 LAST60_PAYOUT_WALLET_ADDRESS=<dedicated payout wallet address>   # see docs/PAYOUT_WALLET.md
 INDEXER_BACKFILL=none
+# REWARD_FUNDING_POLICY defaults to forge_phase_aware_v2 (activation slot pinned at first start).
+# Wallets can instead be generated from the admin page (docs/WALLETS.md); TOKEN_MINT may be set there too,
+# and a LaunchLab POOL_ADDRESS is derived from the token mint. Hands-off creator flows: docs/CREATOR_WALLET.md
 ```
 `bun scripts/find-active-pool.ts raydium_launchlab` prints a busy pool to try.
 
@@ -77,6 +80,8 @@ bun run cli revenue | revenue-reconcile                   # same report / re-run
 | [Fee accounting](docs/FEE_ACCOUNTING.md) | formulas, periods, ledger, collection, reconciliation |
 | [Reward funding](docs/REWARD_FUNDING.md) | two-phase business model, revenue streams, claim ↔ transfer evidence, how Forge's existing post-migration creator payout is attributed (§4a), funding policy, Forgepad findings, runbook |
 | [Payout wallet](docs/PAYOUT_WALLET.md) | the dedicated payout wallet: key generation and installation, fail-closed signer, verification, funding for fees |
+| [Wallets & pre-launch](docs/WALLETS.md) | generate the payout / creator wallets from the admin page (encrypted vault, end-to-end encrypted export), pool derived from the token mint before launch |
+| [Creator wallet](docs/CREATOR_WALLET.md) | hands-off creator wallet automation: claim bonding fees, send 75 % to the payout wallet, sweep Forge's post-migration creator payouts |
 | [Providers](docs/PROVIDERS.md) | Meteora DBC & Raydium LaunchLab internals, graduation support matrix |
 | [Database](docs/DATABASE.md) | collections, constraints, state machines, reconstruction |
 | [API](docs/API.md) | public, SSE and admin endpoints |
@@ -106,15 +111,18 @@ bun run cli revenue | revenue-reconcile                   # same report / re-run
 | 13 | Scheduling information stays private | ✔ not in any public response, terminal line, log or admin endpoint (tested) |
 | 14 | Provider switch by configuration only | ✔ performed live via the admin API |
 | 15 | Runs without the frontend | ✔ separate processes |
-| 16 | Phase-aware reward funding (PR #6–#8) | ✔ streams, correlation, reconciliation, policy-gated round funding and CPMM `creator_fee_on` / `CreatorFeeShare` verification; Forge's existing post-migration creator payout recognised with no Forgepad change (PR #8). Tested on real fixtures and synthetic transactions mirroring Forge's flow; **not verified on real Forge harvests** (none existed when written) and **not funding live rounds**: the default policy is legacy ([§4a](docs/REWARD_FUNDING.md#4a-forges-existing-post-migration-creator-distribution), [§13](docs/REWARD_FUNDING.md#13-known-limitations)) |
-| 17 | Dedicated payout wallet, custody and recovery (PR #10) | ✔ fail-closed payout signer bound to `LAST60_PAYOUT_WALLET_ADDRESS`; contributions fund rounds only once their SOL is verified in the payout wallet (custody transfers never create a second credit); audited operator re-run of unresolved Forge attributions. Tested on synthetic transactions; custody and recovery are **disabled by default**; **no real custody sweep or mainnet transaction performed** ([§14–§16](docs/REWARD_FUNDING.md#14-physical-custody-getting-credited-sol-into-the-payout-wallet-pr-10)) |
+| 16 | Phase-aware reward funding (PR #6–#8) | ✔ streams, correlation, reconciliation, policy-gated round funding and CPMM `creator_fee_on` / `CreatorFeeShare` verification; Forge's existing post-migration creator payout recognised with no Forgepad change (PR #8). Tested on real fixtures and synthetic transactions mirroring Forge's flow; **not verified on real Forge harvests** (none existed when written) and **not yet verified funding a live round** (`forge_phase_aware_v2` is now the default policy) ([§4a](docs/REWARD_FUNDING.md#4a-forges-existing-post-migration-creator-distribution), [§13](docs/REWARD_FUNDING.md#13-known-limitations)) |
+| 17 | Dedicated payout wallet, custody and recovery (PR #10) | ✔ fail-closed payout signer bound to `LAST60_PAYOUT_WALLET_ADDRESS`; contributions fund rounds only once their SOL is verified in the payout wallet (custody transfers never create a second credit); audited operator re-run of unresolved Forge attributions. Tested on synthetic transactions; custody is on by default under `forge_phase_aware_v2`, recovery is **disabled by default**; **no real custody sweep or mainnet transaction performed** ([§14–§16](docs/REWARD_FUNDING.md#14-physical-custody-getting-credited-sol-into-the-payout-wallet-pr-10)) |
+| 18 | Hands-off creator wallet (forge_phase_aware_v2 default) | ✔ `forge_phase_aware_v2` is the default policy with an automatically pinned, shared activation slot; with the creator key in the rewards worker, bonding-curve fees are claimed, 75 % is sent to the payout wallet (memo-correlated, `direct` custody) and Forge's post-migration creator payouts are swept into it (custody, `creator_wallet_sweep`), persisted before broadcast and never repeated. Tested on synthetic transactions on the FakeChain; **no mainnet transaction sent** ([Creator wallet](docs/CREATOR_WALLET.md)) |
 
 **Before going live:** resolve the production blockers in [Audit §7](docs/AUDIT.md) — verify the
 real Forgepad pool and declare its allocation (`EXPECTED_*`; undeclared or mismatching allocations
 are recorded but never distributed) in dry-run, observe a graduation end-to-end, and run
 an authorized small-value payout test — then follow the go-live sequence in
 [Deployment](docs/DEPLOYMENT.md). Live mainnet payouts require `PAYOUT_MODE=live` **and**
-`ALLOW_MAINNET_PAYOUTS=true`; fee collection stays `manual` until the claim signer is verified.
+`ALLOW_MAINNET_PAYOUTS=true`. Fee collection is `manual` unless the launch creator wallet is configured
+(then claims, the 75 % settlement and post-migration sweeps are automatic — [Creator wallet](docs/CREATOR_WALLET.md));
+verify the creator key against the pool in dry-run first (`bun run cli creator-wallet`).
 
 > The dashboard screenshots in `docs/screenshots/` were captured before the copy change and still
 > show an older percentage headline; the live UI no longer advertises a fixed percentage.

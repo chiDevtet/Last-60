@@ -163,6 +163,17 @@ export interface CheckpointState {
   slot: number;
 }
 
+/**
+ * The launch is not live yet: no token mint is configured, or its pool does not exist on chain yet.
+ * Workers treat this as a normal waiting state (not a failure) and retry until the pool appears.
+ */
+export class AwaitingLaunchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AwaitingLaunchError";
+  }
+}
+
 export class ProviderValidationError extends Error {
   constructor(message: string) {
     super(message);

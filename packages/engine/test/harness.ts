@@ -65,6 +65,9 @@ export function testConfig(env: Record<string, string> = {}): AppConfig {
     PAYOUT_COMMITMENT: "finalized",
     PAYOUT_WALLET_MIN_RESERVE_LAMPORTS: "0",
     INSTANCE_ID: "test-a",
+    // The production default is forge_phase_aware_v2; the round / payout suites exercise the legacy fee
+    // semantics, so the harness selects legacy unless a test opts into v2 explicitly.
+    REWARD_FUNDING_POLICY: "legacy_creator_fee_v1",
     ...env,
   });
 }

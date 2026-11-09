@@ -10,6 +10,7 @@
  *   revenue [--json]           phase-aware revenue report: every stream, per fee mint (read-only)
  *   revenue-reconcile          re-run claim ↔ transfer correlation and reconciliation now (idempotent;
  *                              writes only derived reconciliation rows and new funding credits)
+ *   creator-wallet [n]         read-only status of the creator wallet automation and its latest n transfers
  *   payout-wallet              read-only verification of the dedicated payout wallet (address, signer status,
  *                              derived-key match, balance, latest payout / custody reconciliation; never a key)
  *   funding [--json]           the four funding stages: attribution / custody / round funding / payouts + liquidity
@@ -26,7 +27,9 @@
  * The CLI runs with the server's database credentials: its operator identity is `cli:$USER`.
  */
 import { randomBytes } from "node:crypto";
-import { buildFundingPipeline, cancelCustodyRequest, createCustodyRequest, payoutWalletVerification, recoverAttribution, refreshCustodyFinality, renderFundingPipeline, submitCustodySignature, ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, buildRevenueReport, renderRevenueReport, reconcileFunding, forgeLaunchContextOf, revenueRuntimeOf, type ProcessRole } from "@last60/engine";
+import bs58 from "bs58";
+import { importPublicKey, keyFingerprint } from "@last60/shared";
+import { buildFundingPipeline, CREATOR_WALLET_STATUS_ID, resolveFundingActivation, readVaultWallets, walletsStatus, loadVaultKeypair, loadVaultKey, importSecretOf, IMPORT_KEY_STATE_ID, cancelCustodyRequest, createCustodyRequest, payoutWalletVerification, recoverAttribution, refreshCustodyFinality, renderFundingPipeline, submitCustodySignature, ConfigError, connectDatabase, jsonSafe, loadConfig, Reconciler, requeueFailedPayout, RpcClient, SettingsStore, TerminalWriter, createProvider, providerTargetFor, attachStoredMigration, buildRevenueReport, renderRevenueReport, reconcileFunding, forgeLaunchContextOf, revenueRuntimeOf, type ProcessRole } from "@last60/engine";
 
 const [cmd, ...args] = process.argv.slice(2);
 const print = (v: unknown) => console.log(JSON.stringify(jsonSafe(v), null, 2));
@@ -49,8 +52,15 @@ if (cmd === "check-config") {
   process.exit(failed ? 1 : 0);
 }
 
-const cfg = loadConfig("cli");
+let cfg = loadConfig("cli");
 const db = await connectDatabase(cfg.mongo.uri, cfg.mongo.dbName, { syncIndexes: false });
+{
+  const vault = await readVaultWallets(db);
+  if (vault.payout || vault.creator) cfg = loadConfig("cli", process.env, { vault });
+}
+await resolveFundingActivation(cfg, db, new RpcClient({ urls: cfg.solana.rpcUrls, timeoutMs: cfg.solana.timeoutMs, maxRps: 5 })).catch((err) => {
+  console.error(`warning: funding policy activation slot unresolved (${String(err?.message ?? err)}); revenue commands are unavailable until the RPC is reachable`);
+});
 const settings = new SettingsStore(db, cfg, 0);
 const actor = `cli:${process.env.USER ?? "operator"}`;
 try {
@@ -126,6 +136,47 @@ try {
       print(await payoutWalletVerification(db, { address: cfg.payout.walletPublicKey, runtimeExpectedAddress: s.expectedPayoutPublicKey, rpc, payoutMode: s.payoutMode }));
       break;
     }
+    case "wallets": {
+      // Read-only: generated / configured wallets, their source and balance (never key material).
+      const rpc = new RpcClient({ urls: cfg.solana.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
+      // Import key fingerprint: computed from the vault key when run on the rewards host (authoritative —
+      // compare it with the one the admin page shows) and as published in the database.
+      let local: string | null = null;
+      try {
+        const k = loadVaultKey(cfg);
+        if (k) local = keyFingerprint(importPublicKey(importSecretOf(k)));
+      } catch {
+        local = null;
+      }
+      const pub: any = await db.SystemState.findById(IMPORT_KEY_STATE_ID).lean();
+      const published = pub?.value?.publicKey ? keyFingerprint(pub.value.publicKey) : null;
+      print({ wallets: await walletsStatus(db, cfg, (a) => rpc.getBalance(a)), importKey: { fingerprintFromVaultKey: local ?? "vault key not readable here (run on the rewards host)", publishedFingerprint: published, match: local && published ? local === published : null } });
+      break;
+    }
+    case "wallet-export": {
+      // Backup on the REWARDS HOST (needs the vault key): prints the secret key of a generated wallet.
+      const role = args[0];
+      if (role !== "payout" && role !== "creator") throw new Error("usage: wallet-export <payout|creator> --yes");
+      if (!args.includes("--yes")) {
+        console.error(`This prints the PRIVATE KEY of the ${role} wallet. Anyone who sees it controls the wallet. Re-run with --yes.`);
+        process.exitCode = 2;
+        break;
+      }
+      const kp = await loadVaultKeypair(db, cfg, role);
+      if (!kp) throw new Error(`no generated ${role} wallet in the vault`);
+      console.log(JSON.stringify({ role, address: kp.publicKey.toBase58(), secretKeyBase58: bs58.encode(kp.secretKey), solanaKeypairJson: Array.from(kp.secretKey) }, null, 2));
+      await db.WalletVault.updateOne({ _id: role }, { $set: { lastExportedAt: new Date() }, $inc: { exports: 1 } });
+      break;
+    }
+    case "creator-wallet": {
+      // Read-only: what the rewards worker's creator wallet automation is doing (never key material).
+      const [status, recent] = await Promise.all([
+        db.SystemState.findById(CREATOR_WALLET_STATUS_ID).lean(),
+        db.CreatorWalletTransfer.find({}, { serializedTx: 0 }).sort({ createdAt: -1 }).limit(Number(args[0] ?? 20)).lean(),
+      ]);
+      print({ configured: { address: cfg.creatorWallet.address, automationEnabled: cfg.creatorWallet.automationEnabled, fundingPolicy: cfg.revenue.policy.version, activationSlot: cfg.revenue.policy.activationSlot, activationSource: cfg.revenue.activation.source, payoutWallet: cfg.payout.walletPublicKey, custodyEnabled: cfg.revenue.custody.enabled }, rewardsWorker: (status as any)?.value ?? null, recentTransfers: recent });
+      break;
+    }
     case "funding": {
       const s = await settings.get(true);
       const rpc = new RpcClient({ urls: s.rpcUrls, maxTxVersion: cfg.solana.maxTxVersion });
@@ -185,7 +236,7 @@ try {
       print(await db.AttributionRecovery.find(args[0] ? { attributionKey: args[0] } : {}).sort({ requestedAt: -1 }).limit(100).lean());
       break;
     default:
-      console.log("commands: status | check-config | pause <c> | resume <c> | requeue <id> | clear-halt <reason> | reconcile | round <n> | revenue [--json] | revenue-reconcile | payout-wallet | funding [--json] | custody-request <fundingKey> | custody-submit <custodyId> <signature> | custody-cancel <custodyId> <reason> | custody-refresh | attributions [status] | recover <attributionKey> [note] | recoveries [key] | gen-schedule-key");
+      console.log("commands: status | check-config | pause <c> | resume <c> | requeue <id> | clear-halt <reason> | reconcile | round <n> | revenue [--json] | revenue-reconcile | payout-wallet | wallets | wallet-export <role> --yes | creator-wallet [n] | funding [--json] | custody-request <fundingKey> | custody-submit <custodyId> <signature> | custody-cancel <custodyId> <reason> | custody-refresh | attributions [status] | recover <attributionKey> [note] | recoveries [key] | gen-schedule-key");
   }
 } finally {
   await db.close();

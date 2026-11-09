@@ -210,8 +210,17 @@ export class FakeChain implements ChainRpc {
         this.transfers.push({ signature, ...t, slot: this.slot });
       }
     }
-    const addresses = tx.compileMessage().accountKeys.map((k: PublicKey) => k.toBase58());
-    this.land({ signature, slot: this.slot, blockTime: Math.floor(this.now() / 1000), err, raw: null, addresses });
+    const msg = tx.compileMessage();
+    const addresses = msg.accountKeys.map((k: PublicKey) => k.toBase58());
+    const blockTime = Math.floor(this.now() / 1000);
+    // getTransaction(json) shape, so landed transactions can be fetched and verified like real ones.
+    const raw = {
+      slot: this.slot,
+      blockTime,
+      meta: { err, fee: Number(fee), innerInstructions: [], loadedAddresses: { writable: [], readonly: [] }, logMessages: [], preTokenBalances: [], postTokenBalances: [], preBalances: addresses.map(() => 0), postBalances: addresses.map(() => 0) },
+      transaction: { signatures: [signature], message: { accountKeys: addresses, header: msg.header, instructions: msg.instructions.map((ix) => ({ programIdIndex: ix.programIdIndex, accounts: ix.accounts, data: ix.data })), recentBlockhash: msg.recentBlockhash } },
+    };
+    this.land({ signature, slot: this.slot, blockTime, err, raw, addresses });
     if (fault === "timeout_after_accept") throw new RpcError("injected timeout after accept", null, null, undefined, true);
     return signature;
   }
