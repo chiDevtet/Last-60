@@ -2,8 +2,10 @@
  * Independent, public verifier for a settled round. Uses ONLY the public API (snapshot slots,
  * payouts) and a Solana RPC — not the database — to re-derive who should have been paid:
  *
- *   recipients = most recent BUYER_COUNT unique wallets whose latest qualifying buy lies in
- *                (previous round's snapshot slot, this round's snapshot slot]
+ *   buyer recipients = most recent BUYER_COUNT unique wallets whose latest qualifying buy lies in
+ *                      (previous round's snapshot slot, this round's snapshot slot]
+ *
+ * The round's randomly drawn holder recipients are listed with the draw's seed, not re-derived.
  *
  * Usage: bun scripts/verify-round.ts <roundNumber> [--fees] [--from-slot=N]
  * Env:   API_URL (default http://localhost:4000), SOLANA_RPC_URL, LAUNCH_PROVIDER, POOL_ADDRESS,
@@ -66,9 +68,12 @@ outer: for (;;) {
 }
 winners.sort((a, b) => b.slot - a.slot || b.pos - a.pos);
 const expected = winners.slice(0, round.buyerCount).map((w) => w.wallet).sort();
-const actual = round.payouts.map((p: any) => p.recipient).sort();
+// Buyer places only: holder places come from the round's random draw (seed: round.holderDrawSeed).
+const actual = round.payouts.filter((p: any) => p.kind !== "holder").map((p: any) => p.recipient).sort();
+const holders = round.payouts.filter((p: any) => p.kind === "holder").map((p: any) => p.recipient);
 console.log("derived from chain:", expected);
 console.log("paid by engine:    ", actual);
+if (holders.length) console.log(`holder draw (${holders.length} of ${round.eligibleHolders} eligible, seed ${round.holderDrawSeed}):`, holders);
 const recipientsOk = JSON.stringify(expected) === JSON.stringify(actual);
 console.log(recipientsOk ? "✔ recipients verified against the chain" : "✘ recipient mismatch");
 if (withFees) {

@@ -33,6 +33,10 @@ export interface CurrentRoundDTO {
   durationSeconds: number;
   finalWindowSeconds: number;
   buyerCount: number;
+  /** Random holders paid alongside the buyers each paying round (0: holder draw off). */
+  holderCount: number;
+  /** Minimum holding to enter the holder draw, in whole tokens. */
+  minHolderTokens: string;
   minBuy: string;
   rewardBps: number;
   qualifyingBuyers: number; // unique qualifying wallets in the current reward period
@@ -69,9 +73,13 @@ export interface BuyDTO {
 
 export type PayoutState = "pending" | "submitted" | "confirmed" | "failed" | "simulated";
 
+/** Why a wallet was paid: one of the round's most recent qualifying buyers, or drawn at random from the holders. */
+export type PayoutKind = "buyer" | "holder";
+
 export interface PayoutDTO {
   roundNumber: number;
   recipient: string;
+  kind: PayoutKind;
   amount: string;
   state: PayoutState;
   signature: string | null;
@@ -92,7 +100,10 @@ export interface RoundSummaryDTO {
   rolloverOut: string;
   dust: string;
   perRecipient: string;
+  /** Buyers + holders paid. */
   recipientCount: number;
+  /** Of `recipientCount`: wallets from the random holder draw. */
+  holderRecipientCount: number;
   paid: string;
   dryRun: boolean;
 }
@@ -100,6 +111,12 @@ export interface RoundSummaryDTO {
 export interface RoundDetailDTO extends RoundSummaryDTO {
   snapshotSlot: number | null;
   buyerCount: number;
+  holderCount: number;
+  minHolderTokens: string;
+  /** Holders that met every rule when the draw was made. */
+  eligibleHolders: number;
+  /** The draw's random seed, published once the round has executed (see docs/ARCHITECTURE.md). */
+  holderDrawSeed: string | null;
   minBuy: string;
   rewardBps: number;
   payouts: PayoutDTO[];

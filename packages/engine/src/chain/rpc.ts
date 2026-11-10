@@ -302,6 +302,7 @@ export type ChainRpc = Pick<
   | "getEpochInfo"
   | "getBlockSignatures"
   | "getTokenLargestAccounts"
+  | "getProgramAccounts"
 >;
 
 function decodeAccount(v: any): AccountInfoRaw {

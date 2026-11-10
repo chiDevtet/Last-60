@@ -211,7 +211,7 @@ export function Countdown({ round, pool, now, latest }: { round: CurrentRoundDTO
           {inFinal && <div className="mt-1 max-w-[15rem] text-xs text-mist">The payout can trigger at any moment before the clock reaches zero.</div>}
           {settledHere && latest && latest.roundNumber === r.number && (
             <div className="mt-2 text-xs text-mist">
-              {latest.recipientCount > 0 ? `${sol(latest.perRecipient)} SOL × ${latest.recipientCount} wallets` : "No qualifying buyers"}
+              {latest.recipientCount > 0 ? `${sol(latest.perRecipient)} SOL × ${latest.recipientCount} wallets${latest.holderRecipientCount > 0 ? ` (${latest.recipientCount - latest.holderRecipientCount} buyers + ${latest.holderRecipientCount} holders)` : ""}` : "No qualifying buyers"}
             </div>
           )}
         </div>
@@ -229,7 +229,7 @@ export function Countdown({ round, pool, now, latest }: { round: CurrentRoundDTO
           {sol(round.minBuy, 3)} <span className="text-mist text-sm">SOL</span>
         </Fact>
         <Fact label="Recipients per round">
-          <span>Last {round.buyerCount}</span>
+          <span>{round.holderCount > 0 ? `${round.buyerCount} buyers + ${round.holderCount} holders` : `Last ${round.buyerCount}`}</span>
         </Fact>
       </dl>
     </section>

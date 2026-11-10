@@ -57,7 +57,7 @@ export function Dashboard({ initial, initialTerminal, tradeUrl }: { initial: Das
             <div className="mx-auto mb-10 max-w-2xl text-center">
               <h1 className="text-3xl font-semibold tracking-tight sm:text-5xl">The final minute pays.</h1>
               <p className="mx-auto mt-4 max-w-xl text-base text-mist sm:text-lg">
-                Every {round.durationSeconds / 60} minutes, eligible creator fees are allocated to payouts for the last {round.buyerCount} unique buyers — paid on-chain at a moment inside the final 60 seconds.
+                Every {round.durationSeconds / 60} minutes, eligible creator fees are allocated to payouts for the last {round.buyerCount} unique buyers{round.holderCount > 0 ? ` and ${round.holderCount} randomly drawn holders` : ""} — paid on-chain at a moment inside the final 60 seconds.
               </p>
             </div>
             <Countdown round={round} pool={pool} now={now} latest={latest} />
@@ -82,15 +82,15 @@ export function Dashboard({ initial, initialTerminal, tradeUrl }: { initial: Das
         </section>
 
         <section id="history" className="mx-auto mt-20 max-w-7xl px-4 sm:px-6">
-          <SectionTitle eyebrow="History" title="Payout history" sub="Expand a round to see each recipient, amount and transaction." />
+          <SectionTitle eyebrow="History" title="Payout history" sub="Expand a round to see each recipient — buyer or holder — with its amount and transaction." />
           <PayoutHistory initial={recentRounds} explorer={meta.explorer} cluster={meta.cluster} />
         </section>
 
         <section id="how" className="mx-auto mt-20 max-w-7xl px-4 sm:px-6">
           <SectionTitle eyebrow="Mechanics" title="How it works" />
-          <HowItWorks minBuy={round.minBuy} buyerCount={round.buyerCount} durationMin={round.durationSeconds / 60} />
+          <HowItWorks minBuy={round.minBuy} buyerCount={round.buyerCount} holderCount={round.holderCount} minHolderTokens={round.minHolderTokens} durationMin={round.durationSeconds / 60} />
           <div className="card mt-4 p-6">
-            <Rules />
+            <Rules holderCount={round.holderCount} minHolderTokens={round.minHolderTokens} />
           </div>
         </section>
       </main>

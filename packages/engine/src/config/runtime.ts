@@ -23,6 +23,8 @@ export const RuntimeOverridesSchema = z
     poolAddress: pubkey,
     feeBeneficiaryRole: z.enum(["creator", "partner", "platform"]),
     buyerCount: z.number().int().min(1).max(50),
+    holderCount: z.number().int().min(0).max(50),
+    minHolderTokens: intStr,
     minBuyQuote: intStr,
     rewardBps: z.number().int().min(1).max(10_000),
     payoutAsset: z.string().trim().refine((v) => v.toUpperCase() === "SOL" || isValidPubkey(v), 'must be "SOL" or a mint address'),
@@ -61,6 +63,10 @@ export interface EffectiveSettings {
   poolAddressSource: "configured" | "derived" | "discovered" | null;
   feeBeneficiaryRole: AppConfig["provider"]["feeBeneficiaryRole"];
   buyerCount: number;
+  /** Random holders paid per round alongside the buyers (0: off). */
+  holderCount: number;
+  /** Minimum holding for the holder draw, in whole tokens. */
+  minHolderTokens: bigint;
   minBuyQuote: bigint;
   rewardBps: number;
   payoutAssetMint: string;
@@ -129,6 +135,8 @@ export function resolveSettings(cfg: AppConfig, overrides: RuntimeOverrides, ver
     ...resolvePool(cfg, o, launchProvider, tokenMint, discovered),
     feeBeneficiaryRole: o.feeBeneficiaryRole ?? cfg.provider.feeBeneficiaryRole,
     buyerCount: o.buyerCount ?? cfg.rewards.buyerCount,
+    holderCount: o.holderCount ?? cfg.rewards.holderCount,
+    minHolderTokens: o.minHolderTokens !== undefined ? BigInt(o.minHolderTokens) : cfg.rewards.minHolderTokens,
     minBuyQuote: o.minBuyQuote !== undefined ? BigInt(o.minBuyQuote) : cfg.rewards.minBuyQuote,
     rewardBps: o.rewardBps ?? cfg.rewards.rewardBps,
     payoutAssetMint: o.payoutAsset ? (o.payoutAsset.toUpperCase() === "SOL" ? WSOL_MINT : o.payoutAsset) : cfg.payout.assetMint,

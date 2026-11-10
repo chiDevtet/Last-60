@@ -11,7 +11,7 @@ export function Stats({ stats, chart, dryRun }: { stats: StatsDTO; chart: FeeCha
     <div className="grid gap-4 lg:grid-cols-[1fr_1.15fr]">
       <dl className="grid grid-cols-2 gap-3">
         <Tile label="Total fees accrued" value={<AnimatedSol lamports={stats.totalFeesAccrued} />} unit="SOL" />
-        <Tile label="Total paid to buyers" value={<AnimatedSol lamports={stats.totalPaid} />} unit="SOL" />
+        <Tile label="Total paid to buyers & holders" value={<AnimatedSol lamports={stats.totalPaid} />} unit="SOL" />
         <Tile label="Waiting to be paid" value={<AnimatedSol lamports={stats.totalPending} />} unit="SOL" />
         <Tile label="Current reward allocation" value={<AnimatedSol lamports={stats.currentReward} />} unit="SOL" />
         <Tile label="Payouts made" value={<AnimatedInt value={stats.payoutCount} />} />
@@ -68,7 +68,7 @@ function RoundsChart({ data }: { data: FeeChartPointDTO[] }) {
       <div className="flex items-baseline justify-between">
         <div>
           <h3 className="text-sm font-semibold">Reward pool per round</h3>
-          <p className="text-xs text-mist">SOL allocated to buyers, last {data.length || 0} executed rounds</p>
+          <p className="text-xs text-mist">SOL allocated to buyers and holders, last {data.length || 0} executed rounds</p>
         </div>
         <button onClick={() => setTable((t) => !t)} className="focus-ring rounded px-2 py-1 text-xs text-mist hover:text-frost" aria-pressed={table}>
           {table ? "Chart" : "Table"}

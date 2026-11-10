@@ -177,6 +177,10 @@ const RawEnv = z.object({
   FUNDING_CORRELATION_MODE: z.enum(["strict", "exclusive_window"]).default("strict"),
 
   BUYER_COUNT: int(5, 1, 50),
+  /** Random holders paid alongside the buyers in every paying round (0 disables the holder draw). */
+  HOLDER_COUNT: int(5, 0, 50),
+  /** Minimum holding to enter the holder draw, in WHOLE tokens (100,000 = 0.01 % of a 1,000,000,000 supply). */
+  MIN_HOLDER_TOKENS: z.string().trim().regex(/^\d+$/, "must be a whole number of tokens").default("100000"),
   MIN_BUY_SOL: z.string().default("0.05"),
   MIN_BUY_QUOTE_AMOUNT: z.string().optional(),
   EXCLUDED_WALLETS: csv(pubkey),
@@ -387,6 +391,10 @@ export interface AppConfig {
   };
   rewards: {
     buyerCount: number;
+    /** Random holders paid per round (0: holder draw off). */
+    holderCount: number;
+    /** Minimum holding for the holder draw, in whole tokens. */
+    minHolderTokens: bigint;
     /** Minimum qualifying buy in quote base units (lamports for SOL). */
     minBuyQuote: bigint;
     minBuySolInput: string;
@@ -796,6 +804,8 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     },
     rewards: {
       buyerCount: raw.BUYER_COUNT,
+      holderCount: raw.HOLDER_COUNT,
+      minHolderTokens: BigInt(raw.MIN_HOLDER_TOKENS),
       minBuyQuote,
       minBuySolInput: raw.MIN_BUY_SOL,
       rewardBps,

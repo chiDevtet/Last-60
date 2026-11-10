@@ -9,10 +9,10 @@ const site = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
 export const metadata: Metadata = {
   metadataBase: new URL(site),
   title: { default: `${name} — The final minute pays`, template: `%s · ${name}` },
-  description: "Every five minutes, eligible creator fees are allocated to on-chain payouts for the most recent unique buyers. Payouts are based on verified creator fee allocations. Transparent, verifiable, Solana-native.",
+  description: "Every five minutes, eligible creator fees are allocated to on-chain payouts for the most recent unique buyers and randomly drawn holders. Payouts are based on verified creator fee allocations. Transparent, verifiable, Solana-native.",
   icons: { icon: [{ url: "/icon.svg", type: "image/svg+xml" }, { url: "/favicon.ico", sizes: "any" }], apple: "/apple-touch-icon.png" },
   applicationName: name,
-  openGraph: { siteName: name, title: `${name} — The final minute pays`, description: "Eligible creator fees are allocated to payouts for the last buyers of every round.", images: ["/og-image.png"], type: "website" },
+  openGraph: { siteName: name, title: `${name} — The final minute pays`, description: "Eligible creator fees are allocated to payouts for the last buyers and randomly drawn holders of every round.", images: ["/og-image.png"], type: "website" },
   twitter: { card: "summary_large_image", images: ["/og-image.png"] },
 };
 
