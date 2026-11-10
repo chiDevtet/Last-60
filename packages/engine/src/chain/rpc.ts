@@ -205,6 +205,12 @@ export class RpcClient {
     return { slot: r.context.slot, value: r.value.map((v: any) => (v ? decodeAccount(v) : null)) };
   }
 
+  /** Program accounts matching filters (addresses only when `dataSlice` length is 0). Used for pool discovery. */
+  async getProgramAccounts(programId: string, o: { filters: unknown[]; dataSlice?: { offset: number; length: number }; commitment?: Commitment }): Promise<{ pubkey: string; account: AccountInfoRaw }[]> {
+    const r = await this.call<any>("getProgramAccounts", [programId, { encoding: "base64", commitment: o.commitment ?? "confirmed", filters: o.filters, ...(o.dataSlice ? { dataSlice: o.dataSlice } : {}) }]);
+    return (Array.isArray(r) ? r : (r?.value ?? [])).map((x: any) => ({ pubkey: x.pubkey, account: decodeAccount(x.account) }));
+  }
+
   /** Largest token accounts of a mint (used to locate the current holder of an NFT). */
   async getTokenLargestAccounts(mint: string, commitment: Commitment = "confirmed"): Promise<{ slot: number; value: { address: string; amount: bigint }[] }> {
     const r = await this.call<any>("getTokenLargestAccounts", [mint, { commitment }]);

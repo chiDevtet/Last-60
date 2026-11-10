@@ -16,11 +16,14 @@ export interface RevenueReport {
   bondingCurve: PerMint<{ collections: number; verifiedCollections: number; grossCreatorFeesCollected: string; creatorExpectedShare: string; creatorRetainedImplied: string; last60ExpectedContribution: string; last60FundingReceived: string; last60FundingCreditable: string; untransferred: string; unverifiedGross: string; statuses: Record<string, number> }>;
   postMigration: {
     cpmmCreatorFees: PerMint<{ collections: number; netCreatorTransfers: string; grossBeforeProtocolShare: "not observable from the collection transaction"; effectiveCreatorFeeShareRates: string[]; creatorFeeOnModes: string[]; rewardEligible: false }>;
+    /** Meteora DBC → DAMM v2: LP fees the creator claimed from its migration positions (same shape as the bonding curve). */
+    dammV2CreatorLp: RevenueReport["bondingCurve"];
     forgePlatformLp: PerMint<{ collections: number; verifiedCollections: number; grossClaimed: string; last60ExpectedContribution: string; last60FundingReceived: string; last60FundingCreditable: string; forgeRetainedExpected: string; forgeRetainedImplied: string; forgeRetainedObserved: null; untransferred: string; unverifiedGross: string; statuses: Record<string, number> }>;
   };
   buyerRewards: {
     verifiedBondingCurveFunding: PerMint<string>;
     verifiedForgeLpFunding: PerMint<string>;
+    verifiedDammV2CreatorLpFunding: PerMint<string>;
     eligibleBalanceByMint: PerMint<string>;
     consumedByRounds: PerMint<string>;
     remainingAvailable: PerMint<string>;
@@ -67,10 +70,11 @@ export async function buildRevenueReport(db: Models, opts: { sourcePool?: string
   const bonding: RevenueReport["bondingCurve"] = {};
   const forge: RevenueReport["postMigration"]["forgePlatformLp"] = {};
   const add = (m: Record<string, bigint>, k: string, v: bigint) => (m[k] = (m[k] ?? 0n) + v);
-  const acc: Record<string, Record<string, Record<string, bigint>>> = { bonding: {}, forge: {} };
-  const counts: Record<string, Record<string, { n: number; v: number; st: Record<string, number> }>> = { bonding: {}, forge: {} };
+  const damm: RevenueReport["postMigration"]["dammV2CreatorLp"] = {};
+  const acc: Record<string, Record<string, Record<string, bigint>>> = { bonding: {}, forge: {}, damm: {} };
+  const counts: Record<string, Record<string, { n: number; v: number; st: Record<string, number> }>> = { bonding: {}, forge: {}, damm: {} };
   for (const r of recs) {
-    const which = r.stream === "bonding_curve_creator_fee" ? "bonding" : r.stream === "forge_platform_lp_fee_collection" ? "forge" : null;
+    const which = r.stream === "bonding_curve_creator_fee" ? "bonding" : r.stream === "forge_platform_lp_fee_collection" ? "forge" : r.stream === "damm_v2_creator_lp_fee" ? "damm" : null;
     if (!which) continue;
     const m = (acc[which]![r.asset] ??= {});
     const c = (counts[which]![r.asset] ??= { n: 0, v: 0, st: {} });
@@ -91,6 +95,10 @@ export async function buildRevenueReport(db: Models, opts: { sourcePool?: string
     const c = counts.bonding![mint]!;
     bonding[mint] = { collections: c.n, verifiedCollections: c.v, grossCreatorFeesCollected: z(m, "gross"), creatorExpectedShare: z(m, "expectedRetained"), creatorRetainedImplied: z(m, "implied"), last60ExpectedContribution: z(m, "expected"), last60FundingReceived: z(m, "actual"), last60FundingCreditable: z(m, "creditable"), untransferred: z(m, "untransferred"), unverifiedGross: z(m, "unverified"), statuses: c.st };
   }
+  for (const [mint, m] of Object.entries(acc.damm!)) {
+    const c = counts.damm![mint]!;
+    damm[mint] = { collections: c.n, verifiedCollections: c.v, grossCreatorFeesCollected: z(m, "gross"), creatorExpectedShare: z(m, "expectedRetained"), creatorRetainedImplied: z(m, "implied"), last60ExpectedContribution: z(m, "expected"), last60FundingReceived: z(m, "actual"), last60FundingCreditable: z(m, "creditable"), untransferred: z(m, "untransferred"), unverifiedGross: z(m, "unverified"), statuses: c.st };
+  }
   for (const [mint, m] of Object.entries(acc.forge!)) {
     const c = counts.forge![mint]!;
     forge[mint] = { collections: c.n, verifiedCollections: c.v, grossClaimed: z(m, "gross"), last60ExpectedContribution: z(m, "expected"), last60FundingReceived: z(m, "actual"), last60FundingCreditable: z(m, "creditable"), forgeRetainedExpected: z(m, "expectedRetained"), forgeRetainedImplied: z(m, "implied"), forgeRetainedObserved: null, untransferred: z(m, "untransferred"), unverifiedGross: z(m, "unverified"), statuses: c.st };
@@ -107,6 +115,7 @@ export async function buildRevenueReport(db: Models, opts: { sourcePool?: string
   }
   const vb: Record<string, bigint> = {};
   const vf: Record<string, bigint> = {};
+  const vd: Record<string, bigint> = {};
   const eligible: Record<string, bigint> = {};
   const consumed: Record<string, bigint> = {};
   const byReason: Record<string, number> = {};
@@ -114,7 +123,7 @@ export async function buildRevenueReport(db: Models, opts: { sourcePool?: string
   for (const c of credits) {
     const v = big(c.creditableAmount);
     if (c.payoutEligible) {
-      add(c.stream === "bonding_curve_last60_reward_contribution" ? vb : vf, c.fundingMint, v);
+      add(c.stream === "bonding_curve_last60_reward_contribution" ? vb : c.stream === "damm_v2_creator_lp_last60_contribution" ? vd : vf, c.fundingMint, v);
       add(eligible, c.fundingMint, v);
       if (c.roundNumber !== null && c.roundNumber !== undefined) add(consumed, c.fundingMint, v);
     } else {
@@ -131,10 +140,11 @@ export async function buildRevenueReport(db: Models, opts: { sourcePool?: string
     sourcePool: opts.sourcePool ?? null,
     policy: { ...policySnapshot(opts.policy), inForceAtSlot: opts.currentSlot ?? null, phaseAwareInForce: opts.currentSlot == null ? null : phaseAwareInForce(opts.policy, opts.currentSlot) },
     bondingCurve: bonding,
-    postMigration: { cpmmCreatorFees: cpmmOut, forgePlatformLp: forge },
+    postMigration: { cpmmCreatorFees: cpmmOut, dammV2CreatorLp: damm, forgePlatformLp: forge },
     buyerRewards: {
       verifiedBondingCurveFunding: map(vb),
       verifiedForgeLpFunding: map(vf),
+      verifiedDammV2CreatorLpFunding: map(vd),
       eligibleBalanceByMint: map(eligible),
       consumedByRounds: map(consumed),
       remainingAvailable: remaining,
@@ -168,6 +178,14 @@ export function renderRevenueReport(r: RevenueReport): string {
   L.push(`POST-MIGRATION — ${STREAM_INFO.cpmm_creator_trading_fee.label}`);
   if (!Object.keys(r.postMigration.cpmmCreatorFees).length) L.push("  (no collections observed)");
   for (const [m, x] of Object.entries(r.postMigration.cpmmCreatorFees)) L.push(`  mint ${m}: ${x.collections} collection(s); net creator transfers ${x.netCreatorTransfers}; effective share rate(s) ${x.effectiveCreatorFeeShareRates.join(", ")}; creator_fee_on ${x.creatorFeeOnModes.join(", ")}`);
+  L.push(`POST-MIGRATION — ${STREAM_INFO.damm_v2_creator_lp_fee.label}`);
+  if (!Object.keys(r.postMigration.dammV2CreatorLp).length) L.push("  (no collections observed)");
+  for (const [m, x] of Object.entries(r.postMigration.dammV2CreatorLp)) {
+    L.push(`  mint ${m}: ${x.collections} claim(s), ${x.verifiedCollections} verified`);
+    L.push(`    gross creator LP fees claimed            ${x.grossCreatorFeesCollected}`);
+    L.push(`    Asteroid Protocol expected contribution  ${x.last60ExpectedContribution} / received ${x.last60FundingReceived}   (creditable ${x.last60FundingCreditable})`);
+    L.push(`    untransferred / unverified               ${x.untransferred} / ${x.unverifiedGross}   statuses ${JSON.stringify(x.statuses)}`);
+  }
   L.push(`POST-MIGRATION — ${STREAM_INFO.forge_platform_lp_fee_collection.label}`);
   if (!Object.keys(r.postMigration.forgePlatformLp).length) L.push("  (no collections observed)");
   for (const [m, x] of Object.entries(r.postMigration.forgePlatformLp)) {
@@ -182,6 +200,7 @@ export function renderRevenueReport(r: RevenueReport): string {
   L.push("BUYER-REWARD FUNDING");
   L.push(`  verified bonding-curve funding   ${JSON.stringify(b.verifiedBondingCurveFunding)}`);
   L.push(`  verified Forge LP funding        ${JSON.stringify(b.verifiedForgeLpFunding)}   (creator's 50 % LP allocation)`);
+  L.push(`  verified DAMM v2 LP funding      ${JSON.stringify(b.verifiedDammV2CreatorLpFunding)}   (75 % of the creator's claimed LP fees)`);
   L.push(`  eligible / consumed / remaining  ${JSON.stringify(b.eligibleBalanceByMint)} / ${JSON.stringify(b.consumedByRounds)} / ${JSON.stringify(b.remainingAvailable)}`);
   L.push(`  ineligible credits               ${b.ineligibleCredits.count} ${JSON.stringify(b.ineligibleCredits.byReason)}`);
   L.push(`  unlinked funding inflows         ${b.unlinkedFundingInflows.count} ${JSON.stringify(b.unlinkedFundingInflows.byMint)}`);

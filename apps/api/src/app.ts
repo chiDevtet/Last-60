@@ -27,6 +27,8 @@ import {
   submitCustodySignature,
   createExportRequest,
   deriveLaunchLabPool,
+  discoverDbcPool,
+  type DbcDiscovery,
   requestWalletGeneration,
   requestImportKey,
   requestWalletImport,
@@ -477,6 +479,19 @@ export function createApp(d: ApiDeps) {
   });
   admin.get("/launch/derive", async (c) => {
     const mint = z.string().trim().min(32).max(44).parse(c.req.query("mint"));
+    const s = await d.settings.get();
+    if (s.launchProvider === "meteora_dbc") {
+      // A DBC pool depends on its launch config: it is looked up on chain by its base mint.
+      let found: DbcDiscovery;
+      try {
+        found = d.rpc ? await discoverDbcPool(d.rpc as unknown as Parameters<typeof discoverDbcPool>[0], mint) : { status: "unsupported", reason: "no RPC" };
+      } catch (err) {
+        if (/invalid public key|Non-base58|Invalid public key input/i.test(String((err as Error)?.message ?? err))) return c.json({ error: "not a valid token mint address" }, 400);
+        found = { status: "unsupported", reason: String((err as Error)?.message ?? err).slice(0, 200) };
+      }
+      const poolAddress = found.status === "found" ? found.pool : null;
+      return c.json({ tokenMint: mint, quote: "SOL", provider: s.launchProvider, poolAddress, poolExists: found.status === "found" ? true : found.status === "not_found" ? false : null, lookup: found.status });
+    }
     let poolAddress: string;
     try {
       poolAddress = deriveLaunchLabPool(mint);
@@ -484,7 +499,7 @@ export function createApp(d: ApiDeps) {
       return c.json({ error: "not a valid token mint address" }, 400);
     }
     const info = d.rpc ? await d.rpc.getAccountInfo(poolAddress).catch(() => null) : null;
-    return c.json({ tokenMint: mint, quote: "SOL", poolAddress, poolExists: info ? !!info.value : null });
+    return c.json({ tokenMint: mint, quote: "SOL", provider: s.launchProvider, poolAddress, poolExists: info ? !!info.value : null, lookup: "derived" });
   });
 
   admin.get("/funding/recoveries", async (c) => {

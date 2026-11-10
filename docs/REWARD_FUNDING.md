@@ -85,6 +85,9 @@ Every event carries an explicit stream; streams are never summed into one "creat
 | `forge_platform_lp_fee_collection` | post_migration | collection (gross) | — | Forge | Forge | no |
 | `forge_platform_lp_last60_contribution` | post_migration | observed transfer | **creator (50 %)** | Forge | Asteroid Protocol | **yes** |
 | `forge_platform_lp_retained` | post_migration | derived (gross − contribution) | Forge (50 %) | Forge | Forge | no |
+| `damm_v2_creator_lp_fee` | post_migration | collection (gross) — Meteora DBC → DAMM v2 only | — | creator | creator | no |
+| `damm_v2_creator_lp_retained` | post_migration | derived (gross − contribution) | creator (25 %) | creator | creator | no |
+| `damm_v2_creator_lp_last60_contribution` | post_migration | observed transfer | creator (75 %) | creator | Asteroid Protocol | **yes** (§17) |
 
 Storage (all with unique keys, `$setOnInsert` writes and model-level immutability guards):
 
@@ -664,3 +667,33 @@ carries `recovery: {requestId, operator, algorithm, coveredThroughSlot, finalize
 See docs/PAYOUT_WALLET.md: variables, fail-closed key validation, the narrowly scoped signer
 (construction → authorization → signing; one authorized transfer per transaction), key generation and
 secure installation, read-only verification, and funding the wallet for fees.
+
+## 17. Meteora DBC launches: funding after graduation to DAMM v2
+
+A Meteora DBC launch funds rewards in **both** phases, at the same share:
+
+| Phase | Collection | Asteroid Protocol share | How it is claimed and settled |
+|---|---|---|---|
+| Bonding curve | `bonding_curve_creator_fee` — DBC `claim_creator_trading_fee` | 75 % of each claim | as for LaunchLab (CREATOR_WALLET.md) |
+| After graduation | `damm_v2_creator_lp_fee` — DAMM v2 `claim_position_fee` on a **migration position** of the verified graduation whose NFT the launch creator holds | 75 % of each claim (`policyLast60Bps` = the bonding share) | the creator wallet's auto-claim builds `claim_position_fee` for its positions (and any residual bonding fees) and unwraps WSOL into the creator wallet; the settlement then sends exactly 75 % of the claimed SOL to the payout wallet with `last60:v1:<claim signature>` |
+
+Verification of a DAMM v2 claim (`verdictOf`, fails closed):
+
+* the destination is the **verified** DBC → DAMM v2 migration (all migration checks, `migration.ts`);
+* the position is one the migration created, its NFT holder and the fee recipient are the launch creator;
+* the migrated-LP allocation is `verified`: **`EXPECTED_DBC_CREATOR_LP_PERCENTAGE` must equal the DBC
+  config's creator LP percentage** (liquid + permanently locked + vesting). Undeclared or mismatched →
+  the claim is recorded but nothing is creditable.
+
+Only the SOL leg funds rounds; the token leg is recorded per mint and never converted. A partner's
+position, a third-party LP, or a position NFT moved away from the creator is not this launch's
+revenue. If the DBC config gives the creator **0 % of the migrated LP**, there are no creator
+positions and therefore no post-migration funding — check the config before launch
+(`bun run verify:allocation`). The legacy `dammv2-cp` position checkpoints are still recorded for the
+allocation report; under v2 they never fund rounds (no double count).
+
+The DBC pool itself is found from the token mint (no `POOL_ADDRESS`): the indexer searches DBC
+`VirtualPool` accounts by `base_mint` (offset 136), re-derives each candidate from its own config
+(PDA `["pool", config, max(base, quote), min(base, quote)]`) and remembers the verified pool for that
+mint (`system_state.pool_discovery`). Code: `providers/meteora/pda.ts`; tests:
+`test/dbc-damm-v2-funding.test.ts`.

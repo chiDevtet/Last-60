@@ -38,6 +38,10 @@ within seconds without a restart.
   collect modes; with `OutputToken`, buy fees are in the token (recorded, not distributed).
 * **Claims.** `EvtClaimCreatorTradingFee` / `EvtClaimTradingFee` on the configured pool.
 * **Status.** `is_migrated` / `migration_progress` → `bonding | migrating | migrated`.
+* **Pool from the mint.** The pool is the PDA `["pool", config, max(base, quote), min(base, quote)]`,
+  so it depends on the launch config. Leave `POOL_ADDRESS` empty: once the token is launched the
+  indexer finds its `VirtualPool` by `base_mint` (`getProgramAccounts` memcmp at byte 136), re-derives
+  it from its own config and remembers it for that mint (`providers/meteora/pda.ts`).
 * **Verified.** Full-history reconciliation of two real pools matched on-chain counters exactly.
 
 ## Raydium LaunchLab — `LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj`

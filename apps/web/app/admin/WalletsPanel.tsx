@@ -302,7 +302,9 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
           <p><span className="text-mist">Token mint:</span> <span className="font-mono">{launch.tokenMint ?? "not set — set it in Configuration below"}</span></p>
           <p>
             <span className="text-mist">Pool:</span> <span className="font-mono">{launch.poolAddress ? shortAddress(launch.poolAddress, 6, 6) : "—"}</span>{" "}
-            {launch.poolAddressSource === "derived" && <span className="rounded border border-line px-1 text-[10px] text-mist">derived from the mint</span>}{" "}
+            {launch.poolAddressSource === "derived" && <span className="rounded border border-line px-1 text-[10px] text-mist">derived from the mint</span>}
+            {launch.poolAddressSource === "discovered" && <span className="rounded border border-line px-1 text-[10px] text-mist">found from the mint</span>}{" "}
+            {!launch.poolAddress && launch.tokenMint && launch.provider === "meteora_dbc" && <span className="text-warn">◷ waiting for the Meteora DBC pool — found automatically once the token is launched</span>}
             {launch.poolExists === true && <span className="text-good">✓ live on chain</span>}
             {launch.poolExists === false && <span className="text-warn">◷ not created yet — workers wait for the launch, then start automatically</span>}
           </p>
@@ -313,11 +315,16 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
         </div>
         {derived && (
           <p className="mt-2 flex items-center gap-2 text-xs">
-            <span className="text-mist">Raydium LaunchLab pool (SOL quote):</span> <code className="font-mono">{derived.poolAddress}</code> <Copy text={derived.poolAddress} />
-            <span className={derived.poolExists ? "text-good" : "text-mist"}>{derived.poolExists ? "exists" : "not created yet"}</span>
+            <span className="text-mist">{derived.provider === "meteora_dbc" ? "Meteora DBC pool (SOL quote):" : "Raydium LaunchLab pool (SOL quote):"}</span>{" "}
+            {derived.poolAddress ? (
+              <>
+                <code className="font-mono">{derived.poolAddress}</code> <Copy text={derived.poolAddress} />
+              </>
+            ) : null}
+            <span className={derived.poolExists ? "text-good" : "text-mist"}>{derived.poolExists ? "exists" : derived.lookup === "ambiguous" ? "several pools use this mint — enter the pool address" : derived.poolExists === false ? "not created yet" : "lookup unavailable"}</span>
           </p>
         )}
-        <p className="mt-2 text-[11px] text-dim">Set the token mint in Configuration and leave the pool address empty: the pool is derived automatically. A pool quoted in another token (e.g. USD1) must be entered explicitly.</p>
+        <p className="mt-2 text-[11px] text-dim">Set the token mint in Configuration and leave the pool address empty: a Raydium LaunchLab pool is derived from the mint, a Meteora DBC pool is found on chain from the mint once the token is launched. A pool quoted in another token (e.g. USD1) must be entered explicitly.</p>
       </div>
     </section>
   );
