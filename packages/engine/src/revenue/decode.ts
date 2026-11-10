@@ -6,6 +6,8 @@
  *                                    out of the creator fee vault; DBC claim_creator_trading_fee out of
  *                                    the pool's quote/base vaults), as parsed by the provider;
  *   cpmm_creator_trading_fee         CPMM collect_creator_fee(_permissionless) transfers to pool_creator;
+ *   damm_v2_creator_lp_fee           DAMM v2 claim_position_fee on a migration position of the verified
+ *                                    Meteora DBC graduation, transfers out of the pool's token vaults;
  *   forge_platform_lp_fee_collection LP-lock collect_cp_fees on a lock whose Fee Key was minted to the
  *                                    PlatformConfig platform_nft_wallet by the verified migration.
  * Funding inflows (last60_funding_inflow): System Program transfers (native SOL) and SPL Token /
@@ -255,6 +257,46 @@ export function extractRevenue(tx: NormalizedTx, parsed: ParsedTransaction, f: R
           destinationOwner: recipient,
           beneficiary: recipient,
           evidence: { collectInstruction: ix.ordinal, lockPda, feeKeyHolder, platformLock: platformLock === null ? "unknown" : true },
+        });
+      }
+    }
+  }
+
+  // 3b. Meteora DBC → DAMM v2: LP fees claimed from the migration positions (claim_position_fee,
+  //     already restricted to the destination's migration positions by the DAMM v2 adapter). Only the
+  //     launch creator's claims are the creator's revenue; the partner's position is not this launch's.
+  if (d && d.kind === "dbc_damm_v2" && f.role === "creator") {
+    for (const c of parsed.claims) {
+      if (c.pool !== d.pool || c.evidence?.event !== "EvtClaimPositionFee") continue;
+      const ixOrdinal = typeof c.evidence?.instruction === "number" ? (c.evidence.instruction as number) : null;
+      const ix = ixOrdinal !== null ? byOrdinal.get(ixOrdinal) : null;
+      // claim_position_fee accounts: [pool_authority, pool, position, token_a_account, token_b_account, token_a_vault, token_b_vault, token_a_mint, token_b_mint, position_nft_account, owner, …]
+      if (!ix || ix.accounts[1] !== d.pool) continue;
+      const owner = (c.evidence?.owner as string | undefined) ?? ix.accounts[10] ?? null;
+      if (!owner || owner !== f.creator) continue;
+      const vaultMint = new Map([[ix.accounts[5]!, ix.accounts[7]!], [ix.accounts[6]!, ix.accounts[8]!]]);
+      for (const t of subtreeTransfers(tx, ix)) {
+        const mint = vaultMint.get(t.source);
+        if (!mint || t.amount === 0n) continue;
+        const info = tokenAccountInfo(tx, t.destination);
+        const recipient = info?.owner ?? ataOwnerOf(t.destination, mint, t.program, [f.creator, owner]);
+        out.push({
+          kind: "collection",
+          stream: "damm_v2_creator_lp_fee",
+          launchPhase: "post_migration",
+          ...common(d.pool),
+          ...pos(t.ordinal),
+          feeMint: mint,
+          asset: assetOf(mint),
+          decimals: decimalsOf(tx, t.destination) ?? t.decimals ?? null,
+          grossAmount: t.amount,
+          netAmount: t.amount,
+          sourceAccount: t.source,
+          destinationAccount: t.destination,
+          sourceOwner: null,
+          destinationOwner: recipient,
+          beneficiary: recipient,
+          evidence: { claimInstruction: ix.ordinal, position: String(c.evidence?.position ?? ix.accounts[2] ?? ""), positionOwner: owner, vault: t.source, transfer: t.ordinal },
         });
       }
     }

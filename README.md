@@ -52,7 +52,7 @@ LAST60_PAYOUT_WALLET_ADDRESS=<dedicated payout wallet address>   # see docs/PAYO
 INDEXER_BACKFILL=none
 # REWARD_FUNDING_POLICY defaults to forge_phase_aware_v2 (activation slot pinned at first start).
 # Wallets can instead be generated from the admin page (docs/WALLETS.md); TOKEN_MINT may be set there too,
-# and a LaunchLab POOL_ADDRESS is derived from the token mint. Hands-off creator flows: docs/CREATOR_WALLET.md
+# a LaunchLab POOL_ADDRESS is derived from the token mint, a Meteora DBC pool is found from it after launch. Hands-off creator flows: docs/CREATOR_WALLET.md
 ```
 `bun scripts/find-active-pool.ts raydium_launchlab` prints a busy pool to try.
 

@@ -9,12 +9,13 @@
  *   refresh    → re-reads pool state (fee params, migration status)
  */
 import type { AppConfig } from "../config/env";
-import type { EffectiveSettings, SettingsStore } from "../config/runtime";
+import { recordDiscoveredPool, type EffectiveSettings, type SettingsStore } from "../config/runtime";
 import type { ChainRpc } from "../chain/rpc";
 import { RpcClient } from "../chain/rpc";
 import { LogsSubscriber } from "../chain/ws";
 import type { Models } from "../db/models";
 import { big } from "../db/decimal";
+import { discoverDbcPool } from "../providers/meteora/pda";
 import { AwaitingLaunchError, attachStoredMigration, createProvider, providerTargetFor, resolveAndAttachMigration, type LaunchProvider, type PoolInfo } from "../providers";
 import { basesOf, roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
@@ -105,7 +106,30 @@ export class Indexer {
   }
 
   /** (Re)initialise provider + RPC when relevant settings change. */
+  /**
+   * Meteora DBC: find the token's pool on chain (its address depends on the launch config, so it
+   * cannot be derived from the mint alone). Until the pool exists the indexer waits; once found and
+   * verified it is remembered for this mint and every process picks it up from the settings.
+   */
+  private async discoverDbcPool(s: EffectiveSettings): Promise<EffectiveSettings> {
+    const mint = s.tokenMint!;
+    const d = await discoverDbcPool(this.rpc as unknown as Parameters<typeof discoverDbcPool>[0], mint, s.payoutAssetMint);
+    if (d.status === "unsupported") throw new AwaitingLaunchError(`the Meteora DBC pool cannot be searched (${d.reason}); set the pool address in the admin console`);
+    if (d.status === "ambiguous") throw new Error(`several Meteora DBC pools use token ${mint} (${d.pools.join(", ")}); set the pool address in the admin console`);
+    if (d.status === "not_found") throw new AwaitingLaunchError(`the Meteora DBC pool for ${mint.slice(0, 4)}…${mint.slice(-4)} does not exist yet (it is found automatically once the token is launched)`);
+    await recordDiscoveredPool(this.deps.db, "meteora_dbc", mint, d.pool);
+    this.log.info({ mint, pool: d.pool, config: d.config }, "Meteora DBC pool discovered from the token mint");
+    await this.terminal.system(`Found the Meteora DBC pool ${d.pool.slice(0, 4)}…${d.pool.slice(-4)} for token ${mint.slice(0, 4)}…${mint.slice(-4)}.`, `dbc-discovered:${mint}:${d.pool}`).catch(() => undefined);
+    const next = await this.deps.settings.get(true);
+    if (next.poolAddress !== d.pool) throw new Error(`discovered pool ${d.pool} was not applied (effective pool ${next.poolAddress ?? "none"})`);
+    return next;
+  }
+
   private async configure(s: EffectiveSettings) {
+    if (s.launchProvider === "meteora_dbc" && s.tokenMint && !s.poolAddress) {
+      this.rpc ??= this.deps.rpc ?? new RpcClient({ urls: s.rpcUrls, timeoutMs: this.deps.cfg.solana.timeoutMs, maxRps: this.deps.cfg.solana.maxRps, maxTxVersion: this.deps.cfg.solana.maxTxVersion, logger: this.log });
+      s = await this.discoverDbcPool(s);
+    }
     const relevant = JSON.stringify([s.launchProvider, s.poolAddress, s.tokenMint, s.feeBeneficiaryRole, s.rpcUrls, s.wsUrl, s.indexerUseWebsocket, s.payoutAssetMint]);
     const prev = this.settings ? JSON.stringify([this.settings.launchProvider, this.settings.poolAddress, this.settings.tokenMint, this.settings.feeBeneficiaryRole, this.settings.rpcUrls, this.settings.wsUrl, this.settings.indexerUseWebsocket, this.settings.payoutAssetMint]) : null;
     this.settings = s;

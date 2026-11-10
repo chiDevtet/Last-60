@@ -58,7 +58,7 @@ export interface EffectiveSettings {
   tokenMint: string | null;
   poolAddress: string | null;
   /** `configured` (override / environment) or `derived` (Raydium LaunchLab PDA of the token mint, SOL quote). */
-  poolAddressSource: "configured" | "derived" | null;
+  poolAddressSource: "configured" | "derived" | "discovered" | null;
   feeBeneficiaryRole: AppConfig["provider"]["feeBeneficiaryRole"];
   buyerCount: number;
   minBuyQuote: bigint;
@@ -84,8 +84,15 @@ export interface EffectiveSettings {
  * in the admin console is followed by its derived pool (never by an environment pool of another
  * token); without a token override the environment pool (itself derived when only TOKEN_MINT is set).
  */
-function resolvePool(cfg: AppConfig, o: RuntimeOverrides, launchProvider: EffectiveSettings["launchProvider"], tokenMint: string | null): Pick<EffectiveSettings, "poolAddress" | "poolAddressSource"> {
+function resolvePool(cfg: AppConfig, o: RuntimeOverrides, launchProvider: EffectiveSettings["launchProvider"], tokenMint: string | null, discovered: DiscoveredPools): Pick<EffectiveSettings, "poolAddress" | "poolAddressSource"> {
   if (o.poolAddress) return { poolAddress: o.poolAddress, poolAddressSource: "configured" };
+  // Meteora DBC: the pool depends on its launch config, so it is found on chain from the mint once the
+  // launch exists (indexer, `discoverDbcPool`) and remembered per mint — never carried over to another token.
+  if (launchProvider === "meteora_dbc") {
+    if (cfg.provider.poolAddress && launchProvider === cfg.provider.id && !o.tokenMint) return { poolAddress: cfg.provider.poolAddress, poolAddressSource: cfg.provider.poolAddressSource ?? "configured" };
+    const found = tokenMint ? discovered[`meteora_dbc:${tokenMint}`] : undefined;
+    return found ? { poolAddress: found, poolAddressSource: "discovered" } : { poolAddress: null, poolAddressSource: null };
+  }
   const launchLab = launchProvider === "raydium_launchlab";
   const derive = (mint: string) => ({ poolAddress: deriveLaunchLabPool(mint), poolAddressSource: "derived" as const });
   if (launchLab && o.tokenMint) return derive(o.tokenMint);
@@ -94,7 +101,24 @@ function resolvePool(cfg: AppConfig, o: RuntimeOverrides, launchProvider: Effect
   return { poolAddress: null, poolAddressSource: null };
 }
 
-export function resolveSettings(cfg: AppConfig, overrides: RuntimeOverrides, version: number): EffectiveSettings {
+/** Pools found on chain from their token mint, keyed `<provider>:<mint>` (system_state `pool_discovery`). */
+export type DiscoveredPools = Record<string, string>;
+export const POOL_DISCOVERY_ID = "pool_discovery";
+
+export async function loadDiscoveredPools(db: Models): Promise<DiscoveredPools> {
+  const doc: any = await db.SystemState.findById(POOL_DISCOVERY_ID).lean().catch(() => null);
+  const v = doc?.value;
+  return v && typeof v === "object" ? Object.fromEntries(Object.entries(v).filter(([, x]) => typeof x === "string")) as DiscoveredPools : {};
+}
+
+/** Remember the verified pool of a mint (idempotent; a mint keeps its first verified pool). */
+export async function recordDiscoveredPool(db: Models, provider: string, tokenMint: string, pool: string): Promise<void> {
+  await db.SystemState.updateOne({ _id: POOL_DISCOVERY_ID, [`value.${provider}:${tokenMint}`]: { $exists: false } } as any, { $set: { [`value.${provider}:${tokenMint}`]: pool, updatedAt: new Date() } }, { upsert: true }).catch((err: any) => {
+    if (err?.code !== 11000) throw err; // the document exists and already names this mint
+  });
+}
+
+export function resolveSettings(cfg: AppConfig, overrides: RuntimeOverrides, version: number, discovered: DiscoveredPools = {}): EffectiveSettings {
   const o = overrides;
   const launchProvider = o.launchProvider ?? cfg.provider.id;
   const tokenMint = o.tokenMint ?? cfg.provider.tokenMint;
@@ -102,7 +126,7 @@ export function resolveSettings(cfg: AppConfig, overrides: RuntimeOverrides, ver
     version,
     launchProvider,
     tokenMint,
-    ...resolvePool(cfg, o, launchProvider, tokenMint),
+    ...resolvePool(cfg, o, launchProvider, tokenMint, discovered),
     feeBeneficiaryRole: o.feeBeneficiaryRole ?? cfg.provider.feeBeneficiaryRole,
     buyerCount: o.buyerCount ?? cfg.rewards.buyerCount,
     minBuyQuote: o.minBuyQuote !== undefined ? BigInt(o.minBuyQuote) : cfg.rewards.minBuyQuote,
@@ -128,7 +152,8 @@ export function resolveSettings(cfg: AppConfig, overrides: RuntimeOverrides, ver
 export function validateEffective(cfg: AppConfig, s: EffectiveSettings): string[] {
   const p: string[] = [];
   if (s.launchProvider !== "mock" && !s.tokenMint) p.push("tokenMint is required for this provider");
-  else if (s.launchProvider !== "mock" && !s.poolAddress) p.push("poolAddress is required for this provider (only a Raydium LaunchLab pool is derived from the token mint)");
+  // Meteora DBC without a pool: the indexer finds it from the mint once the launch exists (waiting state).
+  else if (s.launchProvider === "raydium_launchlab" && !s.poolAddress) p.push("poolAddress is required for this provider");
   if (s.launchProvider === "mock" && cfg.solana.cluster === "mainnet-beta") p.push("the mock provider (synthetic data) is refused on mainnet-beta");
   if (s.launchProvider === "meteora_dbc" && s.feeBeneficiaryRole === "platform") p.push('Meteora DBC supports roles "creator" or "partner"');
   if (s.launchProvider === "raydium_launchlab" && s.feeBeneficiaryRole === "partner") p.push('Raydium LaunchLab supports roles "creator" or "platform"');
@@ -171,7 +196,7 @@ export class SettingsStore {
     if (!force && this.cache && Date.now() - this.cache.at < this.ttlMs) return this.cache.value;
     const r = await this.raw();
     const parsed = RuntimeOverridesSchema.safeParse(r.overrides);
-    const value = resolveSettings(this.cfg, parsed.success ? parsed.data : {}, r.version);
+    const value = resolveSettings(this.cfg, parsed.success ? parsed.data : {}, r.version, await loadDiscoveredPools(this.db));
     this.cache = { at: Date.now(), value };
     return value;
   }
@@ -190,9 +215,10 @@ export class SettingsStore {
     }
     const parsed = RuntimeOverridesSchema.safeParse(next);
     if (!parsed.success) throw new SettingsValidationError(parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`));
-    const effective = resolveSettings(this.cfg, parsed.data, current.version + 1);
+    const discovered = await loadDiscoveredPools(this.db);
+    const effective = resolveSettings(this.cfg, parsed.data, current.version + 1, discovered);
     const problems = validateEffective(this.cfg, effective);
-    const before = resolveSettings(this.cfg, RuntimeOverridesSchema.safeParse(current.overrides).data ?? {}, current.version);
+    const before = resolveSettings(this.cfg, RuntimeOverridesSchema.safeParse(current.overrides).data ?? {}, current.version, discovered);
     // U1: any change of who/what fees are attributed to — role, pool or provider — is checked against
     // the target pool's history in BOTH collections (swaps and non-swap fee attributions).
     if (effective.feeBeneficiaryRole !== before.feeBeneficiaryRole || effective.poolAddress !== before.poolAddress || effective.launchProvider !== before.launchProvider) {

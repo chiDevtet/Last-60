@@ -9,6 +9,7 @@ import type { PublicKey } from "@solana/web3.js";
 import type { NormalizedTx } from "../chain/tx";
 import type { ChainRpc } from "../chain/rpc";
 import type { NormalizedAttribution } from "../accounting/attribution";
+import { DammV2Destination } from "./destination/dammV2";
 import type { CheckpointState, ClaimPlan, FeeSourceState, LaunchProvider, ParsedTransaction, PoolInfo } from "./LaunchProvider";
 import { buildDestination, type DestinationAdapter, type DestinationSpec } from "./destination";
 
@@ -69,12 +70,30 @@ export class MigrationAwareProvider implements LaunchProvider {
     return { swaps: [...a.swaps, ...b.swaps], claims: [...a.claims, ...b.claims], anomalies: [...a.anomalies, ...b.anomalies], attributions: [...(a.attributions ?? []), ...(b.attributions ?? [])] };
   }
 
-  getFeeSourceState(): Promise<FeeSourceState> {
-    return this.inner.getFeeSourceState();
+  /** The creator's DAMM v2 migration positions (Meteora DBC graduation, role creator), when attached. */
+  private dammV2(): DammV2Destination | null {
+    return this.dest instanceof DammV2Destination && this.inner.info().feeBeneficiaryRole === "creator" ? this.dest : null;
   }
 
-  buildClaimInstructions(claimer: PublicKey, destination: PublicKey): Promise<ClaimPlan> {
-    return this.inner.buildClaimInstructions(claimer, destination);
+  /** Bonding-curve unclaimed fees, plus — after a DBC → DAMM v2 graduation — the creator's unclaimed position LP fees. */
+  async getFeeSourceState(): Promise<FeeSourceState> {
+    const a = await this.inner.getFeeSourceState();
+    const d = this.dammV2();
+    const b = d ? await d.claimState(this.inner.info().beneficiary).catch(() => null) : null;
+    if (!b || (b.unclaimedQuote === 0n && b.unclaimedBase === 0n)) return a;
+    return { ...a, unclaimedQuote: a.unclaimedQuote + b.unclaimedQuote, unclaimedBase: a.unclaimedBase + b.unclaimedBase, source: `${a.source} + DAMM v2 migration positions (${b.positions.length})` };
+  }
+
+  async buildClaimInstructions(claimer: PublicKey, destination: PublicKey): Promise<ClaimPlan> {
+    const d = this.dammV2();
+    if (!d) return this.inner.buildClaimInstructions(claimer, destination);
+    const info = this.inner.info();
+    const lp = await d.buildClaimInstructions(claimer, destination, { [info.tokenMint]: info.baseTokenProgram, [info.quoteMint]: info.quoteTokenProgram });
+    if (!lp.claimed) return this.inner.buildClaimInstructions(claimer, destination);
+    // Residual bonding-curve fees are claimed in the same transaction when there are any.
+    const inner = await this.inner.getFeeSourceState().catch(() => null);
+    const bonding = inner && (inner.unclaimedQuote > 0n || inner.unclaimedBase > 0n) ? await this.inner.buildClaimInstructions(claimer, destination) : null;
+    return { instructions: [...(bonding?.instructions ?? []), ...lp.instructions], signer: claimer, description: `${bonding ? `${bonding.description} + ` : ""}claim_position_fee ×${lp.claimed} (DAMM v2 ${d.pool}) → ${destination.toBase58()}` };
   }
 
   async checkpoint(snapshotSlot: number, previous: (key: string) => Promise<CheckpointState | null>): Promise<NormalizedAttribution[]> {

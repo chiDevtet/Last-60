@@ -10,6 +10,7 @@ export * from "./LaunchProvider";
 export { MeteoraDBCProvider, DBC_PROGRAM_ID } from "./meteora/MeteoraDBCProvider";
 export { RaydiumLaunchLabProvider, LAUNCHLAB_PROGRAM_ID } from "./raydium/RaydiumLaunchLabProvider";
 export { deriveLaunchLabPool } from "./raydium/pda";
+export { deriveDbcPool, discoverDbcPool, type DbcDiscovery } from "./meteora/pda";
 export { MockProvider } from "./mock/MockProvider";
 export * from "./migration";
 export { MigrationAwareProvider } from "./MigrationAwareProvider";
@@ -52,6 +53,6 @@ export function createProvider(target: ProviderTarget, rpc: ChainRpc | null): La
 
 function req(v: string | null, name: string): string {
   // Not configured yet (set from the admin console or the environment): a waiting state, not a crash.
-  if (!v) throw new AwaitingLaunchError(name === "TOKEN_MINT" ? "no token mint is configured yet (set it in the admin console)" : `${name} is not configured yet`);
+  if (!v) throw new AwaitingLaunchError(name === "TOKEN_MINT" ? "no token mint is configured yet (set it in the admin console)" : `${name} is not configured yet (a Meteora DBC pool is found automatically once the token is launched)`);
   return v;
 }

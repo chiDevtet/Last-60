@@ -62,9 +62,18 @@ describe("environment validation", () => {
   test("provider/role combinations are validated", () => {
     expect(() => loadConfig("indexer", { ...base, FEE_BENEFICIARY_ROLE: "platform" })).toThrow(/platform/);
     expect(() => loadConfig("indexer", { ...base, LAUNCH_PROVIDER: "raydium_launchlab", FEE_BENEFICIARY_ROLE: "partner" })).toThrow(/partner/);
-    // No token yet is not an error (set it in the admin console; workers wait). A DBC pool cannot be derived.
+    // No token yet is not an error (set it in the admin console; workers wait). A DBC pool without
+    // POOL_ADDRESS is found on chain from the mint by the indexer and remembered for that mint only.
     expect(loadConfig("indexer", { ...base, TOKEN_MINT: "", POOL_ADDRESS: "" }).provider.tokenMint).toBeNull();
-    expect(() => loadConfig("indexer", { ...base, POOL_ADDRESS: "" })).toThrow(/POOL_ADDRESS: is required for meteora_dbc/);
+    const dbc = loadConfig("indexer", { ...base, POOL_ADDRESS: "" });
+    expect(dbc.provider.poolAddress).toBeNull();
+    const mint = dbc.provider.tokenMint!;
+    expect(resolveSettings(dbc, {}, 1)).toMatchObject({ tokenMint: mint, poolAddress: null, poolAddressSource: null });
+    expect(validateEffective(dbc, resolveSettings(dbc, {}, 1))).toEqual([]);
+    const found = "97xjunPVUDsYyhK5vxop3C5aXkXX37GX1SUt636nhNH9";
+    expect(resolveSettings(dbc, {}, 1, { [`meteora_dbc:${mint}`]: found })).toMatchObject({ poolAddress: found, poolAddressSource: "discovered" });
+    // another token set in the admin console never inherits that pool
+    expect(resolveSettings(dbc, { tokenMint: found }, 2, { [`meteora_dbc:${mint}`]: found })).toMatchObject({ poolAddress: null });
     expect(loadConfig("indexer", { ...base, LAUNCH_PROVIDER: "raydium_launchlab" }).provider.id).toBe("raydium_launchlab");
   });
 

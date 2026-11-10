@@ -183,6 +183,17 @@ async function verdictOf(db: Models, d: RevenueDraft, f: RevenueLaunchFacts, pro
     if (wallet && d.beneficiary !== wallet) problems.push(`collected fees were paid to ${d.beneficiary ?? "?"}, not the platform NFT wallet`);
     return { verification: problems.length ? (mismatch ? "mismatch" : "unverifiable") : "verified", problems, effectiveFeeConfig: { lockPda: String(d.evidence.lockPda), platformNftWallet: wallet, feeKeyOwnership: "platform" } };
   }
+  if (d.stream === "damm_v2_creator_lp_fee") {
+    // Meteora DBC → DAMM v2: LP fees the creator claimed from a migration position of the verified destination.
+    const a = info.destination?.allocation;
+    if (!f.creator) problems.push("missing_creator_association");
+    else if (d.beneficiary !== f.creator) problems.push(`recipient ${d.beneficiary ?? "?"} is not the launch creator ${f.creator}`);
+    if (d.evidence.positionOwner !== f.creator) problems.push(`position NFT holder ${String(d.evidence.positionOwner ?? "?")} is not the launch creator`);
+    if (!f.destination || f.destination.kind !== "dbc_damm_v2") problems.push("no_verified_damm_v2_destination");
+    const v = a?.verification ?? "not_declared";
+    if (v !== "verified") problems.push(`migrated_lp_allocation_${v}${a?.problems.length ? `: ${a.problems.join("; ")}` : ""}`);
+    return { verification: problems.length ? (v === "mismatch" ? "mismatch" : "unverifiable") : "verified", problems, effectiveFeeConfig: { position: String(d.evidence.position ?? ""), migratedLpBasis: a?.id ?? null, creatorLpPercentage: (info.feeParams.creatorLpPercentage as string | number | undefined) ?? null } };
+  }
   if (d.stream === "cpmm_creator_trading_fee") {
     const a = info.destination?.allocation;
     if (f.destination?.poolCreator && d.beneficiary !== f.destination.poolCreator) problems.push("recipient is not the CPMM pool_creator");
@@ -307,7 +318,7 @@ export async function ingestRevenue(db: Models, tx: NormalizedTx, parsed: Parsed
 
 // ── reconciliation ──────────────────────────────────────────────────────────────────────────
 
-const SPLIT_STREAMS: CollectionStream[] = ["bonding_curve_creator_fee", "forge_platform_lp_fee_collection"];
+const SPLIT_STREAMS: CollectionStream[] = ["bonding_curve_creator_fee", "forge_platform_lp_fee_collection", "damm_v2_creator_lp_fee"];
 
 /**
  * Bonding-curve creator fees that accrued at or before the activation slot were already distributed
@@ -337,7 +348,8 @@ function expectedLast60Of(c: any, absorbed: Map<string, bigint>): bigint | null 
   const split = SPLIT_OF[c.stream as CollectionStream];
   if (!split) return null;
   const p: PolicySnapshot = c.snapshot.policy;
-  const bps = c.stream === "bonding_curve_creator_fee" ? p.bondingCreatorFeeLast60Bps : p.forgeLpLast60Bps;
+  // The DAMM v2 creator LP stream funds rewards at the bonding-curve creator share (revenueStreams.ts).
+  const bps = c.stream === "forge_platform_lp_fee_collection" ? p.forgeLpLast60Bps : p.bondingCreatorFeeLast60Bps;
   const gross = big(c.netAmount) - (absorbed.get(c.key) ?? 0n);
   return expectedSplit(gross < 0n ? 0n : gross, bps).last60;
 }

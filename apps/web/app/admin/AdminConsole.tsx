@@ -21,7 +21,7 @@ const FIELDS: { group: string; fields: Field[] }[] = [
     fields: [
       { key: "launchProvider", label: "Launch provider", kind: "select", options: ["meteora_dbc", "raydium_launchlab"] },
       { key: "tokenMint", label: "Token mint", kind: "text" },
-      { key: "poolAddress", label: "Pool address", kind: "text", help: "Raydium LaunchLab: leave empty — derived from the token mint (SOL quote), even before launch" },
+      { key: "poolAddress", label: "Pool address", kind: "text", help: "Leave empty: a Raydium LaunchLab pool is derived from the token mint (even before launch); a Meteora DBC pool is found from the mint once the token is launched" },
       { key: "feeBeneficiaryRole", label: "Fee beneficiary role", kind: "select", options: ["creator", "partner", "platform"], help: "Whose fee share is distributed (DBC: creator|partner, LaunchLab: creator|platform)" },
     ],
   },

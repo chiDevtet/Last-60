@@ -381,7 +381,7 @@ export interface AppConfig {
     tokenMint: string | null;
     poolAddress: string | null;
     /** `derived`: POOL_ADDRESS was unset and the LaunchLab pool was derived from TOKEN_MINT. */
-    poolAddressSource: "configured" | "derived" | null;
+    poolAddressSource: "configured" | "derived" | "discovered" | null;
     feeBeneficiaryRole: "creator" | "partner" | "platform";
     expected: ExpectedAllocation;
   };
@@ -613,9 +613,9 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
   // Role-specific requirements
   // The token and pool may be set later from the admin console: until then the indexer and rewards
   // worker wait ("waiting for launch"). A Raydium LaunchLab pool is derived from the token mint
-  // (PDA ["pool", mint, WSOL]); a Meteora DBC pool also depends on its config and must be given.
-  const needsChainTarget = role === "indexer" || role === "rewards";
-  if (needsChainTarget && raw.LAUNCH_PROVIDER === "meteora_dbc" && raw.TOKEN_MINT && !raw.POOL_ADDRESS) problems.push("POOL_ADDRESS: is required for meteora_dbc (it cannot be derived from the token mint)");
+  // (PDA ["pool", mint, WSOL]); a Meteora DBC pool also depends on its config and is discovered.
+  // A Meteora DBC pool without POOL_ADDRESS is found on chain from TOKEN_MINT by the indexer once the
+  // launch exists (providers/meteora/pda.ts `discoverDbcPool`); until then the workers wait.
   let derivedPool: string | null = null;
   if (raw.LAUNCH_PROVIDER === "raydium_launchlab" && raw.TOKEN_MINT && !raw.POOL_ADDRESS) derivedPool = deriveLaunchLabPool(raw.TOKEN_MINT);
   if (raw.LAUNCH_PROVIDER === "mock" && raw.NODE_ENV === "production") {
