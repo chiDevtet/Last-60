@@ -1,7 +1,7 @@
-# Phase-aware revenue attribution and Last-60 reward funding (PR #6, corrected in PR #7, Forge creator distributions in PR #8, payout wallet, custody and recovery in PR #10)
+# Phase-aware revenue attribution and Asteroid Protocol reward funding (PR #6, corrected in PR #7, Forge creator distributions in PR #8, payout wallet, custody and recovery in PR #10)
 
-This document describes how LAST60 attributes Forge's revenue across the two launch phases, which
-streams may fund Last-60 buyer rewards, what evidence is required, and how Last-60 recognises Forge's
+This document describes how Asteroid Protocol attributes Forge's revenue across the two launch phases, which
+streams may fund Asteroid Protocol buyer rewards, what evidence is required, and how Asteroid Protocol recognises Forge's
 **existing** post-migration LP distribution without any change to Forgepad's platform-wide fee claimer
 (§4a). Code: `packages/engine/src/accounting/revenueStreams.ts` (pure model, incl.
 `attributeForgeDistribution`), `src/revenue/decode.ts` (transaction decoding, incl.
@@ -32,21 +32,21 @@ This model is authoritative. The percentages are fixed in code (`APPROVED_SHARES
 percentage is applied afterwards to the fees **actually collected**. Neither one proves that anything
 was collected or transferred.
 
-| Phase | What is charged | Who collects | Allocation of what was collected | Last-60 funding? |
+| Phase | What is charged | Who collects | Allocation of what was collected | Asteroid Protocol funding? |
 |---|---|---|---|---|
-| Bonding curve | creator fee **0.50 % of trade volume** (LaunchLab `creator_fee_rate` 5 000 / 10⁶) | the creator (`claim_creator_fee`) | **75 %** Last-60 buyer rewards · **25 %** creator (developer revenue) | yes — the 75 %, **once the transfer is observed** |
-| After migration | CPMM creator fee **0.05 % of trade volume** (AmmConfig `creator_fee_rate` 500 / 10⁶), minus Raydium's protocol creator-fee share | the CPMM `pool_creator` (`collect_creator_fee`) | **100 %** creator (developer revenue) · **0 %** Last-60 | **never** |
-| After migration | LP trading fees of Forge's **platform-owned** Fee Key | Forge (`collect_cp_fees` on the LP-lock program) | **50 % the creator's allocation, dedicated to Last-60 buyer rewards** · **50 %** Forge | yes — the creator's 50 %, **once the transfer is observed** |
+| Bonding curve | creator fee **0.50 % of trade volume** (LaunchLab `creator_fee_rate` 5 000 / 10⁶) | the creator (`claim_creator_fee`) | **75 %** Asteroid Protocol buyer rewards · **25 %** creator (developer revenue) | yes — the 75 %, **once the transfer is observed** |
+| After migration | CPMM creator fee **0.05 % of trade volume** (AmmConfig `creator_fee_rate` 500 / 10⁶), minus Raydium's protocol creator-fee share | the CPMM `pool_creator` (`collect_creator_fee`) | **100 %** creator (developer revenue) · **0 %** Asteroid Protocol | **never** |
+| After migration | LP trading fees of Forge's **platform-owned** Fee Key | Forge (`collect_cp_fees` on the LP-lock program) | **50 % the creator's allocation, dedicated to Asteroid Protocol buyer rewards** · **50 %** Forge | yes — the creator's 50 %, **once the transfer is observed** |
 
 Example (illustration only; accounting uses observed integer amounts): 1 000 SOL of bonding volume
 × 0.50 % = 5 SOL of creator fees charged. If the creator collects 4 SOL so far, 3 SOL (75 % of the
-4 SOL collected — never 75 % of volume) is the expected Last-60 contribution and 1 SOL stays with the
-creator. Last-60 counts the 3 SOL only when it observes a transfer of it into a configured Last-60
+4 SOL collected — never 75 % of volume) is the expected Asteroid Protocol contribution and 1 SOL stays with the
+creator. Asteroid Protocol counts the 3 SOL only when it observes a transfer of it into a configured Asteroid Protocol
 funding destination.
 
 **The creator's 50 % LP allocation.** Forge owns the platform Fee Key and claims the LP fees, so Forge
 *custodies* the whole claim. Half of it is the creator's allocation — attributed to the launch creator,
-but dedicated to Last-60 buyer rewards: it is **not** additional personal developer revenue, and it is
+but dedicated to Asteroid Protocol buyer rewards: it is **not** additional personal developer revenue, and it is
 **not** the creator's native CPMM creator fee (a different stream the creator collects directly from
 the pool). The creator does not own the Fee Key; `creator_scale` is never evidence of a creator LP
 entitlement (see `docs/FEE_ACCOUNTING.md` §2). In the code this is `forge_platform_lp_last60_contribution`
@@ -60,9 +60,9 @@ routes are recognised:
 1. **Forge's existing creator distribution** (`forge_creator_distribution`, §4a) — what Forgepad's
    collector already does today: a separate, memo-less transaction from the Fee Key holder to the
    **launch creator's wallet** paying the creator's 50 %. The creator wallet is where this stream's
-   Last-60 funds land; they are the creator's allocation dedicated to Last-60 buyer rewards, **not**
+   Asteroid Protocol funds land; they are the creator's allocation dedicated to Asteroid Protocol buyer rewards, **not**
    personal developer revenue and **not** CPMM creator trading revenue.
-2. **Into a Last-60 funding destination** (`last60_destination`, PR #6 / #7) — a transfer from the Fee
+2. **Into an Asteroid Protocol funding destination** (`last60_destination`, PR #6 / #7) — a transfer from the Fee
    Key holder to a `LAST60_FUNDING_DESTINATIONS` wallet in the claim's transaction or with a
    `last60:v1:<claim>` memo. Still supported; not required.
 
@@ -80,10 +80,10 @@ Every event carries an explicit stream; streams are never summed into one "creat
 |---|---|---|---|---|---|---|
 | `bonding_curve_creator_fee` | bonding_curve | collection (gross) | — | creator | creator | no |
 | `bonding_curve_creator_retained` | bonding_curve | derived (gross − contribution) | creator (25 %) | creator | creator | no |
-| `bonding_curve_last60_reward_contribution` | bonding_curve | observed transfer | creator (75 %) | creator | Last-60 | **yes** |
+| `bonding_curve_last60_reward_contribution` | bonding_curve | observed transfer | creator (75 %) | creator | Asteroid Protocol | **yes** |
 | `cpmm_creator_trading_fee` | post_migration | collection (net transfer) | creator (100 %) | creator | creator | no |
 | `forge_platform_lp_fee_collection` | post_migration | collection (gross) | — | Forge | Forge | no |
-| `forge_platform_lp_last60_contribution` | post_migration | observed transfer | **creator (50 %)** | Forge | Last-60 | **yes** |
+| `forge_platform_lp_last60_contribution` | post_migration | observed transfer | **creator (50 %)** | Forge | Asteroid Protocol | **yes** |
 | `forge_platform_lp_retained` | post_migration | derived (gross − contribution) | Forge (50 %) | Forge | Forge | no |
 
 Storage (all with unique keys, `$setOnInsert` writes and model-level immutability guards):
@@ -167,16 +167,16 @@ transfer indexed before its claim is linked once the claim arrives.
 | 2. swap (non-SOL quote only) | Jupiter, separate transaction | the quote leg (e.g. USD1, ai16z) → SOL; the creator's SOL basis is Jupiter's `otherAmountThreshold`, not a measured amount |
 | 3. payout | `sendPayouts`, a **separate legacy transaction**, fee payer = holder, **no memo** | `SystemProgram.transfer(holder → creator, ⌊basis × 50 %⌋)` · `createAssociatedTokenAccountIdempotent` · `TransferChecked(holder ATA → creator ATA, token, ⌊token leg × 50 %⌋)` — when the token has **no** Forge rewards distributor and the Fee Key is post-2026-08-17 (combined) |
 | — | (distributor mode) | the same transaction also pays the token's Forge rewards distributor 50 % and the creator only **25 %** (25 / 50 / 25) — not the approved model |
-| 4. writeback | MongoDB `raydium_postmig_lockfee_claims`, `raydium_launches.last_postmigration_creator_payout_tx` | Forge's own records (`harvestTx`, `distTx`) — **not** an existing Last-60 data source; not used |
+| 4. writeback | MongoDB `raydium_postmig_lockfee_claims`, `raydium_launches.last_postmigration_creator_payout_tx` | Forge's own records (`harvestTx`, `distTx`) — **not** an existing Asteroid Protocol data source; not used |
 
-The creator is `LaunchpadPool.creator` (Forge reads it on-chain; Last-60 reads the same field). The SOL
+The creator is `LaunchpadPool.creator` (Forge reads it on-chain; Asteroid Protocol reads the same field). The SOL
 basis of a SOL-quoted pool is the Raydium API's UI estimate of the unclaimed fee (`toRaw(uiAmount)`),
 not the measured claim; the token leg is measured (wallet balance delta) and therefore exactly
 `⌊claimed token × 50 %⌋`. A failed payout is logged and **not retried** (the next cycle harvests again).
 
-### What Last-60 observes and how it correlates
+### What Asteroid Protocol observes and how it correlates
 
-There is no field in the payout that names its harvest (no memo, no shared transaction). Last-60
+There is no field in the payout that names its harvest (no memo, no shared transaction). Asteroid Protocol
 therefore proves the relationship from launch-scoped, complete-index chain evidence, and refuses when
 it cannot (`attributeForgeDistribution`, pure):
 
@@ -216,7 +216,7 @@ with a `funding_attributions` row (`unresolved`, reasons, candidates); no credit
 single harvest is proven. Linked legs above the remaining allocation are credits with
 `payoutEligible=false` and the excess recorded (the claim's reconciliation shows `excess`).
 
-**High volume.** The indexer watches, per Last-60 launch, only Forge's associated token account for
+**High volume.** The indexer watches, per Asteroid Protocol launch, only Forge's associated token account for
 that launch's token (from the migration slot) — never the platform wallet's whole multi-launch
 history. The attribution pass reads only `pending` queue rows of the launch (indexed
 `(sourcePool, status, slot)`) and, per payout, the launch's latest ≤ 24 harvest rows at or before it and
@@ -234,7 +234,7 @@ many creators and many launches in one database are independent.
   credited; the token leg is credited per mint (recorded; rounds pay only in the payout asset).
 * **SOL estimate above the measured half**: that SOL leg is never payable. Because Forge's SOL basis
   is the Raydium API's estimate, a SOL payout can exceed ⌊claimed × 50 %⌋ by a small amount when
-  reserves move between Forge's read and its harvest; such legs stay unpaid in Last-60.
+  reserves move between Forge's read and its harvest; such legs stay unpaid in Asteroid Protocol.
 * **Unpaid harvest** (Forge payout error, never retried): the next harvest's payout is unresolved too.
 * **`POSTMIG_SWAP_TOKEN_LEG=true`** or a zero token leg: no anchor → recorded, never credited.
 * Coverage requires the indexer's cursors for the destination pool and Forge's launch-token account;
@@ -343,7 +343,7 @@ rolloverOut + payouts`, that consumed credits and `FUNDING_CREDITED` equal the r
 claim's consumed funding exceeds its expected allocation, and re-checks capped legacy fees.
 
 Unchanged: unique-buyer selection, the buyer snapshot, the round cadence and payout safety checks.
-Forge's claim cadence and Last-60's buyer window are separate mechanisms. Balances are per mint; only
+Forge's claim cadence and Asteroid Protocol's buyer window are separate mechanisms. Balances are per mint; only
 the payout asset funds rounds (contributions in other mints — e.g. the token leg of an LP claim — are
 recorded and reported, never converted).
 
@@ -353,7 +353,7 @@ recorded and reported, never converted).
 |---|---|
 | `REWARD_FUNDING_POLICY` | `forge_phase_aware_v2` (default, approved model) or `legacy_creator_fee_v1`; `forge_phase_aware_v1` is rejected |
 | `REWARD_FUNDING_POLICY_ACTIVATION_SLOT` | unset / `auto` (default): pinned **once** to the finalized slot at the first start of any process, stored in `system_state.funding_policy_activation` and read by every later start of every process (`config/activation.ts`) — i.e. exactly "at the deployment that enables it". Until it is resolved nothing is recorded and no round is planned. An explicit slot overrides it (at or after the switch-over; credits recorded before activation are permanently ineligible — fail closed) |
-| `LAST60_FUNDING_DESTINATIONS` | Last-60 funding wallets (comma separated); also watched by the indexer. Under v2 the dedicated `LAST60_PAYOUT_WALLET_ADDRESS` is added automatically (once), so a contribution sent straight to it needs no custody transfer; v2 requires at least one destination (the payout wallet counts) |
+| `LAST60_FUNDING_DESTINATIONS` | Asteroid Protocol funding wallets (comma separated); also watched by the indexer. Under v2 the dedicated `LAST60_PAYOUT_WALLET_ADDRESS` is added automatically (once), so a contribution sent straight to it needs no custody transfer; v2 requires at least one destination (the payout wallet counts) |
 | `LAST60_PAYOUT_WALLET_ADDRESS` (+ `…_KEYPAIR_PATH` / `…_PRIVATE_KEY`, rewards only) | the dedicated payout wallet (§16, docs/PAYOUT_WALLET.md); legacy `PAYOUT_WALLET_*` names are aliases |
 | `LAST60_CUSTODY_ENABLED` | default **on** under v2 with a payout wallet, off otherwise; `false`: no custody request can be opened or bound. Rounds still require verified custody (direct contributions into the payout wallet are verified by their own transfer) |
 | `LAST60_CUSTODY_REQUEST_TTL_HOURS` | how long an open custody request can be bound (default 168) |
@@ -381,25 +381,25 @@ not the running servers.
 | `scripts/Raypostmigration.js` (PM2 `forgeRaydiumPostMigrationCollector`) | harvests the platform Fee Key LP fees (`harvestLockLp`, `closeWsol`), swaps a non-SOL quote leg to SOL (Jupiter), then pays in ONE separate transaction, no memo: **creator wallet 25 %** (SOL + token leg in kind), **per-token rewards distributor 50 %** (SOL only), platform keeps 25 %; a token without a distributor pays **creator wallet 50 %**, platform 50 % (`scripts/quote-mints/postmig-split.js`). Creator share only on post-2026-08-17 Fee Keys. The SOL leg amount is the SDK's UI estimate, not measured from the claim transaction | in `ecosystem.config.js` with `POSTMIG_DRY_RUN: 'false'` (live) and a **60 s** default interval (both changed today) |
 | `scripts/forgeRaydiumPlatformFeeClaimer.js` | bonding-curve **platform**-fee sweep; pays 50 % of the SOL basis to rewards distributors from the same platform wallet | in `ecosystem.config.js` |
 | `pages/api/raydium/claim-creator-fees-tx.ts` | builds the creator's own `claimCreatorFee` / `claimMultipleCreatorFee` transaction, paid to the creator, + a Forge memo and a WSOL unwrap | used by My Launches |
-| Last-60 integration | none: no Last-60 funding destination, no `last60:v1` memo, no 75 % transfer anywhere | — |
+| Asteroid Protocol integration | none: no Asteroid Protocol funding destination, no `last60:v1` memo, no 75 % transfer anywhere | — |
 
 Findings against the approved model:
 
 1. **Post-migration LP split.** For a token without a Forge rewards distributor Forge pays the creator's
-   wallet exactly the approved 50 % and keeps 50 %. Since PR #8 Last-60 recognises that existing payout
-   as the creator's allocation dedicated to Last-60 (§4a); PR #7's statement that a creator-wallet payout
+   wallet exactly the approved 50 % and keeps 50 %. Since PR #8 Asteroid Protocol recognises that existing payout
+   as the creator's allocation dedicated to Asteroid Protocol (§4a); PR #7's statement that a creator-wallet payout
    is excluded is superseded — what is excluded is a transfer *from* the creator's wallet, and Forge's
    distributor mode (creator 25 %, distributor 50 %), which is recorded but never credited.
-2. **No 75 % bonding contribution exists.** The creator claims 100 % to their own wallet. Last-60 records
+2. **No 75 % bonding contribution exists.** The creator claims 100 % to their own wallet. Asteroid Protocol records
    the collection and the full untransferred 75 %, and funds nothing.
 3. **No explicit correlation field.** Distributions are separate transactions without a memo, and the
    platform wallet that pays them also pays bonding platform-fee distributions. PR #7 therefore made
    positional `exclusive_window` links non-payable; PR #8 adds the launch-anchored, complete-index
    sequence attribution of §4a instead (still never by amount, still failing closed).
 4. **Conversions.** Non-SOL quote legs are swapped before payout; a converted amount never satisfies a
-   claim in Last-60 (per-mint accounting).
+   claim in Asteroid Protocol (per-mint accounting).
 5. **Measured amounts and idempotency.** The SOL payout basis is an estimate, and payouts have no
-   persisted-before-broadcast idempotency; Last-60's own accounting does not depend on either, but
+   persisted-before-broadcast idempotency; Asteroid Protocol's own accounting does not depend on either, but
    Forgepad's payouts can under- or over-pay.
 6. **CPMM creator fee** is left to each creator (`platformCpCreator` default) — consistent with the
    approved model (Forge never touches it).
@@ -407,17 +407,17 @@ Findings against the approved model:
 ## 11. Forgepad changes: none required for the post-migration LP stream
 
 A normal Forge launch keeps using Forgepad's existing platform-wide collector unchanged: no
-Last-60-specific memo, destination, percentage, worker or per-token configuration. Last-60 adapts to
+Asteroid Protocol-specific memo, destination, percentage, worker or per-token configuration. Asteroid Protocol adapts to
 the money movements Forge already makes (§4a). This repository never modifies Forgepad.
 
 What remains outside this stream:
 
 1. **Bonding curve (75 %).** The creator claims 100 % of bonding creator fees to their own wallet; the
-   75 % Last-60 contribution is a transfer the **creator** makes (same transaction as the claim, or
-   with a `last60:v1:<claim>` memo) into a Last-60 funding destination. Until then those collections
+   75 % Asteroid Protocol contribution is a transfer the **creator** makes (same transaction as the claim, or
+   with a `last60:v1:<claim>` memo) into an Asteroid Protocol funding destination. Until then those collections
    reconcile as `awaiting_distribution`. (Not part of Forge's claimer.) With the creator wallet
-   automation Last-60 makes both the claim and that memo transfer itself (docs/CREATOR_WALLET.md).
-2. **Optional, never required** — things on Forge's side that would let Last-60 credit more of what it
+   automation Asteroid Protocol makes both the claim and that memo transfer itself (docs/CREATOR_WALLET.md).
+2. **Optional, never required** — things on Forge's side that would let Asteroid Protocol credit more of what it
    already pays: a SOL basis measured from the harvest transaction instead of the API estimate (the
    SOL leg would then never exceed the half), and paying in the claimed mint instead of swapping a
    non-SOL quote. Without them those legs stay recorded and unpaid; nothing is misattributed.
@@ -482,7 +482,7 @@ available: start with `REWARD_FUNDING_POLICY=legacy_creator_fee_v1` and switch l
 * The Forge creator route credits only Forge's no-distributor mode, the token leg of non-SOL-quoted
   pools and SOL legs not above the measured half (§4a, limits); everything else is recorded, unpaid.
 * Forge's own MongoDB records (`raydium_postmig_lockfee_claims.harvestTx/distTx`) would name the pair
-  explicitly but are not an existing Last-60 data source and are not used.
+  explicitly but are not an existing Asteroid Protocol data source and are not used.
 * The `exclusive_window` scan looks at the latest 200 collections of a source; older open claims beyond
   that window are not considered (use memo or same-transaction correlation in production).
 * Bonding-curve creator-fee claims are parsed only for `FEE_BENEFICIARY_ROLE=creator`.
@@ -499,7 +499,7 @@ available: start with `REWARD_FUNDING_POLICY=legacy_creator_fee_v1` and switch l
   inflows / unreconciled claims (bounded to 500 per pass); the Forge creator route uses its own indexed
   queue (§4a). At very high claim counts consider archiving fully reconciled claims.
 * Without the creator wallet automation (docs/CREATOR_WALLET.md), custody (§14) is creator-initiated:
-  Last-60 cannot move SOL out of a creator's wallet. A creator who never sends the custody transfer
+  Asteroid Protocol cannot move SOL out of a creator's wallet. A creator who never sends the custody transfer
   leaves the contribution attributed but unfunded (reported as
   "attributed, awaiting custody"; it never funds a round).
 * A contribution funds a round only when custody covers its whole creditable amount; partial custody is
@@ -516,7 +516,7 @@ rewards. Forge's existing collector pays the creator's 50 % to the **creator's**
 receipt is the contribution and is credited once (`reward_funding`, route `forge_creator_distribution`).
 Unless the operator installs the creator's key for the creator wallet automation (docs/CREATOR_WALLET.md —
 it then opens the request and signs the sweep itself, through exactly this workflow, method
-`creator_wallet_sweep`), Last-60 cannot sign for the creator's wallet, so the creator (or whoever holds
+`creator_wallet_sweep`), Asteroid Protocol cannot sign for the creator's wallet, so the creator (or whoever holds
 the contribution) must send it to the dedicated payout wallet. That transfer is a **custody
 transfer**: it moves the existing contribution; it never creates another `reward_funding` credit.
 
@@ -605,7 +605,7 @@ bound: `method` (`memo_observed` / `operator_signature`), `transferKey`, `signat
 ### Bonding-curve funding
 
 The 75 % bonding-curve contribution is unchanged in substance: it is the creator's observed transfer
-(same transaction as the claim, or a `last60:v1:<claim>` memo) into a Last-60 funding destination.
+(same transaction as the claim, or a `last60:v1:<claim>` memo) into an Asteroid Protocol funding destination.
 Since the payout wallet is a funding destination under v2, a creator who sends the 75 % straight to it
 needs no further step (`direct`). A contribution sent to another configured destination needs a custody
 transfer from that destination. The 25 % creator share is never credited (anything above the 75 % is
@@ -615,7 +615,7 @@ excess), and an uncorrelated or unverified transfer is never a credit.
 
 PR #8 deliberately leaves uncertain Forge creator distributions `unresolved`, and the attribution pass
 never re-evaluates a decided row. When later evidence becomes available (typically: coverage claimed
-completeness but a harvest was missing and has since been backfilled), an operator may ask Last-60 to
+completeness but a harvest was missing and has since been backfilled), an operator may ask Asteroid Protocol to
 **re-run the normal verification** for one row. Recovery is permission to rerun verification, not
 permission to override it.
 

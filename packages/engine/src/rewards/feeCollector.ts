@@ -93,7 +93,7 @@ export class FeeCollector {
         const raw = await this.d.rpc.getTransactionRaw(signature, "confirmed");
         if (raw) await ingestRawTransaction({ db: this.d.db, provider, terminal: this.d.terminal, minBuyQuote: s.minBuyQuote, log: this.log, revenue: revenueRuntimeOf(this.d.cfg) }, raw, { source: "catchup", commitment: "confirmed" });
         const claim: any = await this.d.db.FeeClaim.findOne({ signature }).lean();
-        if (claim) await this.d.terminal.feeClaimed(big(claim.quoteAmount), signature, phaseAware ? "the creator wallet (the Last-60 share follows to the payout wallet)" : "the payout wallet");
+        if (claim) await this.d.terminal.feeClaimed(big(claim.quoteAmount), signature, phaseAware ? "the creator wallet (the Asteroid Protocol share follows to the payout wallet)" : "the payout wallet");
         return signature;
       }
       if ((await this.d.rpc.getBlockHeight("confirmed")) > lastValidBlockHeight) break;

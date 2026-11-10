@@ -217,7 +217,7 @@ export function interpretPlatformConfig(c: LaunchLabPlatformConfig, cpmm: CpmmCo
       beneficiary: c.platformCpCreator ?? "the launch creator (platform_cp_creator is default)",
       status: "requires_launch_evidence",
       formula: cpmm
-        ? `accrued per CPMM swap at AmmConfig ${cpmm.address} creator_fee_rate ${cpmm.creatorFeeRate} (${pct(cpmm.creatorFeeRate)} of swap value); at collection the protocol keeps ⌊accrued × ${cpmm.creatorFeeShareRate} / 1e6⌋ (${pct(cpmm.creatorFeeShareRate)}); LAST60 counts only what the collection instruction transferred`
+        ? `accrued per CPMM swap at AmmConfig ${cpmm.address} creator_fee_rate ${cpmm.creatorFeeRate} (${pct(cpmm.creatorFeeRate)} of swap value); at collection the protocol keeps ⌊accrued × ${cpmm.creatorFeeShareRate} / 1e6⌋ (${pct(cpmm.creatorFeeShareRate)}); Asteroid Protocol counts only what the collection instruction transferred`
         : `AmmConfig ${c.cpConfig ?? "?"} not read`,
       explanation: "separate program and rate from the bonding-curve creator fee; requires the migration tx (CPMM pool_creator, enable_creator_fee, creator_fee_on) to verify",
       payableByLast60: "eligible only after a verified migration with pool_creator = creator, creator fee enabled, and a verified bonding basis",
@@ -261,7 +261,7 @@ export function renderPlatformConfigReport(r: { address: string; owner: string; 
     L.push(`    [${s.status === "confirmed" ? "CONFIRMED" : s.status === "none" ? "NONE" : "NEEDS LAUNCH EVIDENCE"}] ${s.stream} → ${s.beneficiary}`);
     L.push(`        ${s.formula}`);
     L.push(`        ${s.explanation}`);
-    L.push(`        LAST60: ${s.payableByLast60}`);
+    L.push(`        Asteroid Protocol: ${s.payableByLast60}`);
   }
   for (const n of r.notes) L.push(`  note: ${n}`);
   L.push("");

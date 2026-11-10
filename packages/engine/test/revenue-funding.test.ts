@@ -199,7 +199,7 @@ describe("Forge platform LP claims → 50 % Last-60 contribution", () => {
     expect(report.postMigration.forgePlatformLp[spec.cpmm!.token1Mint]).toMatchObject({ collections: 1, grossClaimed: "77", last60ExpectedContribution: "38" });
     expect(report.buyerRewards.eligibleBalanceByMint).toEqual({ [WSOL_MINT]: "2000000" });
     expect(renderRevenueReport(report)).toContain("Forge platform Fee Key LP fees claimed (gross)");
-    expect(renderRevenueReport(report)).toContain("creator allocation → Last-60");
+    expect(renderRevenueReport(report)).toContain("creator allocation → Asteroid Protocol");
   });
 
   test("Forge beneficiary undeclared or ≠ platform_nft_wallet, or lock facts missing: claim unresolved, contribution never payable", async () => {

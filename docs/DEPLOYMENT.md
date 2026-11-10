@@ -74,7 +74,7 @@ Exit code 78 means invalid configuration; PM2 will not restart-loop it.
 ### Sharing a host with another PM2 daemon
 
 Check `ls ~/.pm2` and `ps aux | grep 'God Daemon'` before starting anything. If another daemon is
-already running, give Last60 its own `PM2_HOME` and do not share the default one:
+already running, give Asteroid Protocol its own `PM2_HOME` and do not share the default one:
 
 ```bash
 export PM2_HOME=/root/.pm2-last60
@@ -84,7 +84,7 @@ pm2 startup systemd -u root --hp /root --service-name pm2-last60
 ```
 
 **`pm2 startup` ignores `PM2_HOME`** and writes `PM2_HOME=/root/.pm2` and
-`PIDFile=/root/.pm2/pm2.pid` into the unit. Correct both lines to the Last60 home and run
+`PIDFile=/root/.pm2/pm2.pid` into the unit. Correct both lines to the Asteroid Protocol home and run
 `systemctl daemon-reload` **before** the first `systemctl start`. A unit left at the default adopts
 the other daemon as its main process, and stopping it then kills that daemon and everything it runs.
 

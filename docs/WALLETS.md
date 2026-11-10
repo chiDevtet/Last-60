@@ -10,7 +10,7 @@ No environment variable has to be edited for any of it.
 2. The API only records the request. The **rewards worker** (the only process with the vault key) creates
    the key pair within seconds and stores the secret key **encrypted** (AES-256-GCM; the role and address
    are bound in as associated data, so an entry cannot be swapped or tampered with undetected).
-3. Every Last-60 process notices the new wallet and restarts itself (PM2 restarts it, about 15 s). They
+3. Every Asteroid Protocol process notices the new wallet and restarts itself (PM2 restarts it, about 15 s). They
    then use it exactly as if its address had been set in the environment: the payout wallet becomes the
    payout signer, a funding destination and the custody destination; the creator wallet drives the
    creator wallet automation (docs/CREATOR_WALLET.md) and claims fees.

@@ -45,7 +45,7 @@ function Revealed({ role, address, secret, onHide }: { role: string; address: st
     const blob = new Blob([JSON.stringify(Array.from(secret))], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `last60-${role}-${address.slice(0, 6)}.json`;
+    a.download = `asteroid-protocol-${role}-${address.slice(0, 6)}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   };
@@ -112,7 +112,7 @@ function ImportForm({ role, title, call, signMessage, site, onDone, onError }: {
         if (!ok) throw new Error("import cancelled");
       }
       writePin(k.publicKey);
-      if (!confirm(`Import ${parsed.address} as the ${title.toLowerCase()}?\n\nYour admin wallet will ask you to sign. The key is encrypted in this browser before it is sent. All Last-60 processes restart (about 15 s) to load it.`)) throw new Error("import cancelled");
+      if (!confirm(`Import ${parsed.address} as the ${title.toLowerCase()}?\n\nYour admin wallet will ask you to sign. The key is encrypted in this browser before it is sent. All Asteroid Protocol processes restart (about 15 s) to load it.`)) throw new Error("import cancelled");
       // 3. Sign the intent (address + worker key), seal the key to the worker, send ciphertext only.
       const requestId = newExportRequest().requestId;
       const message = importIntentMessage({ site: site ?? window.location.host, role, address: parsed.address, requestId, workerKey: k.publicKey, expiresAt: new Date(Date.now() + EXPORT_MAX_TTL_MS - 30_000).toISOString() });
@@ -171,7 +171,7 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
   }, [load]);
 
   async function generate(role: ExportWalletRole) {
-    if (!confirm(`Generate a new ${role} wallet?\n\nThe rewards worker creates the key and stores it encrypted. All Last-60 processes then restart automatically (about 15 seconds) to load it. Export a backup right after.`)) return;
+    if (!confirm(`Generate a new ${role} wallet?\n\nThe rewards worker creates the key and stores it encrypted. All Asteroid Protocol processes then restart automatically (about 15 seconds) to load it. Export a backup right after.`)) return;
     setErr(null);
     setMsg(null);
     setBusy(`gen:${role}`);
@@ -260,7 +260,7 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
                   <p className="mt-2 text-xl font-semibold">{w.balanceLamports !== null ? sol(w.balanceLamports, 6) : "—"} <span className="text-sm text-mist">SOL</span></p>
                   {role === "creator" && (
                     <p className="mt-2 text-[11px] text-mist">
-                      Fund this address with a little SOL for network fees (≈0.05 SOL), then <b>launch the token from this wallet</b> (export → import into Phantom) so it is the pool&apos;s on-chain creator. Last-60 refuses to sign for a wallet that is not the creator.
+                      Fund this address with a little SOL for network fees (≈0.05 SOL), then <b>launch the token from this wallet</b> (export → import into Phantom) so it is the pool&apos;s on-chain creator. Asteroid Protocol refuses to sign for a wallet that is not the creator.
                     </p>
                   )}
                   {w.source === "vault" && (

@@ -187,7 +187,7 @@ export class Reconciler {
       const exp = new Map(recs.map((x) => [x.key, big(x.expectedLast60)]));
       for (const x of perClaim) {
         const e = exp.get(x._id);
-        if (e === undefined || big(x.t) > e) problems.push(`claim ${String(x._id).slice(0, 80)}: consumed funding ${big(x.t)} exceeds its expected Last-60 allocation ${e ?? "(no reconciliation row)"}`);
+        if (e === undefined || big(x.t) > e) problems.push(`claim ${String(x._id).slice(0, 80)}: consumed funding ${big(x.t)} exceeds its expected Asteroid Protocol allocation ${e ?? "(no reconciliation row)"}`);
       }
     }
     const confirmedNoSig = await this.d.db.Payout.countDocuments({ state: "confirmed", confirmedSignature: null });

@@ -224,7 +224,7 @@ export async function buildFundingPipeline(db: Models, o: { payoutWallet: string
 
 export function renderFundingPipeline(r: FundingPipelineReport): string {
   const L: string[] = [];
-  L.push(`LAST60 reward-funding pipeline — ${r.generatedAt}`);
+  L.push(`Asteroid Protocol reward-funding pipeline — ${r.generatedAt}`);
   L.push(`Payout wallet: ${r.payoutWallet ?? "(not configured)"} — amounts in lamports`);
   L.push("");
   L.push("1. ECONOMIC ATTRIBUTION (who contributed)");

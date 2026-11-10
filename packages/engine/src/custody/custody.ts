@@ -230,7 +230,7 @@ export function custodyInstructions(from: string, to: string, lamports: bigint, 
     to,
     lamports: lamports.toString(),
     memo,
-    text: `From ${from}, send exactly ${lamports} lamports of native SOL (a System Program transfer, not wrapped SOL) to the Last-60 payout wallet ${to}, in a transfer-only transaction carrying the SPL memo "${memo}". Do not include any other instruction.`,
+    text: `From ${from}, send exactly ${lamports} lamports of native SOL (a System Program transfer, not wrapped SOL) to the Asteroid Protocol payout wallet ${to}, in a transfer-only transaction carrying the SPL memo "${memo}". Do not include any other instruction.`,
   };
 }
 

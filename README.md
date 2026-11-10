@@ -1,4 +1,4 @@
-<p align="center"><img src="brand/logo-dark.svg" alt="LAST60" height="56"></p>
+<p align="center"><img src="brand/logo-dark.svg" alt="Asteroid Protocol" height="72"></p>
 
 <p align="center"><b>The final minute pays.</b><br>
 Every five minutes, eligible creator fees are allocated to on-chain payouts for the five most
@@ -6,6 +6,12 @@ recent unique buyers — at a moment inside the final 60 seconds chosen by a sec
 kept private until it happens. Payouts are based on verified creator fee allocations.</p>
 
 <p align="center"><img src="docs/screenshots/dashboard-final-minute.png" alt="Dashboard in the final minute" width="860"></p>
+
+> **Formerly LAST60.** The product is now **Asteroid Protocol** ([Brand](docs/BRAND.md)). Internal
+> identifiers keep the `last60` namespace so existing deployments, databases and on-chain records stay
+> valid: `LAST60_*` environment variables, the `last60:v1:` / `last60:custody:v1:` funding memos and
+> `last60:r…` payout memos, the `last60` database, stream ids such as `forge_platform_lp_last60_contribution`,
+> the `@last60/*` workspace packages and the `last60-*` PM2 process names.
 
 ---
 
@@ -17,10 +23,10 @@ kept private until it happens. Payouts are based on verified creator fee allocat
 | **Indexer** (`apps/worker` → `indexer`) | WebSocket fast path + gap-free cursor polling + backfill; idempotent ingestion; finality tracking and fork exclusion; v1-transaction aware. |
 | **Launch providers** | Meteora DBC and Raydium LaunchLab adapters from the official IDLs, validated on real mainnet data; switch with `LAUNCH_PROVIDER` (or live, from the admin console). Strictly verified graduation to Meteora DAMM v2 and Raydium CPMM with post-migration buyer tracking and creator-entitlement accounting. |
 | **Creator-fee accounting** | Only fees allocated to the creator by on-chain configuration and position ownership are counted; every record carries gross / allocated / excluded amounts, its allocation basis, evidence and payout eligibility ([Fee accounting](docs/FEE_ACCOUNTING.md)). |
-| **Phase-aware reward funding** | Forge's two-phase model kept as seven separate streams: bonding-curve creator fees (25 % creator / 75 % Last-60 of what is **collected**), CPMM creator fees (direct creator revenue, never funding) and Forge platform LP claims (50 % the creator's allocation, dedicated to Last-60 / 50 % Forge). Only **observed, finalized, correlated** transfers fund rounds, capped at the expected allocation, once, under the versioned `forge_phase_aware_v2` policy: into a Last-60 funding destination (same transaction or memo), or — for the creator's 50 % LP allocation — **Forge's existing post-migration payout to the creator's wallet**, attributed to exactly one verified harvest by launch-scoped, complete-index evidence, never by amount; anything ambiguous is recorded and never payable ([Reward funding](docs/REWARD_FUNDING.md)). |
+| **Phase-aware reward funding** | Forge's two-phase model kept as seven separate streams: bonding-curve creator fees (25 % creator / 75 % Asteroid Protocol of what is **collected**), CPMM creator fees (direct creator revenue, never funding) and Forge platform LP claims (50 % the creator's allocation, dedicated to Asteroid Protocol / 50 % Forge). Only **observed, finalized, correlated** transfers fund rounds, capped at the expected allocation, once, under the versioned `forge_phase_aware_v2` policy: into an Asteroid Protocol funding destination (same transaction or memo), or — for the creator's 50 % LP allocation — **Forge's existing post-migration payout to the creator's wallet**, attributed to exactly one verified harvest by launch-scoped, complete-index evidence, never by amount; anything ambiguous is recorded and never payable ([Reward funding](docs/REWARD_FUNDING.md)). |
 | **API** (`apps/api`) | Public REST + Server-Sent Events from whitelisted DTOs; wallet-signature admin API with audited, version-checked configuration. |
 | **Web** (`apps/web`, Next.js 16) | Countdown centerpiece with final-minute intensification, live reward pool, buyer feed, live engine terminal, payout history with Solscan links, stats and charts, admin console, brand page. |
-| **Brand** (`brand/`) | LAST60 identity — logo (light/dark), icon, favicons, social image, X banner, OG image. |
+| **Brand** (`brand/`) | Asteroid Protocol identity — logo (light/dark), icon, favicons, social image, X banner, OG image. |
 
 ## Quick start (local, no Docker)
 
@@ -124,8 +130,9 @@ an authorized small-value payout test — then follow the go-live sequence in
 (then claims, the 75 % settlement and post-migration sweeps are automatic — [Creator wallet](docs/CREATOR_WALLET.md));
 verify the creator key against the pool in dry-run first (`bun run cli creator-wallet`).
 
-> The dashboard screenshots in `docs/screenshots/` were captured before the copy change and still
-> show an older percentage headline; the live UI no longer advertises a fixed percentage.
+> `dashboard-final-minute.png` and `dashboard-mobile.png` in `docs/screenshots/` show the Asteroid Protocol
+> identity on an offline mock run (dry-run, no trades). The other dashboard screenshots predate the rebrand and the
+> copy change: they show the former LAST60 identity and an older percentage headline.
 
 ## Layout
 

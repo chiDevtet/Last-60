@@ -24,7 +24,7 @@ export function Dashboard({ initial, initialTerminal, tradeUrl }: { initial: Das
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src="/brand/icon-dark.svg" alt="" className="h-16 w-16 opacity-80" />
           <h1 className="mt-6 text-xl font-semibold">Connecting to the reward engine…</h1>
-          <p className="mt-2 max-w-md text-sm text-mist">The dashboard is waiting for the LAST60 API. Rewards keep running on the backend regardless of this page.</p>
+          <p className="mt-2 max-w-md text-sm text-mist">The dashboard is waiting for the Asteroid Protocol API. Rewards keep running on the backend regardless of this page.</p>
         </main>
       </>
     );

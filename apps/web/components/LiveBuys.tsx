@@ -20,8 +20,8 @@ export function LiveBuys({ buys, now, explorer, cluster, minBuy }: { buys: BuyDT
             <motion.li
               key={`${b.signature}`}
               layout={!reduce}
-              initial={reduce ? false : { opacity: 0, y: -8, backgroundColor: "rgba(56,225,255,0.10)" }}
-              animate={{ opacity: 1, y: 0, backgroundColor: "rgba(56,225,255,0)" }}
+              initial={reduce ? false : { opacity: 0, y: -8, backgroundColor: "rgba(255,181,71,0.10)" }}
+              animate={{ opacity: 1, y: 0, backgroundColor: "rgba(255,181,71,0)" }}
               transition={{ duration: 0.6 }}
               className="flex items-center gap-3 border-b border-line/60 px-4 py-2.5 text-sm"
             >

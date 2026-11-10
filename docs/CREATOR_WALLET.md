@@ -1,13 +1,13 @@
 # Launch creator wallet automation
 
-With the launch creator's key installed in the rewards worker, Last-60 moves every Last-60 share out
+With the launch creator's key installed in the rewards worker, Asteroid Protocol moves every Asteroid Protocol share out
 of the creator wallet into the dedicated payout wallet on its own. After launch nothing has to be done
 by hand: no claim, no transfer, no custody request, no signature submission.
 
 | Phase | What happens automatically | How it becomes round funding |
 |---|---|---|
-| Bonding curve | 1. **Claim** — the accrued creator fee is claimed (`claim_creator_fee`) into the creator wallet (`FEE_COLLECTION_MODE=auto_claim`, the default with a creator key). 2. **75 % settlement** — once the claim is finalized, exactly the claim's outstanding Last-60 share (75 % of what was collected) is sent from the creator wallet to the payout wallet with the memo `last60:v1:<claim signature>`. The creator keeps 25 %. | The normal pipeline links the transfer to its claim (memo correlation) and writes a payable credit. It landed in the payout wallet, so custody is `direct`: it funds the next round. |
-| After migration | **Sweep** — when Forge's collector pays the creator's 50 % LP allocation to the creator wallet (REWARD_FUNDING.md §4a) and Last-60 has attributed it to its harvest (payable credit), a custody request is opened and exactly the credited SOL is sent from the creator wallet to the payout wallet with the memo `last60:custody:v1:<custodyId>`. | The normal custody verification binds it (method `creator_wallet_sweep`); once finalized the credit funds the next round. The sweep is a custody transfer, never a second contribution. |
+| Bonding curve | 1. **Claim** — the accrued creator fee is claimed (`claim_creator_fee`) into the creator wallet (`FEE_COLLECTION_MODE=auto_claim`, the default with a creator key). 2. **75 % settlement** — once the claim is finalized, exactly the claim's outstanding Asteroid Protocol share (75 % of what was collected) is sent from the creator wallet to the payout wallet with the memo `last60:v1:<claim signature>`. The creator keeps 25 %. | The normal pipeline links the transfer to its claim (memo correlation) and writes a payable credit. It landed in the payout wallet, so custody is `direct`: it funds the next round. |
+| After migration | **Sweep** — when Forge's collector pays the creator's 50 % LP allocation to the creator wallet (REWARD_FUNDING.md §4a) and Asteroid Protocol has attributed it to its harvest (payable credit), a custody request is opened and exactly the credited SOL is sent from the creator wallet to the payout wallet with the memo `last60:custody:v1:<custodyId>`. | The normal custody verification binds it (method `creator_wallet_sweep`); once finalized the credit funds the next round. The sweep is a custody transfer, never a second contribution. |
 
 Code: `packages/engine/src/creator/creatorWallet.ts` (automation), `src/rewards/feeCollector.ts`
 (claim), `src/config/activation.ts` (automatic activation slot). Tests: `packages/engine/test/creator-wallet.test.ts`.
@@ -70,7 +70,7 @@ Keep a small SOL balance in the creator wallet for network fees: `LAST60_CREATOR
 * **Destination is fixed.** The creator wallet only ever sends to `LAST60_PAYOUT_WALLET_ADDRESS`, in a
   transfer-only transaction (ComputeBudget + one System transfer + memo). No API, admin setting or
   database row supplies a recipient.
-* **Amounts come from records, never from a balance.** Settlement = the claim's expected Last-60
+* **Amounts come from records, never from a balance.** Settlement = the claim's expected Asteroid Protocol
   allocation (75 % of the collected amount, after any pre-activation accrual) minus everything already
   transferred for it; sweep = the credit's creditable amount minus what is already custodied. Unrelated
   SOL in the creator wallet (its 25 %, its CPMM creator fees, anything else) is never touched.
@@ -96,16 +96,16 @@ Keep a small SOL balance in the creator wallet for network fees: `LAST60_CREATOR
 | Funds | Stays where | Reason |
 |---|---|---|
 | 25 % of each bonding claim | creator wallet | the creator's developer revenue (approved model) |
-| CPMM creator trading fees | not claimed | 100 % creator revenue, never Last-60 funding |
+| CPMM creator trading fees | not claimed | 100 % creator revenue, never Asteroid Protocol funding |
 | Forge payout legs that are `pending` | creator wallet, until attributed | swept automatically as soon as attribution links them (indexer coverage) |
-| Forge payout legs that are `unresolved` or not payable (distributor mode, SOL above the measured half, non-SOL quote conversions, no launch anchor) | creator wallet | Last-60 cannot prove they are the creator's 50 % of one harvest (REWARD_FUNDING.md §4a); moving them would put unattributable SOL in the payout wallet |
+| Forge payout legs that are `unresolved` or not payable (distributor mode, SOL above the measured half, non-SOL quote conversions, no launch anchor) | creator wallet | Asteroid Protocol cannot prove they are the creator's 50 % of one harvest (REWARD_FUNDING.md §4a); moving them would put unattributable SOL in the payout wallet |
 | The token leg of Forge's payout (launch token) | creator wallet | rounds pay SOL and custody covers native SOL only; it is recorded per mint, never converted |
 | Claims of a non-SOL-quoted launch | creator wallet | the 75 % would be an SPL transfer; rounds pay SOL (terminal WARN) |
 | Remainders below `LAST60_CREATOR_MIN_TRANSFER_LAMPORTS` (bonding) or contributions below it (sweep) | creator wallet | a transfer would cost more in fees than it moves |
 
 ## 4. Monitoring
 
-* Terminal: `Creator wallet sent … SOL — the Last-60 share of a bonding-curve fee claim …`,
+* Terminal: `Creator wallet sent … SOL — the Asteroid Protocol share of a bonding-curve fee claim …`,
   `Creator wallet swept … SOL of Forge's post-migration creator payout …`, WARN on a low balance
   (retried automatically), ERROR on a key / creator mismatch or a stuck transfer.
 * `bun run cli creator-wallet [n]`: configuration, the worker's last pass (blocked reason, balance,

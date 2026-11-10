@@ -7,7 +7,7 @@ export function Footer({ mint, pool, explorer, cluster }: { mint: string; pool: 
       <div className="mx-auto grid max-w-7xl gap-8 px-4 py-10 text-sm text-mist sm:px-6 md:grid-cols-[1fr_auto]">
         <div>
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/brand/logo-dark.svg" alt="LAST60" className="h-5 w-auto opacity-80" />
+          <img src="/brand/logo-dark.svg" alt="Asteroid Protocol" className="h-9 w-auto opacity-90" />
           <p className="mt-3 max-w-lg text-xs leading-relaxed">
             Rewards depend on trading activity and are not guaranteed. Nothing on this site is financial advice. All payouts are public Solana transactions; verify them on-chain.
           </p>

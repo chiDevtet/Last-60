@@ -3,7 +3,7 @@ import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
 import "./globals.css";
 
-const name = process.env.NEXT_PUBLIC_APP_NAME ?? "LAST60";
+const name = process.env.NEXT_PUBLIC_APP_NAME ?? "Asteroid Protocol";
 const site = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
 
 export const metadata: Metadata = {
@@ -11,7 +11,8 @@ export const metadata: Metadata = {
   title: { default: `${name} — The final minute pays`, template: `%s · ${name}` },
   description: "Every five minutes, eligible creator fees are allocated to on-chain payouts for the most recent unique buyers. Payouts are based on verified creator fee allocations. Transparent, verifiable, Solana-native.",
   icons: { icon: [{ url: "/icon.svg", type: "image/svg+xml" }, { url: "/favicon.ico", sizes: "any" }], apple: "/apple-touch-icon.png" },
-  openGraph: { title: `${name} — The final minute pays`, description: "Eligible creator fees are allocated to payouts for the last buyers of every round.", images: ["/og-image.png"], type: "website" },
+  applicationName: name,
+  openGraph: { siteName: name, title: `${name} — The final minute pays`, description: "Eligible creator fees are allocated to payouts for the last buyers of every round.", images: ["/og-image.png"], type: "website" },
   twitter: { card: "summary_large_image", images: ["/og-image.png"] },
 };
 
