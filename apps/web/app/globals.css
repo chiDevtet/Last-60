@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
-/* LAST60 design tokens. Dark-first. Brand accents (signal/pulse) are for chrome and the
-   countdown; chart marks use the validated `series` step; status colours are reserved for state
-   and always ship with an icon + label. */
+/* Asteroid Protocol design tokens. Dark-first. Brand accents (signal = Flare gold, pulse = Ember
+   orange — the orbit's colours) are for chrome and the countdown; chart marks use the validated
+   `series` step; status colours are reserved for state and always ship with an icon + label. */
 @theme {
   --color-void: #07080c;
   --color-carbon: #0d1017;
@@ -13,8 +13,8 @@
   --color-frost: #e9edf5;
   --color-mist: #8b93a7;
   --color-dim: #5c6478;
-  --color-signal: #38e1ff;
-  --color-pulse: #7b61ff;
+  --color-signal: #ffb547;
+  --color-pulse: #ff7a1a;
   --color-series: #1a9fcc;
   --color-good: #25a06c;
   --color-warn: #bf8a16;
@@ -43,7 +43,7 @@ body {
 }
 
 ::selection {
-  background: rgb(56 225 255 / 0.25);
+  background: rgb(255 181 71 / 0.28);
 }
 
 .card {

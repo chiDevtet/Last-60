@@ -430,6 +430,6 @@ describe("round consumption under forge_phase_aware_v2", () => {
       r.chain.advance(40);
     });
     await r.db.RevenueReconciliation.updateOne({ key: "Z" }, { $set: { expectedLast60: dec(1n) } }); // e.g. a later, smaller recomputation
-    expect((await r.worker.reconciler.ledger()).problems.join("\n")).toContain("exceeds its expected Last-60 allocation");
+    expect((await r.worker.reconciler.ledger()).problems.join("\n")).toContain("exceeds its expected Asteroid Protocol allocation");
   });
 });

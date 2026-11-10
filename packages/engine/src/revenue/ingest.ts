@@ -607,7 +607,7 @@ export async function evaluateForgeDistribution(db: Models, launch: LaunchRef, f
   const slot = legsAll[0].slot;
   const toCreator = legsAll.filter((e) => e.destinationOwner === forge.creator);
   const decisions = new Map<string, ForgeLegDecisionRecord>();
-  for (const e of legsAll) if (e.destinationOwner !== forge.creator) decisions.set(e.key, { status: "unresolved", reasons: [`recipient_not_launch_creator: ${e.destinationOwner ?? "?"} (Forge outflow in a creator-distribution transaction; never Last-60 funding)`], candidates: [] });
+  for (const e of legsAll) if (e.destinationOwner !== forge.creator) decisions.set(e.key, { status: "unresolved", reasons: [`recipient_not_launch_creator: ${e.destinationOwner ?? "?"} (Forge outflow in a creator-distribution transaction; never Asteroid Protocol funding)`], candidates: [] });
   let harvestCandidates: string[] = [];
   let windowTruncated = false;
 

@@ -384,7 +384,7 @@ export class RaydiumLaunchLabProvider implements LaunchProvider {
     const pool = decodeLaunchLabPool(value.data);
     if (pool.baseMint !== this.opts.tokenMint) throw new ProviderValidationError(`Pool base mint ${pool.baseMint} does not match TOKEN_MINT ${this.opts.tokenMint}`);
     if (this.opts.payoutMint && this.opts.payoutMint !== pool.quoteMint) {
-      throw new ProviderValidationError(`Payout asset ${this.opts.payoutMint} differs from the pool's quote mint ${pool.quoteMint}; LAST60 never converts between assets`);
+      throw new ProviderValidationError(`Payout asset ${this.opts.payoutMint} differs from the pool's quote mint ${pool.quoteMint}; Asteroid Protocol never converts between assets`);
     }
     const plat = await this.rpc.getAccountInfo(pool.platformConfig);
     if (!plat.value || plat.value.owner !== LAUNCHLAB_PROGRAM_ID) throw new ProviderValidationError(`Platform config ${pool.platformConfig} not found`);

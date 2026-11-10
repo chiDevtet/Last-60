@@ -6,10 +6,10 @@ const colors = [
   ["Void", "#07080C", "Page background"],
   ["Carbon", "#0D1017", "Surfaces, chart surface"],
   ["Graphite", "#141924", "Raised surfaces"],
-  ["Frost", "#E9EDF5", "Primary text"],
+  ["Frost", "#E9EDF5", "Primary text, the mark's silver"],
   ["Mist", "#8B93A7", "Secondary text"],
-  ["Signal", "#38E1FF", "Brand accent, countdown, live states"],
-  ["Pulse", "#7B61FF", "Final arc, final-minute intensity"],
+  ["Flare", "#FFB547", "Brand accent, countdown, live states"],
+  ["Ember", "#FF7A1A", "The final arc, final-minute intensity"],
   ["Series", "#1A9FCC", "Chart marks (validated for dark surface)"],
   ["Good", "#25A06C", "Status: confirmed (with ✓ icon)"],
   ["Warn", "#BF8A16", "Status: pending (with ◷ icon)"],
@@ -20,32 +20,35 @@ export default function BrandPage() {
   return (
     <main className="mx-auto max-w-6xl px-4 py-14 sm:px-6">
       <div className="eyebrow">Identity</div>
-      <h1 className="mt-2 text-3xl font-semibold tracking-tight">LAST60 brand</h1>
+      <h1 className="mt-2 text-3xl font-semibold tracking-tight">Asteroid Protocol brand</h1>
       <p className="mt-3 max-w-2xl text-mist">
-        <strong className="text-frost">The final arc.</strong> A round is a five-segment ring, one segment per minute. Only the last segment — the final sixty seconds — is lit, ending in a bright tick at twelve o&apos;clock. The same ring is the zero in the wordmark.
+        <strong className="text-frost">The orbit.</strong> A blade-cut metal A, the apex with no crossbar, circled by a burning orbit that threads through the gap in its right leg and ends in a flare. On the site, the flare is the moment a round closes, and the countdown&apos;s final arc burns in the orbit&apos;s colours.
       </p>
       <section className="mt-10 grid gap-4 md:grid-cols-2">
-        <div className="card flex h-56 items-center justify-center bg-void">
+        <div className="card flex h-56 items-center justify-center bg-void px-6">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/brand/logo-dark.svg" alt="LAST60 logo on dark" className="h-16" />
+          <img src="/brand/logo-dark.svg" alt="Asteroid Protocol logo on dark" className="h-24 max-w-full" />
         </div>
-        <div className="flex h-56 items-center justify-center rounded-[18px] bg-white">
+        <div className="flex h-56 items-center justify-center rounded-[18px] bg-white px-6">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/brand/logo-light.svg" alt="LAST60 logo on light" className="h-16" />
+          <img src="/brand/logo-light.svg" alt="Asteroid Protocol logo on light" className="h-24 max-w-full" />
         </div>
         <div className="card flex h-56 items-center justify-center gap-10">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/brand/icon-dark.svg" alt="Icon" className="h-28" />
+          <img src="/brand/icon-dark.svg" alt="Mark" className="h-36" />
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src="/brand/icon-app.svg" alt="App icon" className="h-20" />
         </div>
-        <div className="flex h-56 items-center justify-center rounded-[18px] bg-white">
+        <div className="flex h-56 items-center justify-center gap-10 rounded-[18px] bg-white">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/brand/icon-light.svg" alt="Icon on light" className="h-28" />
+          <img src="/brand/icon-light.svg" alt="Mark on light" className="h-36" />
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/brand/wordmark-light.svg" alt="Wordmark on light" className="hidden h-12 sm:block" />
         </div>
       </section>
       <section className="mt-12">
         <h2 className="text-lg font-semibold">Colour</h2>
+        <p className="mt-1 max-w-2xl text-sm text-mist">Flare and Ember are the orbit. Warn sits near them in hue, so it always ships with its ◷ icon and a label, and Flare never marks a status.</p>
         <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
           {colors.map(([n, hex, use]) => (
             <div key={n} className="card overflow-hidden">
@@ -58,10 +61,16 @@ export default function BrandPage() {
           ))}
         </div>
       </section>
-      <section className="mt-12 grid gap-4 md:grid-cols-2">
+      <section className="mt-12 grid gap-4 md:grid-cols-3">
+        <div className="card p-6">
+          <div className="eyebrow">Wordmark — Michroma</div>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/brand/wordmark-dark.svg" alt="ASTEROID PROTOCOL" className="mt-4 h-12 max-w-full" />
+          <p className="mt-3 text-mist">Outlined from Michroma, emboldened, with the A drawn as the mark&apos;s apex. Logo only: never set as running text.</p>
+        </div>
         <div className="card p-6">
           <div className="eyebrow">Sans — Geist</div>
-          <p className="mt-3 text-4xl font-semibold tracking-tight">The final minute pays.</p>
+          <p className="mt-3 text-3xl font-semibold tracking-tight">The final minute pays.</p>
           <p className="mt-2 text-mist">UI, headings and figures. Semibold for values, proportional figures for standalone numbers.</p>
         </div>
         <div className="card p-6">

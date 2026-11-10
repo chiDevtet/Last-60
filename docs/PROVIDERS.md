@@ -83,7 +83,7 @@ bun scripts/fetch-fixtures.ts
 ## Post-migration (graduation)
 
 Bonding-curve fee logic is not valid after graduation: trading moves to another program with a
-different fee mechanism. LAST60 handles it as follows (code: `providers/migration.ts`,
+different fee mechanism. Asteroid Protocol handles it as follows (code: `providers/migration.ts`,
 `providers/destination/`, `providers/MigrationAwareProvider.ts`, `providers/migrationAttach.ts`).
 
 1. **Detect** — the bonding pool reports migrated (DBC `is_migrated`, LaunchLab `status = 2`).

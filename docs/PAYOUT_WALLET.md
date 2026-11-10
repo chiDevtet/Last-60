@@ -1,6 +1,6 @@
-# Dedicated Last-60 payout wallet
+# Dedicated Asteroid Protocol payout wallet
 
-The payout wallet is a separate Solana keypair, controlled by the operator, that holds the SOL Last-60
+The payout wallet is a separate Solana keypair, controlled by the operator, that holds the SOL Asteroid Protocol
 pays buyer rewards from. It is the destination of every custody transfer (docs/REWARD_FUNDING.md §14)
 and the only wallet reward payouts are signed from.
 
@@ -41,7 +41,7 @@ hot-loop) when:
 
 `bun run cli check-config` reports the same problems for the `rewards` role. Messages are fixed,
 sanitized strings: they never quote the key (a JSON or base58 parser error could). With **no** key
-configured the worker runs, but live payouts stay queued (`no validated payout signer`) — Last-60 never
+configured the worker runs, but live payouts stay queued (`no validated payout signer`) — Asteroid Protocol never
 falls back to a creator wallet or any other wallet.
 
 ## 3. What the signer may and may not do

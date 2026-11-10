@@ -1,8 +1,9 @@
 "use client";
 /**
  * The centerpiece. A five-segment ring (one segment per minute) that fills as the round elapses.
- * In the final 60 seconds the last segment — "the final arc" — lights up and the scene
- * intensifies as time runs out: scanner sweep, expanding pulses, rising glow.
+ * In the final 60 seconds the last segment — "the final arc" — ignites in the orbit's colours
+ * (ember → flare) and the scene intensifies as time runs out: scanner sweep, expanding pulses,
+ * rising glow. Elapsed minutes fill in the mark's silver.
  *
  * The countdown targets the ROUND END only. The client never receives the hidden execution
  * instant, so nothing here can reveal it.
@@ -107,22 +108,22 @@ export function Countdown({ round, pool, now, latest }: { round: CurrentRoundDTO
           aria-hidden
           className="absolute inset-[-18%] rounded-full blur-3xl transition-opacity duration-700"
           style={{
-            background: `radial-gradient(circle, rgb(123 97 255 / ${0.1 + intensity * 0.28}) 0%, rgb(56 225 255 / ${0.04 + intensity * 0.12}) 38%, transparent 68%)`,
+            background: `radial-gradient(circle, rgb(255 122 26 / ${0.08 + intensity * 0.26}) 0%, rgb(255 181 71 / ${0.04 + intensity * 0.12}) 38%, transparent 68%)`,
           }}
         />
         <svg viewBox="0 0 400 400" className="relative h-full w-full overflow-visible" role="timer" aria-label={`Round ${r.number}: ${mm} minutes ${ss} seconds remaining`}>
           <defs>
             <linearGradient id="cd-prog" x1="0" y1="1" x2="1" y2="0">
-              <stop offset="0" stopColor="#1A9FCC" />
-              <stop offset="1" stopColor="#38E1FF" />
+              <stop offset="0" stopColor="#8B93A7" />
+              <stop offset="1" stopColor="#E9EDF5" />
             </linearGradient>
             <linearGradient id="cd-final" gradientUnits="userSpaceOnUse" x1={pt(288)[0]} y1={pt(288)[1]} x2={pt(360)[0]} y2={pt(360)[1]}>
-              <stop offset="0" stopColor="#7B61FF" />
-              <stop offset="1" stopColor="#38E1FF" />
+              <stop offset="0" stopColor="#FF7A1A" />
+              <stop offset="1" stopColor="#FFB547" />
             </linearGradient>
             <radialGradient id="cd-sweep" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform={`translate(${CX} ${CX}) scale(${R - 24})`}>
-              <stop offset="0" stopColor="#38E1FF" stopOpacity="0" />
-              <stop offset="1" stopColor="#38E1FF" stopOpacity="0.22" />
+              <stop offset="0" stopColor="#FFB547" stopOpacity="0" />
+              <stop offset="1" stopColor="#FFB547" stopOpacity="0.22" />
             </radialGradient>
             <filter id="cd-glow" x="-30%" y="-30%" width="160%" height="160%">
               <feGaussianBlur stdDeviation="7" />
@@ -136,12 +137,12 @@ export function Countdown({ round, pool, now, latest }: { round: CurrentRoundDTO
           {[0, 72, 144, 216, 288].map((a) => {
             const [x0, y0] = pt(a, R + 16);
             const [x1, y1] = pt(a, R + 24);
-            return <line key={a} x1={x0} y1={y0} x2={x1} y2={y1} stroke={a === 288 ? "#7B61FF" : "#2A3244"} strokeWidth={2} strokeLinecap="round" />;
+            return <line key={a} x1={x0} y1={y0} x2={x1} y2={y1} stroke={a === 288 ? "#FF7A1A" : "#2A3244"} strokeWidth={2} strokeLinecap="round" />;
           })}
 
           {/* track */}
           {segments.map((g) => (
-            <path key={`t${g.i}`} d={arc(g.s, g.e)} stroke={g.i === 4 ? "rgb(123 97 255 / 0.22)" : "#1F2635"} strokeWidth={STROKE} fill="none" />
+            <path key={`t${g.i}`} d={arc(g.s, g.e)} stroke={g.i === 4 ? "rgb(255 122 26 / 0.22)" : "#1F2635"} strokeWidth={STROKE} fill="none" />
           ))}
 
           {/* scanner sweep (final minute only) */}
@@ -171,7 +172,7 @@ export function Countdown({ round, pool, now, latest }: { round: CurrentRoundDTO
               cy={CX}
               r={R}
               fill="none"
-              stroke="#38E1FF"
+              stroke="#FFB547"
               strokeWidth={2}
               initial={{ opacity: 0.55, scale: 1 }}
               animate={{ opacity: 0, scale: 1.16 }}
@@ -183,8 +184,8 @@ export function Countdown({ round, pool, now, latest }: { round: CurrentRoundDTO
           {/* leading tick */}
           {P > 0.5 && P < 359.5 && (
             <g>
-              <circle cx={pt(P)[0]} cy={pt(P)[1]} r={11} fill={inFinal ? "#38E1FF" : "#1A9FCC"} opacity={0.25} filter="url(#cd-glow)" />
-              <circle cx={pt(P)[0]} cy={pt(P)[1]} r={6.5} fill="#D6FAFF" stroke="#07080C" strokeWidth={2} />
+              <circle cx={pt(P)[0]} cy={pt(P)[1]} r={11} fill={inFinal ? "#FFB547" : "#C4CAD3"} opacity={0.25} filter="url(#cd-glow)" />
+              <circle cx={pt(P)[0]} cy={pt(P)[1]} r={6.5} fill="#FFF6E2" stroke="#07080C" strokeWidth={2} />
             </g>
           )}
         </svg>
@@ -192,12 +193,12 @@ export function Countdown({ round, pool, now, latest }: { round: CurrentRoundDTO
         {/* center readout */}
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center text-center">
           <div className="eyebrow mb-3 flex items-center gap-2">
-            <span className={`inline-block h-1.5 w-1.5 rounded-full ${inFinal ? "bg-signal live-dot" : "bg-series"}`} />
+            <span className={`inline-block h-1.5 w-1.5 rounded-full ${inFinal ? "bg-signal live-dot" : "bg-frost/60"}`} />
             Round <span className="tabular text-frost">#{r.number.toLocaleString()}</span>
           </div>
           <div
             className="tabular font-semibold leading-none tracking-tight transition-colors duration-500"
-            style={{ fontSize: "clamp(56px, 17vw, 96px)", color: inFinal ? `color-mix(in oklab, #38E1FF ${40 + intensity * 60}%, #E9EDF5)` : "#E9EDF5", textShadow: inFinal ? `0 0 ${12 + intensity * 28}px rgb(56 225 255 / ${0.25 + intensity * 0.35})` : "none" }}
+            style={{ fontSize: "clamp(56px, 17vw, 96px)", color: inFinal ? `color-mix(in oklab, #FFB547 ${40 + intensity * 60}%, #E9EDF5)` : "#E9EDF5", textShadow: inFinal ? `0 0 ${12 + intensity * 28}px rgb(255 181 71 / ${0.25 + intensity * 0.35})` : "none" }}
           >
             <span>{String(mm).padStart(2, "0")}</span>
             <span className={inFinal ? "opacity-80" : "opacity-50"}>:</span>

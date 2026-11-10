@@ -150,32 +150,32 @@ export async function buildRevenueReport(db: Models, opts: { sourcePool?: string
 export function renderRevenueReport(r: RevenueReport): string {
   const L: string[] = [];
   const p = r.policy;
-  L.push(`LAST60 revenue report — ${r.generatedAt}${r.sourcePool ? ` — bonding pool ${r.sourcePool}` : ""}`);
-  L.push(`Funding policy: ${p.version} (id ${p.id}); activation slot ${p.activationSlot ?? "—"}; bonding: ${p.bondingCreatorFeeLast60Bps / 100}% of COLLECTED creator fees to Last-60 (creator keeps ${(10_000 - p.bondingCreatorFeeLast60Bps) / 100}%); Forge LP: creator's ${p.forgeLpLast60Bps / 100}% allocation of CLAIMED platform LP fees to Last-60 (Forge keeps ${(10_000 - p.forgeLpLast60Bps) / 100}%); CPMM creator fees: 0% to Last-60${p.phaseAwareInForce === null ? "" : `; phase-aware in force at slot ${p.inForceAtSlot}: ${p.phaseAwareInForce ? "yes" : "no"}`}`);
+  L.push(`Asteroid Protocol revenue report — ${r.generatedAt}${r.sourcePool ? ` — bonding pool ${r.sourcePool}` : ""}`);
+  L.push(`Funding policy: ${p.version} (id ${p.id}); activation slot ${p.activationSlot ?? "—"}; bonding: ${p.bondingCreatorFeeLast60Bps / 100}% of COLLECTED creator fees to Asteroid Protocol (creator keeps ${(10_000 - p.bondingCreatorFeeLast60Bps) / 100}%); Forge LP: creator's ${p.forgeLpLast60Bps / 100}% allocation of CLAIMED platform LP fees to Asteroid Protocol (Forge keeps ${(10_000 - p.forgeLpLast60Bps) / 100}%); CPMM creator fees: 0% to Asteroid Protocol${p.phaseAwareInForce === null ? "" : `; phase-aware in force at slot ${p.inForceAtSlot}: ${p.phaseAwareInForce ? "yes" : "no"}`}`);
   L.push("Amounts are integer base units of each fee mint. A fee RATE is not an allocation; an expected split is not a payment.");
   L.push("");
   L.push(`BONDING CURVE — ${STREAM_INFO.bonding_curve_creator_fee.label}`);
   if (!Object.keys(r.bondingCurve).length) L.push("  (no collections observed)");
   for (const [m, x] of Object.entries(r.bondingCurve)) {
     L.push(`  mint ${m}: ${x.collections} collection(s), ${x.verifiedCollections} verified`);
-    L.push(`    gross creator fees collected   ${x.grossCreatorFeesCollected}`);
-    L.push(`    creator expected share         ${x.creatorExpectedShare}   (retained implied ${x.creatorRetainedImplied})`);
-    L.push(`    Last-60 expected contribution  ${x.last60ExpectedContribution}`);
-    L.push(`    Last-60 funding received       ${x.last60FundingReceived}   (creditable ${x.last60FundingCreditable})`);
-    L.push(`    untransferred / unverified     ${x.untransferred} / ${x.unverifiedGross}   statuses ${JSON.stringify(x.statuses)}`);
+    L.push(`    gross creator fees collected             ${x.grossCreatorFeesCollected}`);
+    L.push(`    creator expected share                   ${x.creatorExpectedShare}   (retained implied ${x.creatorRetainedImplied})`);
+    L.push(`    Asteroid Protocol expected contribution  ${x.last60ExpectedContribution}`);
+    L.push(`    Asteroid Protocol funding received       ${x.last60FundingReceived}   (creditable ${x.last60FundingCreditable})`);
+    L.push(`    untransferred / unverified               ${x.untransferred} / ${x.unverifiedGross}   statuses ${JSON.stringify(x.statuses)}`);
   }
   L.push("");
-  L.push(`POST-MIGRATION — ${STREAM_INFO.cpmm_creator_trading_fee.label} (never Last-60 funding)`);
+  L.push(`POST-MIGRATION — ${STREAM_INFO.cpmm_creator_trading_fee.label}`);
   if (!Object.keys(r.postMigration.cpmmCreatorFees).length) L.push("  (no collections observed)");
   for (const [m, x] of Object.entries(r.postMigration.cpmmCreatorFees)) L.push(`  mint ${m}: ${x.collections} collection(s); net creator transfers ${x.netCreatorTransfers}; effective share rate(s) ${x.effectiveCreatorFeeShareRates.join(", ")}; creator_fee_on ${x.creatorFeeOnModes.join(", ")}`);
   L.push(`POST-MIGRATION — ${STREAM_INFO.forge_platform_lp_fee_collection.label}`);
   if (!Object.keys(r.postMigration.forgePlatformLp).length) L.push("  (no collections observed)");
   for (const [m, x] of Object.entries(r.postMigration.forgePlatformLp)) {
     L.push(`  mint ${m}: ${x.collections} claim(s), ${x.verifiedCollections} verified`);
-    L.push(`    gross platform LP fees claimed ${x.grossClaimed}`);
-    L.push(`    creator allocation → Last-60   expected ${x.last60ExpectedContribution} / received ${x.last60FundingReceived}   (creditable ${x.last60FundingCreditable})`);
-    L.push(`    Forge retained expected        ${x.forgeRetainedExpected}   (implied ${x.forgeRetainedImplied}; independently observed: n/a)`);
-    L.push(`    untransferred / unverified     ${x.untransferred} / ${x.unverifiedGross}   statuses ${JSON.stringify(x.statuses)}`);
+    L.push(`    gross platform LP fees claimed           ${x.grossClaimed}`);
+    L.push(`    creator allocation → Asteroid Protocol   expected ${x.last60ExpectedContribution} / received ${x.last60FundingReceived}   (creditable ${x.last60FundingCreditable})`);
+    L.push(`    Forge retained expected                  ${x.forgeRetainedExpected}   (implied ${x.forgeRetainedImplied}; independently observed: n/a)`);
+    L.push(`    untransferred / unverified               ${x.untransferred} / ${x.unverifiedGross}   statuses ${JSON.stringify(x.statuses)}`);
   }
   L.push("");
   const b = r.buyerRewards;

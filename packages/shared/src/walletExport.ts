@@ -18,7 +18,7 @@ export type ExportWalletRole = "payout" | "creator";
 export const EXPORT_INFO = "last60/wallet-export/v1";
 /** Longest validity an export intent may claim. */
 export const EXPORT_MAX_TTL_MS = 5 * 60_000;
-const TITLE = "LAST60 wallet key export";
+const TITLE = "Asteroid Protocol wallet key export";
 const WARNING = "Signing reveals this wallet's private key to the browser that created this request, and only to it.";
 
 export interface ExportIntent {
@@ -106,8 +106,8 @@ export async function openExport(secret: Uint8Array, sealed: SealedExport, reque
 // encrypted to, so nobody relaying the request can store a key of their own as a Last-60 wallet.
 
 export const IMPORT_INFO = "last60/wallet-import/v1";
-const IMPORT_TITLE = "LAST60 wallet key import";
-const IMPORT_WARNING = "Signing stores this wallet's private key, encrypted, as a Last-60 wallet. Only sign for an address you control.";
+const IMPORT_TITLE = "Asteroid Protocol wallet key import";
+const IMPORT_WARNING = "Signing stores this wallet's private key, encrypted, as an Asteroid Protocol wallet. Only sign for an address you control.";
 
 export interface ImportIntent {
   site: string;

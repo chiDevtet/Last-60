@@ -260,7 +260,7 @@ export class MeteoraDBCProvider implements LaunchProvider {
     const cfg = this.decodeConfig(cfgAcc.value.data);
     const [base, quote] = await Promise.all([readMint(this.rpc, pool.baseMint), readMint(this.rpc, cfg.quoteMint)]);
     if (this.opts.payoutMint && this.opts.payoutMint !== cfg.quoteMint) {
-      throw new ProviderValidationError(`Payout asset ${this.opts.payoutMint} differs from the pool's quote mint ${cfg.quoteMint}; LAST60 never converts between assets`);
+      throw new ProviderValidationError(`Payout asset ${this.opts.payoutMint} differs from the pool's quote mint ${cfg.quoteMint}; Asteroid Protocol never converts between assets`);
     }
     return this.hydrate(pool, cfg, { baseDecimals: base.decimals, quoteDecimals: quote.decimals, baseTokenProgram: base.program, quoteTokenProgram: quote.program }, slot);
   }

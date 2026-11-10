@@ -282,7 +282,7 @@ const RawEnv = z.object({
   RECONCILIATION_TOLERANCE_LAMPORTS: bigintStr(0n),
   TERMINAL_RETENTION_DAYS: int(30, 1, 3650),
 
-  NEXT_PUBLIC_APP_NAME: z.string().default("LAST60"),
+  NEXT_PUBLIC_APP_NAME: z.string().default("Asteroid Protocol"),
   NEXT_PUBLIC_SOLANA_EXPLORER: z.string().default("https://solscan.io"),
 });
 

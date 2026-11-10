@@ -66,10 +66,10 @@ export interface StreamInfo {
 export const STREAM_INFO: Record<RevenueStream, StreamInfo> = {
   bonding_curve_creator_fee: { phase: "bonding_curve", kind: "collection", beneficiary: "creator", allocationOwner: null, custodian: "creator", rewardEligible: false, label: "Bonding-curve creator fee collected (gross, 0.50 % of volume)" },
   bonding_curve_creator_retained: { phase: "bonding_curve", kind: "retained", beneficiary: "creator", allocationOwner: "creator", custodian: "creator", rewardEligible: false, label: "Bonding-curve creator fee retained by the creator (25 %, developer revenue)" },
-  bonding_curve_last60_reward_contribution: { phase: "bonding_curve", kind: "contribution", beneficiary: "last60", allocationOwner: "creator", custodian: "creator", rewardEligible: true, label: "Bonding-curve creator fee → Last-60 buyer rewards (75 %)" },
-  cpmm_creator_trading_fee: { phase: "post_migration", kind: "collection", beneficiary: "creator", allocationOwner: "creator", custodian: "creator", rewardEligible: false, label: "CPMM creator trading fee (0.05 % of volume, developer revenue, never Last-60)" },
+  bonding_curve_last60_reward_contribution: { phase: "bonding_curve", kind: "contribution", beneficiary: "last60", allocationOwner: "creator", custodian: "creator", rewardEligible: true, label: "Bonding-curve creator fee → Asteroid Protocol buyer rewards (75 %)" },
+  cpmm_creator_trading_fee: { phase: "post_migration", kind: "collection", beneficiary: "creator", allocationOwner: "creator", custodian: "creator", rewardEligible: false, label: "CPMM creator trading fee (0.05 % of volume, developer revenue, never Asteroid Protocol funding)" },
   forge_platform_lp_fee_collection: { phase: "post_migration", kind: "collection", beneficiary: "forge", allocationOwner: null, custodian: "forge", rewardEligible: false, label: "Forge platform Fee Key LP fees claimed (gross)" },
-  forge_platform_lp_last60_contribution: { phase: "post_migration", kind: "contribution", beneficiary: "last60", allocationOwner: "creator", custodian: "forge", rewardEligible: true, label: "Creator's 50 % allocation of Forge LP fees → Last-60 buyer rewards" },
+  forge_platform_lp_last60_contribution: { phase: "post_migration", kind: "contribution", beneficiary: "last60", allocationOwner: "creator", custodian: "forge", rewardEligible: true, label: "Creator's 50 % allocation of Forge LP fees → Asteroid Protocol buyer rewards" },
   forge_platform_lp_retained: { phase: "post_migration", kind: "retained", beneficiary: "forge", allocationOwner: "forge", custodian: "forge", rewardEligible: false, label: "Forge platform LP fees retained by Forge (50 %)" },
 };
 

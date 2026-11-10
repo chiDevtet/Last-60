@@ -1,16 +1,16 @@
 # Fee accounting
 
 > **Phase-aware reward funding (PR #6)** — Forge's two-phase business model (bonding-curve creator
-> fees 25 % creator / 75 % Last-60 of what is collected; CPMM creator fees direct creator revenue;
-> Forge platform LP claims 50 % Last-60 / 50 % Forge), its seven revenue streams, claim ↔ transfer
+> fees 25 % creator / 75 % Asteroid Protocol of what is collected; CPMM creator fees direct creator revenue;
+> Forge platform LP claims 50 % Asteroid Protocol / 50 % Forge), its seven revenue streams, claim ↔ transfer
 > correlation and the versioned funding policy are specified in [REWARD_FUNDING.md](REWARD_FUNDING.md).
 > This document remains the specification of creator-allocated fee attribution, which the default
 > `legacy_creator_fee_v1` policy distributes unchanged.
 
-LAST60 distributes **fees, never volume** — and only the fees that on-chain configuration and
+Asteroid Protocol distributes **fees, never volume** — and only the fees that on-chain configuration and
 position ownership actually **allocate to the token creator** (more generally: to the configured
 beneficiary). Eligible creator fees are tracked and allocated for payouts; payouts are based on
-verified creator fee allocations. LAST60 never uses a pool's gross fees, protocol fees, partner or
+verified creator fee allocations. Asteroid Protocol never uses a pool's gross fees, protocol fees, partner or
 platform fees, or other liquidity providers' fees as creator earnings, and never counts LP
 principal as earned fees.
 
@@ -153,7 +153,7 @@ bundled Anchor IDL (raydium_launchpad 0.2.0) and the Raydium SDK 0.2.82-alpha `P
 
 Accounting interpretation (`interpretPlatformConfig`):
 
-| Stream | Beneficiary | Status | LAST60 |
+| Stream | Beneficiary | Status | Asteroid Protocol |
 |---|---|---|---|
 | Bonding-curve platform fee (1 % of trade) | `8KXqQwtr…` | confirmed by this config | never paid (platform revenue) |
 | Bonding-curve creator fee (0.5 % of trade) | the pool's `creator` | rate confirmed; the creator wallet needs the pool | distributable when `EXPECTED_LAUNCHLAB_PLATFORM_CONFIG` **and** `EXPECTED_LAUNCHLAB_CREATOR_FEE_RATE` match the pool |
@@ -184,7 +184,7 @@ mint.
 
 Nothing is hard-coded and nothing is inferred from the provider name. On load each adapter reads the
 pool and its configuration and builds an **allocation basis** (`PoolInfo.allocation`). Operators may
-declare the allocation they expect (Forgepad sets its own configuration; LAST60 checks it):
+declare the allocation they expect (Forgepad sets its own configuration; Asteroid Protocol checks it):
 
 ```
 EXPECTED_DBC_CREATOR_TRADING_FEE_PERCENTAGE   EXPECTED_DBC_CREATOR_LP_PERCENTAGE
@@ -251,12 +251,12 @@ verified**, the destination pool (`PoolInfo.accountingPools`). Therefore:
 ```
 rewardShare = ⌊fees × REWARD_BPS / 10_000⌋
 retained    = fees − rewardShare
-pool        = rewardShare + funding + rolloverIn      funding = verified Last-60 contributions (phase-aware policy; 0 under legacy)
+pool        = rewardShare + funding + rolloverIn      funding = verified Asteroid Protocol contributions (phase-aware policy; 0 under legacy)
 per         = ⌊pool / n⌋          dust = pool − per × n   (retained, recorded)
 n = 0 or per < MIN_PAYOUT_LAMPORTS → no payouts; pool → rolloverOut (rollover) or retained (retain)
 ```
 `fees` is the period's **distributable creator allocation** only (§1). `REWARD_BPS`
-(`REWARD_PERCENTAGE=75` → 7 500) is LAST60's split of those fees between buyer rewards and retained
+(`REWARD_PERCENTAGE=75` → 7 500) is Asteroid Protocol's split of those fees between buyer rewards and retained
 funds; it is unrelated to the creator's on-chain allocation percentage, the LaunchLab creator fee
 rate, or the creator's migrated-LP share — and it is **not** the bonding-curve 75 % or the Forge LP
 50 %, which are source-specific policy parameters applied to collected amounts (REWARD_FUNDING.md).
@@ -291,7 +291,7 @@ Append-only, one row per economic fact, unique idempotency `key`:
 | `PAYOUT_CONFIRMED` | `…:<payoutId>` | written **in the same MongoDB transaction** as the confirmation and buyer statistics |
 | `PAYOUT_SIMULATED` / `PAYOUT_FAILED` / `PAYOUT_REQUEUED` | `…:<payoutId>` | dry-run / exhausted (atomic) / operator requeue |
 | `FEE_CLAIMED` | `…:<signature>[:<i>]` | on-chain claim of bonding-curve or position fees |
-| `FUNDING_CREDITED` | `…:r<n>:<stream>` | verified, reconciled Last-60 contributions consumed by round n (phase-aware policy) |
+| `FUNDING_CREDITED` | `…:r<n>:<stream>` | verified, reconciled Asteroid Protocol contributions consumed by round n (phase-aware policy) |
 
 ## 8. Collection
 
@@ -299,9 +299,9 @@ Append-only, one row per economic fact, unique idempotency `key`:
 payout wallet. `auto_claim` (live mode only, bonding-curve claims; the default when the launch creator
 wallet is configured, docs/CREATOR_WALLET.md) is gated by the same signer-side live/mainnet checks as
 payouts. Under `forge_phase_aware_v2` the claim lands in the creator's own wallet and the creator
-wallet automation sends the 75 % Last-60 share to the payout wallet (memo-correlated); under the legacy
+wallet automation sends the 75 % Asteroid Protocol share to the payout wallet (memo-correlated); under the legacy
 policy the claim is unwrapped into the payout wallet. Post-migration collection (DAMM v2 position claims, CPMM creator-fee
-collection, LP-lock fee collection) is manual; LAST60 observes and accounts it.
+collection, LP-lock fee collection) is manual; Asteroid Protocol observes and accounts it.
 
 ## 9. Reconciliation (`rewards/reconciliation.ts`)
 

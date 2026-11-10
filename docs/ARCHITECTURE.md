@@ -1,4 +1,4 @@
-# LAST60 — System Architecture
+# Asteroid Protocol — System Architecture
 
 > Status: living document. Every claim about Meteora DBC and Raydium LaunchLab in this file
 > was verified against the programs' source code / official IDLs and against real mainnet
@@ -166,7 +166,7 @@ leaders safe.
    the only funding source. Under `forge_phase_aware_v2` (the default; activation slot pinned at the
    first start unless configured, `config/activation.ts`), for a snapshot after the
    activation slot, eligible creator fees count only up to that slot and the round additionally
-   consumes verified, reconciled Last-60 contribution credits (payout asset, finalized transfers,
+   consumes verified, reconciled Asteroid Protocol contribution credits (payout asset, finalized transfers,
    not yet consumed) — inside the step-7 transaction, conditionally, so each credit funds one round.
 6. Allocation (pure integer function, `rewards/allocation.ts`):
    * `reward = ⌊fees · REWARD_BPS / 10000⌋ + funding + rolloverIn`, `retained = fees − ⌊…⌋`
@@ -224,7 +224,7 @@ See `docs/FEE_ACCOUNTING.md` for the full ledger specification. Summary:
   collections, CPMM creator-fee collections, Forge platform LP claims, funding inflows); inflows are
   correlated to claims (same transaction, `last60:v1:` memo, or opt-in exclusive window), producing
   one `reward_funding` credit per inflow and derived `revenue_reconciliations` per claim. Seven
-  streams are reported separately; only the two Last-60 contributions can fund rounds.
+  streams are reported separately; only the two Asteroid Protocol contributions can fund rounds.
 * **Forge's existing creator distribution (PR #8):** after a verified LaunchLab → CPMM migration the
   indexer also watches Forge's associated token account for the launch token (from the migration
   slot) and records, for the destination pool and that account, `syncedThroughSlot` after each
