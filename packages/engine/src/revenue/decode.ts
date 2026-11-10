@@ -15,6 +15,8 @@
  */
 import type { FlatInstruction, NormalizedTx } from "../chain/tx";
 import { decodeTokenTransfer, SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID, subtreeTransfers, tokenAccountInfo } from "../chain/tx";
+import { ASSOCIATED_TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { PublicKey } from "@solana/web3.js";
 import { COLLECT_CP_FEES_DISC, RAYDIUM_CP_LOCK_PROGRAM_ID } from "../providers/migration";
 import type { ParsedTransaction } from "../providers/LaunchProvider";
 import { assetOf, FORGE_CREATOR_DISTRIBUTION, NATIVE_SOL, parseCustodyMemo, parseFundingMemo, type CollectionStream, type FundingRoute, type LaunchPhase } from "../accounting/revenueStreams";
@@ -90,6 +92,24 @@ export interface RevenueDraft {
 const keyOf = (d: Pick<RevenueDraft, "stream" | "signature" | "ordinal" | "feeMint">) => `${d.stream}:${d.signature}:${d.ordinal}:${d.feeMint}`;
 export { keyOf as revenueEventKey };
 
+/**
+ * The candidate whose associated token account for `mint` (under `tokenProgram`) is `account`, else null.
+ * An ATA address is a PDA of (owner, token program, mint), so a match proves ownership without the
+ * account still existing — but only for these explicit candidates, never by searching.
+ */
+export function ataOwnerOf(account: string, mint: string, tokenProgram: string, candidates: readonly (string | null | undefined)[]): string | null {
+  if (tokenProgram !== SPL_TOKEN_PROGRAM_ID && tokenProgram !== SPL_TOKEN_2022_PROGRAM_ID) return null;
+  for (const c of candidates) {
+    if (!c) continue;
+    try {
+      if (getAssociatedTokenAddressSync(new PublicKey(mint), new PublicKey(c), true, new PublicKey(tokenProgram), ASSOCIATED_TOKEN_PROGRAM_ID).toBase58() === account) return c;
+    } catch {
+      /* not a valid key */
+    }
+  }
+  return null;
+}
+
 function decimalsOf(tx: NormalizedTx, account: string): number | null {
   const b = tx.postTokenBalances.find((x) => x.account === account) ?? tx.preTokenBalances.find((x) => x.account === account);
   return b ? b.decimals : null;
@@ -148,6 +168,9 @@ export function extractRevenue(tx: NormalizedTx, parsed: ParsedTransaction, f: R
         const info = tokenAccountInfo(tx, t.destination);
         const mint = t.mint ?? info?.mint ?? tokenAccountInfo(tx, t.source)?.mint ?? null;
         if (!mint) continue;
+        // A claim into an ATA that the same transaction creates and closes (the usual WSOL claim → unwrap)
+        // leaves no token-balance record, so the owner is proven from the ATA address instead.
+        const owner = info?.owner ?? ataOwnerOf(t.destination, mint, t.program, [f.creator, c.claimer]);
         out.push({
           kind: "collection",
           stream: "bonding_curve_creator_fee",
@@ -156,14 +179,14 @@ export function extractRevenue(tx: NormalizedTx, parsed: ParsedTransaction, f: R
           ...pos(t.ordinal),
           feeMint: mint,
           asset: assetOf(mint),
-          decimals: decimalsOf(tx, t.destination),
+          decimals: decimalsOf(tx, t.destination) ?? t.decimals ?? null,
           grossAmount: t.amount,
           netAmount: t.amount,
           sourceAccount: t.source,
           destinationAccount: t.destination,
           sourceOwner: null,
-          destinationOwner: info?.owner ?? null,
-          beneficiary: info?.owner ?? null,
+          destinationOwner: owner,
+          beneficiary: owner,
           evidence: { claimInstruction: ix.ordinal, claimer: c.claimer, vault: t.source, transfer: t.ordinal },
         });
       }

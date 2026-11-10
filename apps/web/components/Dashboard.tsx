@@ -2,6 +2,7 @@
 import type { DashboardSnapshotDTO, TerminalEventDTO } from "@last60/shared";
 import { useLive, useNow } from "@/lib/useLive";
 import { Countdown } from "./Countdown";
+import { TokenCA } from "./TokenCA";
 import { Header } from "./Header";
 import { LiveBuys } from "./LiveBuys";
 import { PayoutHistory } from "./PayoutHistory";
@@ -60,6 +61,7 @@ export function Dashboard({ initial, initialTerminal, tradeUrl }: { initial: Das
               </p>
             </div>
             <Countdown round={round} pool={pool} now={now} latest={latest} />
+            <TokenCA mint={meta.tokenMint} />
           </div>
         </section>
 

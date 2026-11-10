@@ -168,6 +168,8 @@ export interface TokenTransfer {
   authority: string;
   amount: bigint;
   mint: string | null;
+  /** TransferChecked carries the mint's decimals; null for a plain Transfer. */
+  decimals?: number | null;
 }
 
 /** Decode an SPL Token / Token-2022 `Transfer` (3) or `TransferChecked` (12) instruction, else null. */
@@ -178,7 +180,7 @@ export function decodeTokenTransfer(ix: FlatInstruction): TokenTransfer | null {
     return { ordinal: ix.ordinal, program: ix.programId, source: ix.accounts[0]!, destination: ix.accounts[1]!, authority: ix.accounts[2]!, amount: ix.data.readBigUInt64LE(1), mint: null };
   }
   if (tag === 12 && ix.data.length >= 10 && ix.accounts.length >= 4) {
-    return { ordinal: ix.ordinal, program: ix.programId, source: ix.accounts[0]!, destination: ix.accounts[2]!, authority: ix.accounts[3]!, amount: ix.data.readBigUInt64LE(1), mint: ix.accounts[1]! };
+    return { ordinal: ix.ordinal, program: ix.programId, source: ix.accounts[0]!, destination: ix.accounts[2]!, authority: ix.accounts[3]!, amount: ix.data.readBigUInt64LE(1), mint: ix.accounts[1]!, decimals: ix.data[9]! };
   }
   return null;
 }

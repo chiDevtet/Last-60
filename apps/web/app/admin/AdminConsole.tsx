@@ -84,6 +84,8 @@ export function AdminConsole() {
   const [token, setToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Pending "which wallet should sign?" prompt (session restored without a known wallet).
+  const [picker, setPicker] = useState<((w: Wallet | null) => void) | null>(null);
 
   useEffect(() => {
     const api = getWallets();
@@ -122,6 +124,9 @@ export function AdminConsole() {
       const acc: WalletAccount | undefined = accounts.find((a: WalletAccount) => a.chains.some((c) => c.startsWith("solana:"))) ?? accounts[0];
       if (!acc) throw new Error("wallet returned no account");
       setAccount({ wallet: w, account: acc });
+      try {
+        sessionStorage.setItem("last60.admin.wallet", w.name);
+      } catch {}
       const n = await call("/auth/nonce", { method: "POST", body: JSON.stringify({ wallet: acc.address }) });
       let body: Record<string, string>;
       if ("solana:signIn" in w.features) {
@@ -163,22 +168,72 @@ export function AdminConsole() {
     );
   }
   const signMessage: SignMessage = async (message) => {
+    // Every intent must be signed by the signed-in admin account (the API rejects any other signer).
+    const admin: string = (await call("/me")).wallet;
+    const pick = (accounts: readonly WalletAccount[]) => accounts.find((x) => x.address === admin);
     let acc = account;
     if (!acc) {
       // Session restored from storage: reconnect a wallet to sign (the API checks it is the signed-in admin).
-      const w = wallets.find((x) => "solana:signMessage" in x.features);
-      if (!w) throw new Error("no wallet with message signing is available in this browser");
+      // Use the wallet that signed in (never just the first one the browser registers, e.g. Brave Wallet).
+      const signers = wallets.filter((x) => "solana:signMessage" in x.features);
+      let remembered: string | null = null;
+      try {
+        remembered = sessionStorage.getItem("last60.admin.wallet");
+      } catch {}
+      let w: Wallet | null | undefined = signers.find((x) => x.name === remembered);
+      if (!w && signers.length === 1) w = signers[0];
+      if (!w && signers.length > 1) w = await new Promise<Wallet | null>((resolve) => setPicker(() => resolve));
+      if (!w) throw new Error(signers.length ? "no wallet selected" : "no wallet with message signing is available in this browser");
+      try {
+        sessionStorage.setItem("last60.admin.wallet", w.name);
+      } catch {}
       const { accounts } = await (w.features["standard:connect"] as any).connect();
-      const a: WalletAccount | undefined = accounts.find((x: WalletAccount) => x.chains.some((c) => c.startsWith("solana:"))) ?? accounts[0];
+      const a = pick(accounts) ?? accounts[0];
       if (!a) throw new Error("wallet returned no account");
       acc = { wallet: w, account: a };
-      setAccount(acc);
     }
+    if (acc.account.address !== admin) {
+      // The wallet's active account may have changed since sign-in (e.g. a newly imported key became active).
+      const { accounts } = await (acc.wallet.features["standard:connect"] as any).connect();
+      const a = pick(accounts) ?? pick(acc.wallet.accounts);
+      if (!a) {
+        const current: string | undefined = accounts[0]?.address;
+        throw new Error(`${acc.wallet.name} is on account ${current ? `${current.slice(0, 4)}…${current.slice(-4)}` : "(none)"}, not your admin wallet ${admin.slice(0, 4)}…${admin.slice(-4)}. Switch ${acc.wallet.name} to the admin account and try again.`);
+      }
+      acc = { wallet: acc.wallet, account: a };
+    }
+    setAccount(acc);
     if (!("solana:signMessage" in acc.wallet.features)) throw new Error(`${acc.wallet.name} cannot sign messages`);
     const [out] = await (acc.wallet.features["solana:signMessage"] as any).signMessage({ account: acc.account, message: new TextEncoder().encode(message) });
     return { signature: bs58.encode(out.signature), address: acc.account.address };
   };
-  return <Console call={call} signMessage={signMessage} me={account?.account.address ?? null} onSignOut={() => { setToken(null); try { sessionStorage.removeItem("last60.admin"); } catch {} }} notice={notice} setNotice={setNotice} />;
+  const choose = (w: Wallet | null) => {
+    picker?.(w);
+    setPicker(null);
+  };
+  return (
+    <>
+      <Console call={call} signMessage={signMessage} me={account?.account.address ?? null} onSignOut={() => { setToken(null); setAccount(null); try { sessionStorage.removeItem("last60.admin"); sessionStorage.removeItem("last60.admin.wallet"); } catch {} }} notice={notice} setNotice={setNotice} />
+      {picker && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog" aria-modal="true" aria-label="Choose a wallet to sign with">
+          <div className="card w-full max-w-sm p-6">
+            <h2 className="text-lg font-semibold">Sign with which wallet?</h2>
+            <p className="mt-1 text-sm text-mist">Pick the allow-listed wallet you signed in with.</p>
+            <div className="mt-4 space-y-2">
+              {wallets.filter((x) => "solana:signMessage" in x.features).map((w) => (
+                <button key={w.name} onClick={() => choose(w)} className="focus-ring flex w-full items-center gap-3 rounded-xl border border-line px-4 py-3 text-left hover:bg-white/[0.03]">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={w.icon} alt="" className="h-6 w-6 rounded" />
+                  <span className="font-medium">{w.name}</span>
+                </button>
+              ))}
+            </div>
+            <button onClick={() => choose(null)} className="focus-ring mt-4 text-sm text-mist hover:underline">Cancel</button>
+          </div>
+        </div>
+      )}
+    </>
+  );
 }
 
 function Console({ call, signMessage, me, onSignOut, notice, setNotice }: { call: (p: string, i?: RequestInit) => Promise<any>; signMessage: SignMessage; me: string | null; onSignOut: () => void; notice: string | null; setNotice: (s: string | null) => void }) {
