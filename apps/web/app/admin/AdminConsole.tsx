@@ -28,7 +28,9 @@ const FIELDS: { group: string; fields: Field[] }[] = [
   {
     group: "Rewards",
     fields: [
-      { key: "buyerCount", label: "Recipients per round", kind: "int" },
+      { key: "buyerCount", label: "Buyers paid per round", kind: "int" },
+      { key: "holderCount", label: "Random holders paid per round", kind: "int", help: "Drawn from holders not already paid as buyers; 0 switches the holder draw off" },
+      { key: "minHolderTokens", label: "Minimum holding for the holder draw (whole tokens)", kind: "text", help: "100000 = 0.01% of a 1,000,000,000 supply" },
       { key: "minBuyQuote", label: "Minimum qualifying buy (SOL)", kind: "lamports" },
       { key: "rewardBps", label: "Reward percentage (%)", kind: "bps" },
       { key: "minPayoutLamports", label: "Minimum payout per wallet (SOL)", kind: "lamports" },

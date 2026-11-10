@@ -25,7 +25,7 @@ import { boundsOf, roundIndexAt, type ScheduleParams } from "../rewards/roundMat
 import { periodFees, periodMatch } from "../rewards/selection";
 
 const EXECUTED_STATES = ["snapshotting", "paying", "awaiting_funds", "completed", "rolled_over", "attention"];
-const PUBLIC_ROUND_FIELDS = "roundNumber roundIndex startsAt endsAt state completedAt snapshotSlot fees reward retained rolloverIn rolloverOut dust perRecipient recipientCount paid dryRun config.buyerCount config.minBuyQuote config.rewardBps";
+const PUBLIC_ROUND_FIELDS = "roundNumber roundIndex startsAt endsAt state completedAt snapshotSlot fees reward retained rolloverIn rolloverOut dust perRecipient recipientCount holderRecipientCount holderDraw.eligibleCount holderDraw.seed paid dryRun config.buyerCount config.holderCount config.minHolderTokens config.minBuyQuote config.rewardBps";
 
 export function phaseOf(r: any, now: number, windowStartsAt: number): RoundPhase {
   switch (r?.state) {
@@ -135,6 +135,8 @@ export class PublicData {
         durationSeconds: this.params.roundDurationMs / 1000,
         finalWindowSeconds: this.params.windowDurationMs / 1000,
         buyerCount: s.buyerCount,
+        holderCount: s.holderCount,
+        minHolderTokens: s.minHolderTokens.toString(),
         minBuy: s.minBuyQuote.toString(),
         rewardBps: s.rewardBps,
         qualifyingBuyers: qualifying,
@@ -212,6 +214,7 @@ export class PublicData {
       dust: big(r.dust).toString(),
       perRecipient: big(r.perRecipient).toString(),
       recipientCount: r.recipientCount ?? 0,
+      holderRecipientCount: r.holderRecipientCount ?? 0,
       paid: big(r.paid).toString(),
       dryRun: !!r.dryRun,
     };
@@ -222,6 +225,7 @@ export class PublicData {
     return {
       roundNumber: p.roundNumber,
       recipient: p.recipient,
+      kind: p.kind === "holder" ? "holder" : "buyer",
       amount: big(p.amount).toString(),
       state,
       // Only expose a signature once it is final; in-flight signatures are public on-chain anyway
@@ -243,11 +247,15 @@ export class PublicData {
   async round(n: number): Promise<RoundDetailDTO | null> {
     const r: any = await this.db.Round.findOne({ roundNumber: n }, PUBLIC_ROUND_FIELDS).lean();
     if (!r || !EXECUTED_STATES.concat("missed").includes(r.state) || r.state === "snapshotting") return null;
-    const payouts: any[] = await this.db.Payout.find({ roundNumber: n }, "roundNumber recipient amount state confirmedSignature confirmedAt position").sort({ position: 1 }).lean();
+    const payouts: any[] = await this.db.Payout.find({ roundNumber: n }, "roundNumber recipient kind amount state confirmedSignature confirmedAt position").sort({ position: 1 }).lean();
     return {
       ...this.roundSummary(r),
       snapshotSlot: r.snapshotSlot ?? null,
       buyerCount: r.config?.buyerCount ?? 0,
+      holderCount: r.config?.holderCount ?? 0,
+      minHolderTokens: r.config?.minHolderTokens ?? "0",
+      eligibleHolders: r.holderDraw?.eligibleCount ?? 0,
+      holderDrawSeed: r.holderDraw?.seed ?? null,
       minBuy: big(r.config?.minBuyQuote).toString(),
       rewardBps: r.config?.rewardBps ?? 0,
       payouts: payouts.map((p) => this.payoutDTO(p)),
@@ -258,7 +266,7 @@ export class PublicData {
     const limit = Math.min(o.limit ?? 50, 200);
     const q: Record<string, unknown> = { state: { $in: ["confirmed", "simulated"] } };
     if (o.before) q.confirmedAt = { $lt: new Date(o.before) };
-    const rows: any[] = await this.db.Payout.find(q, "roundNumber recipient amount state confirmedSignature confirmedAt").sort({ confirmedAt: -1 }).limit(limit + 1).lean();
+    const rows: any[] = await this.db.Payout.find(q, "roundNumber recipient kind amount state confirmedSignature confirmedAt").sort({ confirmedAt: -1 }).limit(limit + 1).lean();
     const items = rows.slice(0, limit).map((p) => this.payoutDTO(p));
     return { items, nextCursor: rows.length > limit ? items[items.length - 1]!.confirmedAt : null };
   }

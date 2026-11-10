@@ -157,6 +157,21 @@ export class FakeChain implements ChainRpc {
     }
     return { slot: this.slot, value: value.sort((a, b) => (b.amount > a.amount ? 1 : -1)) };
   }
+  /** Supports the `dataSize` and `memcmp` (base58 bytes) filters and `dataSlice`. */
+  async getProgramAccounts(programId: string, o: { filters: unknown[]; dataSlice?: { offset: number; length: number } }) {
+    this.maybeFail("getProgramAccounts");
+    const out: { pubkey: string; account: AccountInfoRaw }[] = [];
+    for (const [pubkey, acc] of this.accounts) {
+      if (acc.owner !== programId) continue;
+      const ok = (o.filters as any[]).every((f) => {
+        if (f.dataSize !== undefined) return acc.data.length === f.dataSize;
+        if (f.memcmp) return acc.data.subarray(f.memcmp.offset, f.memcmp.offset + 32).equals(Buffer.from(bs58.decode(f.memcmp.bytes)));
+        return true;
+      });
+      if (ok) out.push({ pubkey, account: { ...acc, data: o.dataSlice ? acc.data.subarray(o.dataSlice.offset, o.dataSlice.offset + o.dataSlice.length) : acc.data } });
+    }
+    return out;
+  }
   async getTokenAccountBalance(address: string) {
     const v = this.tokenBalances.get(address);
     return v === undefined ? null : { slot: this.slot, amount: v };

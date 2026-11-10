@@ -3,7 +3,7 @@
 ## Name
 
 **Asteroid Protocol** (formerly **LAST60**). The product and its mechanic are unchanged: every five
-minutes, eligible creator fees are allocated to payouts for the last unique buyers, at a moment inside
+minutes, eligible creator fees are allocated to payouts for the last unique buyers and randomly drawn holders, at a moment inside
 the final 60 seconds. The tagline stays **"The final minute pays."**
 
 The rebrand covers everything people see: the website, metadata, social images, wallet signing prompts,

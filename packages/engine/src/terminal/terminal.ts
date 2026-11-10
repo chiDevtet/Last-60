@@ -61,13 +61,20 @@ export class TerminalWriter {
   processingStarted(roundNumber: number) {
     return this.write("SYSTEM", `Reward processing initiated for round #${roundNumber}.`, { roundNumber, dedupeKey: `processing:${roundNumber}` });
   }
-  accounting(roundNumber: number, p: { fees: bigint; reward: bigint; retained: bigint; recipients: number; perRecipient: bigint; rolloverIn: bigint }) {
+  accounting(roundNumber: number, p: { fees: bigint; reward: bigint; retained: bigint; recipients: number; holders?: number; perRecipient: bigint; rolloverIn: bigint }) {
+    const split = p.holders ? ` (${p.recipients - p.holders} buyer(s) + ${p.holders} holder(s))` : "";
     const roll = p.rolloverIn > 0n ? ` incl. ${this.fmt(p.rolloverIn)} rolled over` : "";
     return this.write(
       "ACCOUNTING",
-      `Fees ${this.fmt(p.fees)} → reward ${this.fmt(p.reward)}${roll}, retained ${this.fmt(p.retained)}. ${p.recipients} recipient(s) × ${this.fmt(p.perRecipient)} ${this.asset.symbol}.`,
-      { roundNumber, details: { fees: p.fees.toString(), reward: p.reward.toString(), retained: p.retained.toString(), recipients: p.recipients, perRecipient: p.perRecipient.toString() }, dedupeKey: `accounting:${roundNumber}` },
+      `Fees ${this.fmt(p.fees)} → reward ${this.fmt(p.reward)}${roll}, retained ${this.fmt(p.retained)}. ${p.recipients} recipient(s)${split} × ${this.fmt(p.perRecipient)} ${this.asset.symbol}.`,
+      { roundNumber, details: { fees: p.fees.toString(), reward: p.reward.toString(), retained: p.retained.toString(), recipients: p.recipients, holders: p.holders ?? 0, perRecipient: p.perRecipient.toString() }, dedupeKey: `accounting:${roundNumber}` },
     );
+  }
+  holdersDrawn(roundNumber: number, p: { drawn: number; eligible: number; minTokens: bigint; failed: boolean }) {
+    if (p.failed) return Promise.resolve();
+    const min = p.minTokens.toLocaleString("en-US");
+    const msg = p.drawn > 0 ? `Holder draw: ${p.drawn} random holder(s) selected from ${p.eligible} eligible wallet(s) holding ≥ ${min} tokens.` : `Holder draw: no eligible holder (≥ ${min} tokens, not already paid as a buyer) this round.`;
+    return this.write("ACCOUNTING", msg, { roundNumber, details: { drawn: p.drawn, eligible: p.eligible }, dedupeKey: `holders:${roundNumber}` });
   }
   skipped(roundNumber: number, reason: string, rolled: bigint) {
     return this.write("ACCOUNTING", `Round #${roundNumber}: ${reason}. ${rolled > 0n ? `${this.fmt(rolled)} ${this.asset.symbol} carried to the next round.` : "No funds distributed."}`, { roundNumber, dedupeKey: `skipped:${roundNumber}` });
@@ -75,11 +82,11 @@ export class TerminalWriter {
   payoutSubmitted(roundNumber: number, signature: string, attempt: number) {
     return this.write("PAYOUT", `Transaction submitted.`, { roundNumber, signature, details: { attempt }, dedupeKey: `submitted:${signature}` });
   }
-  payoutConfirmed(roundNumber: number, p: { recipient: string; amount: bigint; signature: string; commitment: string }) {
-    return this.write("CONFIRMED", `${this.fmt(p.amount)} ${this.asset.symbol} distributed to ${shortAddress(p.recipient, 3, 3)}.`, { roundNumber, signature: p.signature, details: { recipient: p.recipient, amount: p.amount.toString(), commitment: p.commitment }, dedupeKey: `confirmed:${p.signature}` });
+  payoutConfirmed(roundNumber: number, p: { recipient: string; amount: bigint; signature: string; commitment: string; kind?: string }) {
+    return this.write("CONFIRMED", `${this.fmt(p.amount)} ${this.asset.symbol} distributed to ${p.kind === "holder" ? "holder" : "buyer"} ${shortAddress(p.recipient, 3, 3)}.`, { roundNumber, signature: p.signature, details: { recipient: p.recipient, amount: p.amount.toString(), commitment: p.commitment }, dedupeKey: `confirmed:${p.signature}` });
   }
-  payoutSimulated(roundNumber: number, p: { recipient: string; amount: bigint; payoutId: string }) {
-    return this.write("PAYOUT", `DRY-RUN: would distribute ${this.fmt(p.amount)} ${this.asset.symbol} to ${shortAddress(p.recipient, 3, 3)} (no transaction sent).`, { roundNumber, details: { recipient: p.recipient, amount: p.amount.toString(), dryRun: true }, dedupeKey: `simulated:${p.payoutId}` });
+  payoutSimulated(roundNumber: number, p: { recipient: string; amount: bigint; payoutId: string; kind?: string }) {
+    return this.write("PAYOUT", `DRY-RUN: would distribute ${this.fmt(p.amount)} ${this.asset.symbol} to ${p.kind === "holder" ? "holder" : "buyer"} ${shortAddress(p.recipient, 3, 3)} (no transaction sent).`, { roundNumber, details: { recipient: p.recipient, amount: p.amount.toString(), dryRun: true }, dedupeKey: `simulated:${p.payoutId}` });
   }
   roundCompleted(roundNumber: number, paid: bigint, dryRun: boolean) {
     return this.write("SYSTEM", dryRun ? `Reward round #${roundNumber} completed (dry-run, nothing transferred).` : `Reward round #${roundNumber} completed. ${this.fmt(paid)} ${this.asset.symbol} paid.`, { roundNumber, dedupeKey: `completed:${roundNumber}` });

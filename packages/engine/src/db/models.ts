@@ -750,6 +750,9 @@ const roundSchema = new Schema(
     periodStartAt: { type: Date, default: null }, // only used for the first-ever round
     config: {
       buyerCount: Number,
+      holderCount: Number,
+      /** Minimum holding for the holder draw, in whole tokens (decimal string). */
+      minHolderTokens: String,
       minBuyQuote: D,
       rewardBps: Number,
       payoutMint: String,
@@ -781,6 +784,13 @@ const roundSchema = new Schema(
     dust: { type: D, default: null },
     perRecipient: { type: D, default: null },
     recipientCount: { type: Number, default: 0 },
+    /** Of `recipientCount`: wallets paid from the random holder draw (the rest are buyers). */
+    holderRecipientCount: { type: Number, default: 0 },
+    /**
+     * The round's holder draw, written ONCE (compare-and-set on null) before allocation and reused by
+     * a resumed execution: { seed, minBalance, eligibleCount, recipients: [{ wallet, balance }], error }.
+     */
+    holderDraw: { type: Schema.Types.Mixed, default: null },
     eligibleBuyerCount: { type: Number, default: 0 },
     paid: { type: D, default: null },
     pending: { type: D, default: null },
@@ -819,6 +829,8 @@ const payoutSchema = new Schema(
     roundNumber: { type: Number, required: true },
     recipient: { type: String, required: true },
     position: { type: Number, required: true },
+    /** Why the wallet is paid: a recent qualifying buyer, or drawn from the holders. Rows without it are buyers. */
+    kind: { type: String, enum: ["buyer", "holder"], default: "buyer" },
     amount: { type: D, required: true },
     mint: { type: String, required: true },
     mode: { type: String, enum: ["live", "dry_run"], required: true },

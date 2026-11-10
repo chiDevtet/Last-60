@@ -3,7 +3,7 @@ import { useState } from "react";
 import type { RoundDetailDTO, RoundSummaryDTO } from "@last60/shared";
 import { PUBLIC_API_URL } from "@/lib/config";
 import { accountUrl, txUrl } from "@/lib/explorer";
-import { dateTime, shortAddress, sol } from "@/lib/format";
+import { dateTime, shortAddress, sol, tokens } from "@/lib/format";
 import { StatusPill } from "./StatusPill";
 
 export function PayoutHistory({ initial, explorer, cluster }: { initial: RoundSummaryDTO[]; explorer: string; cluster: string }) {
@@ -70,7 +70,10 @@ export function PayoutHistory({ initial, explorer, cluster }: { initial: RoundSu
                 <span className="text-right tabular md:text-right">
                   <span className="font-semibold">{sol(r.reward, 4)}</span> <span className="text-mist">SOL</span>
                 </span>
-                <span className="hidden text-right tabular md:block">{r.recipientCount}</span>
+                <span className="hidden text-right tabular md:block" title={r.holderRecipientCount > 0 ? `${r.recipientCount - r.holderRecipientCount} buyers + ${r.holderRecipientCount} holders` : undefined}>
+                  {r.recipientCount}
+                  {r.holderRecipientCount > 0 && <span className="block text-[11px] text-mist">{r.recipientCount - r.holderRecipientCount}B + {r.holderRecipientCount}H</span>}
+                </span>
                 <span className="hidden md:block">
                   <StatusPill status={r.dryRun && r.phase === "settled" ? "simulated" : r.phase} />
                 </span>
@@ -119,6 +122,7 @@ function RoundBreakdown({ d, explorer, cluster }: { d: RoundDetailDTO; explorer:
           <thead>
             <tr className="text-left text-xs text-mist">
               <th className="py-1.5 font-normal">Recipient</th>
+              <th className="py-1.5 pl-3 font-normal">Paid as</th>
               <th className="py-1.5 text-right font-normal">Amount</th>
               <th className="hidden py-1.5 pl-4 font-normal sm:table-cell">Transaction</th>
               <th className="py-1.5 pl-4 font-normal">Status</th>
@@ -131,6 +135,9 @@ function RoundBreakdown({ d, explorer, cluster }: { d: RoundDetailDTO; explorer:
                   <a href={accountUrl(explorer, p.recipient, cluster)} target="_blank" rel="noreferrer" className="focus-ring font-mono text-[13px] hover:text-signal">
                     {shortAddress(p.recipient, 4, 4)}
                   </a>
+                </td>
+                <td className="py-2 pl-3 text-xs">
+                  <span className={p.kind === "holder" ? "text-series" : "text-mist"}>{p.kind === "holder" ? "Holder draw" : "Recent buyer"}</span>
                 </td>
                 <td className="py-2 text-right tabular">{sol(p.amount, 6)} SOL</td>
                 <td className="hidden py-2 pl-4 sm:table-cell">
@@ -149,6 +156,12 @@ function RoundBreakdown({ d, explorer, cluster }: { d: RoundDetailDTO; explorer:
             ))}
           </tbody>
         </table>
+      )}
+      {d.holderCount > 0 && d.payouts.length > 0 && (
+        <p className="text-xs text-mist">
+          Holder draw: {d.holderRecipientCount} of {d.eligibleHolders.toLocaleString()} eligible wallets holding at least {tokens(d.minHolderTokens)} tokens
+          {d.holderDrawSeed ? <> · seed <span className="break-all font-mono">{d.holderDrawSeed}</span></> : null}
+        </p>
       )}
       {d.dryRun && <p className="text-xs text-mist">Dry-run round: allocations were computed from live chain data; no transfers were sent.</p>}
     </div>

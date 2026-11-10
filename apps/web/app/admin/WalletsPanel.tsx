@@ -21,7 +21,7 @@ type Call = (p: string, i?: RequestInit) => Promise<any>;
 export type SignMessage = (message: string) => Promise<{ signature: string; address: string }>;
 
 const ROLES: { role: ExportWalletRole; title: string; blurb: string }[] = [
-  { role: "payout", title: "Payout wallet", blurb: "Holds the SOL that buyer rewards are paid from. Creator settlements and sweeps arrive here." },
+  { role: "payout", title: "Payout wallet", blurb: "Holds the SOL that buyer and holder rewards are paid from. Creator settlements and sweeps arrive here." },
   { role: "creator", title: "Creator wallet", blurb: "The launch creator: claims bonding-curve fees, sends 75 % to the payout wallet and sweeps Forge's post-migration payouts — automatically." },
 ];
 

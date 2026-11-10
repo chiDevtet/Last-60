@@ -29,6 +29,7 @@ import { cursorId, readCursor, syncAddress } from "../indexer/signatureSync";
 import { allocate } from "./allocation";
 import { boundsOf, drawExecuteAt, roundIndexAt, type ScheduleParams } from "./roundMath";
 import { periodFees, selectRecipients } from "./selection";
+import { drawHolders, fetchHolderBalances, holderMinBalance, newHolderSeed } from "./holders";
 import { persistAttributions } from "../indexer/ingest";
 import { custodyCoverage } from "../custody/custody";
 
@@ -201,6 +202,38 @@ export class RoundScheduler {
     return Math.max(now + 5, Math.min(wake, now + 1000));
   }
 
+  /**
+   * The round's random holder draw (rewards/holders.ts). Drawn once: the result is persisted on the
+   * round under the execution fence before allocation, and a resumed execution reuses it.
+   *
+   * The buyers' payout never depends on it: if the holder set cannot be read from the RPC, the draw
+   * is recorded as failed and the round pays its buyers only (operators are warned).
+   */
+  private async holderDraw(
+    fence: Record<string, unknown>,
+    roundNumber: number,
+    stored: any,
+    o: { settings: EffectiveSettings; pool: { tokenMint: string; baseDecimals: number; baseTokenProgram: string }; excluded: Set<string>; buyers: string[] },
+  ): Promise<{ seed: string; eligibleCount: number; recipients: { wallet: string; balance: string }[]; error: string | null }> {
+    if (stored?.seed) return stored;
+    const seed = newHolderSeed();
+    const minBalance = holderMinBalance(o.settings.minHolderTokens, o.pool.baseDecimals);
+    let draw: { seed: string; minBalance: string; eligibleCount: number; recipients: { wallet: string; balance: string }[]; error: string | null };
+    try {
+      const balances = await fetchHolderBalances(this.d.rpc, o.pool.tokenMint, o.pool.baseTokenProgram);
+      const d = drawHolders({ balances, minBalance, count: o.settings.holderCount, excluded: new Set([...o.excluded, ...o.buyers]), seed });
+      draw = { seed, minBalance: minBalance.toString(), eligibleCount: d.eligibleCount, recipients: d.recipients.map((h) => ({ wallet: h.wallet, balance: h.balance.toString() })), error: null };
+    } catch (err: any) {
+      const error = String(err?.message ?? err).slice(0, 300);
+      this.log.error({ roundNumber, err: error }, "holder draw failed; paying buyers only");
+      await this.d.terminal.warn(`Round #${roundNumber}: token holders could not be read from the RPC; this round pays its buyers only.`, `holder-draw-failed:${roundNumber}`, roundNumber);
+      draw = { seed, minBalance: minBalance.toString(), eligibleCount: 0, recipients: [], error };
+    }
+    const r = await this.d.db.Round.updateOne({ ...fence, holderDraw: null }, { $set: { holderDraw: draw } });
+    if (!r.modifiedCount) throw new LostLockError();
+    return draw;
+  }
+
   /** Resume executions whose worker died mid-snapshot (lock expired). */
   async recoverStuck(now: number) {
     const stuck: any[] = await this.d.db.Round.find({ state: "snapshotting", "lock.expiresAt": { $lt: new Date(now) } }).sort({ roundNumber: 1 }).lean();
@@ -310,7 +343,13 @@ export class RoundScheduler {
       }
       const funding = phaseAware ? await this.consumableFunding(policy!, snapshotSlot, settings.payoutAssetMint) : { credits: [], total: 0n, byStream: {}, pendingFinality: 0, heldByAllocationGuard: 0, awaitingCustody: 0, awaitingCustodyAmount: 0n };
       const rolloverIn = prev ? big(prev.rolloverOut) : 0n;
-      const a = allocate({ fees: legacyFees, funding: funding.total, rolloverIn, rewardBps: settings.rewardBps, recipients: selection.recipients.map((r) => r.wallet), minPayout: settings.minPayoutLamports, skippedRoundPolicy: settings.skippedRoundPolicy });
+      // Holder draw: paid alongside the buyers, never instead of them (a round without a qualifying
+      // buyer still rolls over, exactly as before).
+      const buyerWallets = selection.recipients.map((r) => r.wallet);
+      const holders = buyerWallets.length && settings.holderCount > 0 ? await this.holderDraw(fence, roundNumber, locked.holderDraw, { settings, pool, excluded, buyers: buyerWallets }) : null;
+      const holderWallets = (holders?.recipients ?? []).map((h) => h.wallet).filter((w) => !buyerWallets.includes(w));
+      const kindOf = (w: string) => (holderWallets.includes(w) ? "holder" : "buyer");
+      const a = allocate({ fees: legacyFees, funding: funding.total, rolloverIn, rewardBps: settings.rewardBps, recipients: [...buyerWallets, ...holderWallets], minPayout: settings.minPayoutLamports, skippedRoundPolicy: settings.skippedRoundPolicy });
       const dryRun = settings.payoutMode !== "live";
       const mint = settings.payoutAssetMint;
 
@@ -327,6 +366,8 @@ export class RoundScheduler {
               periodStartAt: period.periodStartAt,
               config: {
                 buyerCount: settings.buyerCount,
+                holderCount: settings.holderCount,
+                minHolderTokens: settings.minHolderTokens.toString(),
                 minBuyQuote: dec(settings.minBuyQuote),
                 rewardBps: settings.rewardBps,
                 payoutMint: mint,
@@ -354,6 +395,7 @@ export class RoundScheduler {
               dust: dec(a.dust),
               perRecipient: dec(a.perRecipient),
               recipientCount: a.payouts.length,
+              holderRecipientCount: a.payouts.filter((p) => kindOf(p.recipient) === "holder").length,
               eligibleBuyerCount: selection.eligibleBuyerCount,
               paid: dec(0n),
               pending: dec(a.payouts.reduce((s, p) => s + p.amount, 0n)),
@@ -377,7 +419,7 @@ export class RoundScheduler {
         }
         if (a.payouts.length) {
           await this.d.db.Payout.insertMany(
-            a.payouts.map((p) => ({ roundNumber, recipient: p.recipient, position: p.position, amount: dec(p.amount), mint, mode: dryRun ? "dry_run" : "live", state: "pending" })),
+            a.payouts.map((p) => ({ roundNumber, recipient: p.recipient, position: p.position, kind: kindOf(p.recipient), amount: dec(p.amount), mint, mode: dryRun ? "dry_run" : "live", state: "pending" })),
             { session },
           );
         }
@@ -392,7 +434,7 @@ export class RoundScheduler {
           ...(a.dust > 0n ? [L("DUST_RETAINED", a.dust)] : []),
           ...fees.other.map((o) => L("FEE_NON_PAYOUT_ASSET", o.amount, { mint: o.mint, k: o.mint, memo: "recorded only; never converted" })),
           ...fees.ineligible.map((o, i) => L("FEE_EXCLUDED", o.amount, { mint: o.mint, k: `${o.mint}:${i}`, memo: `not payout-eligible: ${o.reason.slice(0, 200)}` })),
-          ...a.payouts.map((p) => L("PAYOUT_SCHEDULED", p.amount, { k: p.recipient, memo: `position ${p.position}` })),
+          ...a.payouts.map((p) => L("PAYOUT_SCHEDULED", p.amount, { k: p.recipient, memo: `position ${p.position} (${kindOf(p.recipient)})` })),
         ];
         await this.d.db.LedgerEntry.insertMany(entries, { session });
       });
@@ -403,7 +445,9 @@ export class RoundScheduler {
       await this.d.db.FeeAttribution.updateMany({ pool: { $in: pools }, slot: slotRange, roundNumber: null }, { $set: { roundNumber } });
       if (fees.ineligible.length) await this.d.terminal.warn(`Round #${roundNumber}: some creator fees in this period are recorded but not eligible for payout (unverified or mismatching allocation); operators notified.`, `ineligible:${roundNumber}`, roundNumber);
       if (a.payouts.length) {
-        await this.d.terminal.accounting(roundNumber, { fees: a.fees, reward: a.pool, retained: a.retained, recipients: a.payouts.length, perRecipient: a.perRecipient, rolloverIn: a.rolloverIn });
+        const paidHolders = a.payouts.filter((p) => kindOf(p.recipient) === "holder").length;
+        if (settings.holderCount > 0) await this.d.terminal.holdersDrawn(roundNumber, { drawn: paidHolders, eligible: holders?.eligibleCount ?? 0, minTokens: settings.minHolderTokens, failed: !!holders?.error });
+        await this.d.terminal.accounting(roundNumber, { fees: a.fees, reward: a.pool, retained: a.retained, recipients: a.payouts.length, holders: paidHolders, perRecipient: a.perRecipient, rolloverIn: a.rolloverIn });
       } else {
         const reason = a.outcome === "no_buyers" ? "no qualifying buyers" : a.outcome === "no_fees" ? "no eligible fees accrued" : "reward per wallet below the minimum payout";
         await this.d.terminal.skipped(roundNumber, reason, a.rolloverOut);

@@ -9,12 +9,12 @@ built exclusively from the whitelisted DTO builders in `packages/engine/src/publ
 | Method & path | Returns |
 |---|---|
 | `GET /health` | `HealthDTO`: database, indexer, rewards, api status from heartbeats; provider, cluster, payout mode |
-| `GET /round/current` | `CurrentRoundDTO`: number, start/end, final-window start, server time, phase, buyer count, min buy, reward bps, unique qualifying buyers in the current period |
+| `GET /round/current` | `CurrentRoundDTO`: number, start/end, final-window start, server time, phase, buyer count, holder count, minimum holding for the holder draw (whole tokens), min buy, reward bps, unique qualifying buyers in the current period |
 | `GET /countdown` | compact subset of the above |
 | `GET /pool` | `RewardPoolDTO`: payout-eligible creator fees of the current period (bonding pool + verified destination), period reward (incl. rollover), retained, pending payouts, distributed 24h / all-time; `asset.decimals` is the payout mint's on-chain decimals |
 | `GET /buys/recent?limit=` | latest buys with qualification flag |
 | `GET /rounds?cursor=&limit=` | settled/rolled-over/missed rounds, newest first, cursor = round number |
-| `GET /rounds/:n` | `RoundDetailDTO` incl. snapshot slot and payouts (signature only once confirmed) |
+| `GET /rounds/:n` | `RoundDetailDTO` incl. snapshot slot, payouts (each with `kind`: `buyer` or `holder`; signature only once confirmed), and the holder draw (holders paid, eligible holders, seed) |
 | `GET /payouts?cursor=&limit=` | confirmed and simulated payouts |
 | `GET /stats` | totals from the ledger |
 | `GET /chart?limit=` | fees / reward / recipients per executed round |
@@ -69,7 +69,7 @@ Wallet-signature authentication (rate-limited 3 rps):
 All funding mutations are written to `config_audit` (`custody_request`, `custody_submit`,
 `custody_cancel`, `attribution_recovery`) with the admin wallet as actor.
 
-Runtime-editable settings: launch provider, token mint, pool, fee role, buyer count, minimum buy,
+Runtime-editable settings: launch provider, token mint, pool, fee role, buyer count, holder count, minimum holding for the holder draw, minimum buy,
 reward bps, minimum payout, skipped-round policy, excluded wallets, payout asset, payout mode,
 expected payout public key, fee collection mode, RPC/WS endpoints, indexer polling/websocket,
 pause flags. **Secrets are environment-only** and can never be set or read through the API.

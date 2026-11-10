@@ -301,7 +301,7 @@ export class PayoutExecutor {
       return true;
     });
     if (!done) return false;
-    await this.d.terminal.payoutConfirmed(p.roundNumber, { recipient: p.recipient, amount: big(p.amount), signature, commitment: this.d.cfg.payout.commitment });
+    await this.d.terminal.payoutConfirmed(p.roundNumber, { recipient: p.recipient, amount: big(p.amount), signature, commitment: this.d.cfg.payout.commitment, kind: p.kind });
     return true;
   }
 
@@ -313,7 +313,7 @@ export class PayoutExecutor {
       { $setOnInsert: { key: `PAYOUT_SIMULATED:${String(p._id)}`, type: "PAYOUT_SIMULATED", roundNumber: p.roundNumber, amount: p.amount, mint: p.mint, payoutId: p._id, memo: `dry-run: ${p.recipient}` } },
       { upsert: true },
     );
-    await this.d.terminal.payoutSimulated(p.roundNumber, { recipient: p.recipient, amount: big(p.amount), payoutId: String(p._id) });
+    await this.d.terminal.payoutSimulated(p.roundNumber, { recipient: p.recipient, amount: big(p.amount), payoutId: String(p._id), kind: p.kind });
     return true;
   }
 
@@ -423,7 +423,8 @@ async function applyConfirmedLedger(db: Models, p: any, signature: string, sessi
     { $setOnInsert: { key: `PAYOUT_CONFIRMED:${String(p._id)}`, type: "PAYOUT_CONFIRMED", roundNumber: p.roundNumber, amount: p.amount, mint: p.mint, payoutId: p._id, signature, memo: p.recipient } },
     { upsert: true, session },
   );
-  await db.BuyerActivity.updateOne({ wallet: p.recipient }, { $inc: { rewardsReceived: p.amount, roundsWon: 1 } }, { upsert: true, session });
+  // A drawn holder may never have bought through the indexed pools: do not create a buyer record for it.
+  await db.BuyerActivity.updateOne({ wallet: p.recipient }, { $inc: { rewardsReceived: p.amount, roundsWon: 1 } }, { upsert: p.kind !== "holder", session });
 }
 
 /**

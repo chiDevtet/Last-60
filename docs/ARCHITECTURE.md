@@ -158,6 +158,16 @@ leaders safe.
 4. Select buyers (Mongo aggregation): buys in the period, `status=active`,
    `quoteAmount ≥ MIN_BUY`, trader not excluded → sort by `(slot desc, intra-slot order desc)`
    → first row per wallet → top `BUYER_COUNT`.
+4b. Holder draw (`rewards/holders.ts`), only when step 4 selected at least one buyer and
+   `HOLDER_COUNT > 0`: read every token account of the launch mint (`getProgramAccounts` on its
+   token program), sum balances per owner, keep on-curve owners holding ≥ `MIN_HOLDER_TOKENS` whole
+   tokens (default 100,000 = 0.01 % of a 1,000,000,000 supply) that are neither an excluded wallet
+   (creator, fee beneficiary, payout wallet, `EXCLUDED_WALLETS`) nor one of this round's buyers.
+   A 32-byte CSPRNG seed is generated; eligible wallets are ranked by `SHA-256(seed ":" wallet)` and
+   the lowest `HOLDER_COUNT` are drawn (uniform — not weighted by balance). The draw (seed, eligible
+   count, winners) is persisted on the round under the execution fence before allocation, so a
+   resumed execution reuses it and never draws twice; the seed is published with the round. If the
+   holder set cannot be read, the draw is recorded as failed and the round pays its buyers only.
 5. Destination LP-position checkpoints (if a verified DAMM v2 destination is attached) are written
    for the snapshot slot. Eligible fees = Σ payout-eligible creator allocations in the period (swap
    `eligibleFee` + attribution `creatorAmount`) in the payout asset. Other assets are recorded, not
@@ -171,11 +181,12 @@ leaders safe.
 6. Allocation (pure integer function, `rewards/allocation.ts`):
    * `reward = ⌊fees · REWARD_BPS / 10000⌋ + funding + rolloverIn`, `retained = fees − ⌊…⌋`
      (`funding` = consumed contributions; `REWARD_BPS` is never applied to it)
+   * `n` = buyers + drawn holders; every recipient receives the same `per`
    * `per = ⌊reward / n⌋`, `dust = reward − per·n` (recorded as retained dust)
-   * `n = 0` or `per < MIN_PAYOUT_LAMPORTS` → no payouts, `reward` carried forward
+   * no buyers (holders are never paid without them) or `per < MIN_PAYOUT_LAMPORTS` → no payouts, `reward` carried forward
      (`SKIPPED_ROUND_POLICY=rollover`, default) or retained (`retain`).
 7. One MongoDB transaction writes: round result, one `payouts` row per recipient (unique
-   `(round, recipient)`), and the ledger entries. Commit ⇒ state `paying`.
+   `(round, recipient)`, `kind` = `buyer` | `holder`), and the ledger entries. Commit ⇒ state `paying`.
 
 ## 6. Payout execution and idempotency
 

@@ -2,10 +2,17 @@
 
 <p align="center"><b>The final minute pays.</b><br>
 Every five minutes, eligible creator fees are allocated to on-chain payouts for the five most
-recent unique buyers — at a moment inside the final 60 seconds chosen by a secure random draw and
-kept private until it happens. Payouts are based on verified creator fee allocations.</p>
+recent unique buyers and five randomly drawn holders — at a moment inside the final 60 seconds chosen
+by a secure random draw and kept private until it happens. Payouts are based on verified creator fee
+allocations.</p>
 
 <p align="center"><img src="docs/screenshots/dashboard-final-minute.png" alt="Dashboard in the final minute" width="860"></p>
+
+**Who is paid each round.** The five most recent unique wallets with a qualifying buy (`BUYER_COUNT`),
+plus five wallets drawn at random from the token's holders (`HOLDER_COUNT`). A holder is eligible with
+at least 100,000 tokens (`MIN_HOLDER_TOKENS`, 0.01% of the 1,000,000,000 supply) in its own wallet and
+is never one of that round's paid buyers, so no wallet is paid twice in a round. All recipients receive
+the same amount. A round with no qualifying buyer pays nobody and its reward rolls over.
 
 > **Formerly LAST60.** The product is now **Asteroid Protocol** ([Brand](docs/BRAND.md)). Internal
 > identifiers keep the `last60` namespace so existing deployments, databases and on-chain records stay

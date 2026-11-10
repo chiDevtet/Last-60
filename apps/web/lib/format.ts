@@ -42,3 +42,9 @@ export function relative(iso: string | null, now: number) {
 export function compactNumber(n: number) {
   return new Intl.NumberFormat(undefined, { notation: n >= 10_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(n);
 }
+
+/** Whole-token count with thousands separators ("100000" → "100,000"). */
+export function tokens(v: string | number | null | undefined) {
+  const s = String(v ?? "0");
+  return /^\d+$/.test(s) ? s.replace(/\B(?=(\d{3})+(?!\d))/g, ",") : s;
+}
