@@ -128,7 +128,7 @@ export function revenueFactsOf(provider: LaunchProvider, r: RevenueRuntime): Rev
   const inner = provider instanceof MigrationAwareProvider ? provider.inner : provider;
   const dest = provider instanceof MigrationAwareProvider ? provider.destination : null;
   const pc = inner instanceof RaydiumLaunchLabProvider ? inner.platformConfigState() : null;
-  const vaults = info.provider === "meteora_dbc" ? [info.accounts.quoteVault, info.accounts.baseVault] : info.provider === "raydium_launchlab" ? [info.accounts.creatorFeeVault] : [info.accounts.creatorClaimVault];
+  const vaults = info.provider === "meteora_dbc" ? [info.accounts.quoteVault, info.accounts.baseVault] : info.provider === "raydium_launchlab" ? [info.accounts.creatorFeeVault] : info.provider === "pump_fun" ? [info.accounts.creatorVault] : [info.accounts.creatorClaimVault];
   let destination: RevenueLaunchFacts["destination"] = null;
   if (dest instanceof CpmmDestination) {
     const f = dest.facts;
@@ -166,7 +166,7 @@ async function verdictOf(db: Models, d: RevenueDraft, f: RevenueLaunchFacts, pro
     else if (d.beneficiary !== f.creator) problems.push(`recipient ${d.beneficiary ?? "?"} is not the pool creator ${f.creator} (creator wallet changed or claim paid elsewhere)`);
     const v = info.allocation?.verification ?? "not_declared";
     if (v !== "verified") problems.push(`bonding_curve_allocation_${v}${info.allocation?.problems.length ? `: ${info.allocation.problems.join("; ")}` : ""}`);
-    if (info.provider === "raydium_launchlab" && (await sharedVaultMixed(db, f.sourcePool, d.slot))) problems.push("shared_creator_vault_mixed_with_other_pools: the claim includes other pools' creator fees and cannot be apportioned");
+    if ((info.provider === "raydium_launchlab" || info.provider === "pump_fun") && (await sharedVaultMixed(db, f.sourcePool, d.slot))) problems.push("shared_creator_vault_mixed_with_other_pools: the claim includes other pools' creator fees and cannot be apportioned");
     return { verification: problems.length ? (v === "mismatch" ? "mismatch" : "unverifiable") : "verified", problems, effectiveFeeConfig: { creatorFeeRate: (info.feeParams.creatorFeeRate as string | number | undefined) ?? (info.feeParams.creatorTradingFeePercentage as string | number | undefined) ?? null, bondingBasis: info.allocation?.id ?? null } };
   }
   if (d.stream === "forge_platform_lp_fee_collection") {
@@ -194,6 +194,19 @@ async function verdictOf(db: Models, d: RevenueDraft, f: RevenueLaunchFacts, pro
     if (v !== "verified") problems.push(`migrated_lp_allocation_${v}${a?.problems.length ? `: ${a.problems.join("; ")}` : ""}`);
     return { verification: problems.length ? (v === "mismatch" ? "mismatch" : "unverifiable") : "verified", problems, effectiveFeeConfig: { position: String(d.evidence.position ?? ""), migratedLpBasis: a?.id ?? null, creatorLpPercentage: (info.feeParams.creatorLpPercentage as string | number | undefined) ?? null } };
   }
+  if (d.stream === "pumpswap_creator_fee") {
+    // pump.fun → PumpSwap: coin creator fees the launch creator collected from its PumpSwap vault.
+    const a = info.destination?.allocation;
+    if (!f.creator) problems.push("missing_creator_association");
+    else if (d.beneficiary !== f.creator) problems.push(`recipient ${d.beneficiary ?? "?"} is not the launch creator ${f.creator}`);
+    if (!f.destination || f.destination.kind !== "pumpfun_pumpswap") problems.push("no_verified_pumpswap_destination");
+    const v = a?.verification ?? "not_declared";
+    if (v !== "verified") problems.push(`pumpswap_creator_fee_basis_${v}${a?.problems.length ? `: ${a.problems.join("; ")}` : ""}`);
+    // The vault is shared by every graduated coin of the creator: a collection that includes another
+    // pool's fees cannot be apportioned to this launch.
+    if (f.destination && (await sharedVaultMixed(db, f.sourcePool, d.slot, f.destination.pool))) problems.push("shared_creator_vault_mixed_with_other_pools: the collection includes other coins' creator fees and cannot be apportioned");
+    return { verification: problems.length ? (v === "mismatch" ? "mismatch" : "unverifiable") : "verified", problems, effectiveFeeConfig: { coinCreator: (a?.params?.coinCreator as string | undefined) ?? null, creatorVault: String(d.evidence.vault ?? ""), pumpswapBasis: a?.id ?? null } };
+  }
   if (d.stream === "cpmm_creator_trading_fee") {
     const a = info.destination?.allocation;
     if (f.destination?.poolCreator && d.beneficiary !== f.destination.poolCreator) problems.push("recipient is not the CPMM pool_creator");
@@ -211,10 +224,11 @@ async function verdictOf(db: Models, d: RevenueDraft, f: RevenueLaunchFacts, pro
   return { verification: "verified", problems, effectiveFeeConfig: {} };
 }
 
-/** LaunchLab: did other pools deposit into the shared creator vault since the previous claim? */
-async function sharedVaultMixed(db: Models, sourcePool: string, claimSlot: number): Promise<boolean> {
-  const prev: any = await db.FeeClaim.findOne({ pool: sourcePool, slot: { $lt: claimSlot } }, { slot: 1 }).sort({ slot: -1 }).lean();
-  return !!(await db.FeeAttribution.exists({ sourcePool, kind: "shared_vault_inflow", excludedReason: EXCLUSION.otherPoolSharedVault, slot: { $lte: claimSlot, ...(prev ? { $gt: prev.slot } : {}) } }));
+/** LaunchLab / pump.fun: did other pools deposit into the shared creator vault since the previous claim? */
+async function sharedVaultMixed(db: Models, sourcePool: string, claimSlot: number, destinationPool: string | null = null): Promise<boolean> {
+  // Bonding-curve vault by default; with `destinationPool`, the vault of that graduation destination.
+  const prev: any = await db.FeeClaim.findOne({ pool: destinationPool ?? sourcePool, slot: { $lt: claimSlot } }, { slot: 1 }).sort({ slot: -1 }).lean();
+  return !!(await db.FeeAttribution.exists({ sourcePool, destinationPool, kind: "shared_vault_inflow", excludedReason: EXCLUSION.otherPoolSharedVault, slot: { $lte: claimSlot, ...(prev ? { $gt: prev.slot } : {}) } }));
 }
 
 export interface RevenueIngestResult {
@@ -318,7 +332,7 @@ export async function ingestRevenue(db: Models, tx: NormalizedTx, parsed: Parsed
 
 // ── reconciliation ──────────────────────────────────────────────────────────────────────────
 
-const SPLIT_STREAMS: CollectionStream[] = ["bonding_curve_creator_fee", "forge_platform_lp_fee_collection", "damm_v2_creator_lp_fee"];
+const SPLIT_STREAMS: CollectionStream[] = ["bonding_curve_creator_fee", "forge_platform_lp_fee_collection", "damm_v2_creator_lp_fee", "pumpswap_creator_fee"];
 
 /**
  * Bonding-curve creator fees that accrued at or before the activation slot were already distributed

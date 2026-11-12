@@ -19,6 +19,11 @@
  *   post_migration  damm_v2_creator_lp_retained                 creator 25 %    creator   no  (developer revenue; derived)
  *   post_migration  damm_v2_creator_lp_last60_contribution      creator 75 %    Last-60   YES (observed transfer only — the same
  *                                                                                              share as the bonding curve)
+ *   post_migration  pumpswap_creator_fee                        (gross)         creator   no  (pump.fun → PumpSwap: the coin creator
+ *                                                                                              fee as collected from the creator vault)
+ *   post_migration  pumpswap_creator_retained                   creator 25 %    creator   no  (developer revenue; derived)
+ *   post_migration  pumpswap_creator_last60_contribution        creator 75 %    Last-60   YES (observed transfer only — pump.fun pays
+ *                                                                                              the same creator fee in both phases)
  *
  * The creator's 50 % LP allocation is NOT the creator's native CPMM creator fee and NOT personal
  * developer revenue: Forge holds it (it claims the platform-owned Fee Key) and must route it to the
@@ -45,13 +50,16 @@ export const REVENUE_STREAMS = [
   "damm_v2_creator_lp_fee",
   "damm_v2_creator_lp_retained",
   "damm_v2_creator_lp_last60_contribution",
+  "pumpswap_creator_fee",
+  "pumpswap_creator_retained",
+  "pumpswap_creator_last60_contribution",
 ] as const;
 export type RevenueStream = (typeof REVENUE_STREAMS)[number];
 export type LaunchPhase = "bonding_curve" | "post_migration";
 /** Streams that are observed collections (a durable claim record is created for each). */
-export type CollectionStream = "bonding_curve_creator_fee" | "cpmm_creator_trading_fee" | "forge_platform_lp_fee_collection" | "damm_v2_creator_lp_fee";
+export type CollectionStream = "bonding_curve_creator_fee" | "cpmm_creator_trading_fee" | "forge_platform_lp_fee_collection" | "damm_v2_creator_lp_fee" | "pumpswap_creator_fee";
 /** Streams that can fund Last-60 buyer rewards. */
-export type ContributionStream = "bonding_curve_last60_reward_contribution" | "forge_platform_lp_last60_contribution" | "damm_v2_creator_lp_last60_contribution";
+export type ContributionStream = "bonding_curve_last60_reward_contribution" | "forge_platform_lp_last60_contribution" | "damm_v2_creator_lp_last60_contribution" | "pumpswap_creator_last60_contribution";
 
 export interface StreamInfo {
   phase: LaunchPhase;
@@ -82,6 +90,9 @@ export const STREAM_INFO: Record<RevenueStream, StreamInfo> = {
   damm_v2_creator_lp_fee: { phase: "post_migration", kind: "collection", beneficiary: "creator", allocationOwner: null, custodian: "creator", rewardEligible: false, label: "DAMM v2 LP fees claimed by the creator from its migration positions (gross)" },
   damm_v2_creator_lp_retained: { phase: "post_migration", kind: "retained", beneficiary: "creator", allocationOwner: "creator", custodian: "creator", rewardEligible: false, label: "DAMM v2 creator LP fees retained by the creator (25 %, developer revenue)" },
   damm_v2_creator_lp_last60_contribution: { phase: "post_migration", kind: "contribution", beneficiary: "last60", allocationOwner: "creator", custodian: "creator", rewardEligible: true, label: "DAMM v2 creator LP fees → Asteroid Protocol buyer rewards (75 %)" },
+  pumpswap_creator_fee: { phase: "post_migration", kind: "collection", beneficiary: "creator", allocationOwner: null, custodian: "creator", rewardEligible: false, label: "PumpSwap coin creator fees collected by the creator (gross)" },
+  pumpswap_creator_retained: { phase: "post_migration", kind: "retained", beneficiary: "creator", allocationOwner: "creator", custodian: "creator", rewardEligible: false, label: "PumpSwap coin creator fees retained by the creator (25 %, developer revenue)" },
+  pumpswap_creator_last60_contribution: { phase: "post_migration", kind: "contribution", beneficiary: "last60", allocationOwner: "creator", custodian: "creator", rewardEligible: true, label: "PumpSwap coin creator fees → Asteroid Protocol buyer rewards (75 %)" },
 };
 
 /** The contribution / retained streams that belong to a collection stream (null: no split). */
@@ -91,6 +102,8 @@ export const SPLIT_OF: Record<CollectionStream, { contribution: ContributionStre
   cpmm_creator_trading_fee: null, // never shared with Last-60 and never part of the Forge LP split
   // Meteora DBC → DAMM v2: the creator's post-migration LP fees fund rewards at the bonding-curve share.
   damm_v2_creator_lp_fee: { contribution: "damm_v2_creator_lp_last60_contribution", retained: "damm_v2_creator_lp_retained" },
+  // pump.fun → PumpSwap: the coin creator fee continues after graduation and funds rewards at the same share.
+  pumpswap_creator_fee: { contribution: "pumpswap_creator_last60_contribution", retained: "pumpswap_creator_retained" },
 };
 
 // ── versioned reward-funding policy ─────────────────────────────────────────────────────────
@@ -158,7 +171,7 @@ export function policyLast60Bps(policy: FundingPolicy, stream: CollectionStream)
   if (stream === "bonding_curve_creator_fee") return policy.bondingCreatorFeeLast60Bps;
   if (stream === "forge_platform_lp_fee_collection") return policy.forgeLpLast60Bps;
   // Same share as the bonding curve: the creator's fee, whichever phase it is collected in.
-  if (stream === "damm_v2_creator_lp_fee") return policy.bondingCreatorFeeLast60Bps;
+  if (stream === "damm_v2_creator_lp_fee" || stream === "pumpswap_creator_fee") return policy.bondingCreatorFeeLast60Bps;
   return null;
 }
 

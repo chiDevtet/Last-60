@@ -11,6 +11,7 @@
  *        DBC       migrate_meteora_damm (DAMM v1, deprecated for new configs)
  *        LaunchLab migrate_to_cpswap   #5 CPMM pool, #10 CPMM config, #17 bonding pool
  *        LaunchLab migrate_to_amm      #13 AMM v4 pool, #23 bonding pool
+ *        pump.fun  migrate / migrate_v2 #9 / #10 PumpSwap pool, #3 / #4 bonding curve
  *   3. The destination account is then verified: owning program, both mints, the PDA derivation
  *      from (config, mints), and (DAMM v2) the pool creator = DBC pool authority; position NFTs
  *      are resolved to their current holders.
@@ -41,6 +42,9 @@ import type { NormalizedTx } from "../chain/tx";
 import { normalizeTransaction } from "../chain/tx";
 
 export const DBC_PROGRAM = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
+import { canonicalPumpSwapPool, pumpPoolAuthority, PUMP_AMM_PROGRAM_ID, PUMP_PROGRAM_ID } from "./pumpfun/pda";
+import { decodePumpSwapPool, PUMP_SWAP_POOL_DISC } from "./destination/pumpSwap";
+
 export const LAUNCHLAB_PROGRAM = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
 export const DAMM_V2_PROGRAM_ID = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
 export const DAMM_V1_PROGRAM_ID = "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB";
@@ -51,7 +55,9 @@ export const RAYDIUM_CP_LOCK_PROGRAM_ID = "LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTK
 /** DBC `pool_authority` PDA — the creator recorded on DAMM v2 pools created by DBC migration. */
 export const DBC_POOL_AUTHORITY = "FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM";
 
-export type MigrationKind = "dbc_damm_v2" | "dbc_damm_v1" | "launchlab_cpmm" | "launchlab_amm_v4";
+export type MigrationKind = "dbc_damm_v2" | "dbc_damm_v1" | "launchlab_cpmm" | "launchlab_amm_v4" | "pumpfun_pumpswap";
+/** Bonding-curve providers whose graduation is resolved here. */
+export type MigratingProvider = "meteora_dbc" | "raydium_launchlab" | "pump_fun";
 
 export interface MigrationRecord {
   kind: MigrationKind;
@@ -76,10 +82,12 @@ const IX = {
   dbcDammV1: instructionDiscriminator("migrate_meteora_damm").toString("hex"),
   llCpmm: instructionDiscriminator("migrate_to_cpswap").toString("hex"),
   llAmm: instructionDiscriminator("migrate_to_amm").toString("hex"),
+  pumpMigrate: instructionDiscriminator("migrate").toString("hex"),
+  pumpMigrateV2: instructionDiscriminator("migrate_v2").toString("hex"),
 };
 
 /** Pure: extract the migration of `bondingPool` from a transaction, or null. */
-export function parseMigration(tx: NormalizedTx, provider: "meteora_dbc" | "raydium_launchlab", bondingPool: string): MigrationRecord | null {
+export function parseMigration(tx: NormalizedTx, provider: MigratingProvider, bondingPool: string): MigrationRecord | null {
   if (tx.err) return null;
   for (const ix of tx.instructions) {
     const disc = ix.data.subarray(0, 8).toString("hex");
@@ -106,6 +114,16 @@ export function parseMigration(tx: NormalizedTx, provider: "meteora_dbc" | "rayd
         return { ...base, kind: "launchlab_amm_v4", destinationProgram: a[12]!, destinationPool: a[13]!, destinationConfig: null, baseMint: a[1]!, quoteMint: a[2]!, positions: [] };
       }
     }
+    if (provider === "pump_fun" && ix.programId === PUMP_PROGRAM_ID) {
+      // migrate     #2 mint, #3 bonding curve, #8 pump_amm, #9 pool, #13 amm global config, #14 WSOL
+      // migrate_v2  #2 base mint, #3 quote mint, #4 bonding curve, #9 pump_amm, #10 pool, #14 amm global config
+      if (disc === IX.pumpMigrate && a[3] === bondingPool) {
+        return { ...base, kind: "pumpfun_pumpswap", destinationProgram: a[8]!, destinationPool: a[9]!, destinationConfig: a[13] ?? null, baseMint: a[2]!, quoteMint: a[14]!, positions: [] };
+      }
+      if (disc === IX.pumpMigrateV2 && a[4] === bondingPool) {
+        return { ...base, kind: "pumpfun_pumpswap", destinationProgram: a[9]!, destinationPool: a[10]!, destinationConfig: a[14] ?? null, baseMint: a[2]!, quoteMint: a[3]!, positions: [] };
+      }
+    }
   }
   return null;
 }
@@ -114,7 +132,7 @@ export function parseMigration(tx: NormalizedTx, provider: "meteora_dbc" | "rayd
  * Scan the bonding pool's history (newest first, bounded) for its migration transaction. Only the
  * migration and later claims touch a graduated bonding pool, so it is normally on the first page.
  */
-export async function findMigration(rpc: ChainRpc, provider: "meteora_dbc" | "raydium_launchlab", bondingPool: string, opts: { maxPages?: number } = {}): Promise<MigrationRecord | null> {
+export async function findMigration(rpc: ChainRpc, provider: MigratingProvider, bondingPool: string, opts: { maxPages?: number } = {}): Promise<MigrationRecord | null> {
   let before: string | undefined;
   for (let page = 0; page < (opts.maxPages ?? 3); page++) {
     const sigs = await rpc.getSignaturesForAddress(bondingPool, { before, limit: 100 });
@@ -400,6 +418,8 @@ export interface VerifiedMigration extends MigrationRecord {
   locks: (MigrationLpLock & { holder: string | null })[];
   tokenAMint: string | null;
   tokenBMint: string | null;
+  /** PumpSwap: the verified pool's facts (pump.fun → PumpSwap graduations). */
+  pumpSwap?: { coinCreator: string; poolCreator: string; poolBaseTokenAccount: string; poolQuoteTokenAccount: string; quoteTokenProgram: string | null; holderReward: boolean; cashback: boolean } | null;
   /** Human-readable reasons when not verified. */
   notes: string[];
 }
@@ -420,6 +440,7 @@ const REQUIRED: Record<MigrationKind, string[]> = {
   launchlab_cpmm: ["destinationExists", "destinationProgramIsCpmm", "ownedByExpectedProgram", "layoutMatches", "mintsMatch", "configMatches", "configOwnedByCpmm", "pdaDerivesFromConfigAndMints", "poolCreatorIsCreatorOrPlatform", "locksValid"],
   dbc_damm_v1: ["supportedDestination"],
   launchlab_amm_v4: ["supportedDestination"],
+  pumpfun_pumpswap: ["destinationExists", "destinationProgramIsPumpSwap", "ownedByExpectedProgram", "layoutMatches", "mintsMatch", "canonicalPoolOfMint", "createdByPumpPoolAuthority", "quoteVaultOwnedByTokenProgram"],
 };
 
 /**
@@ -430,7 +451,7 @@ const REQUIRED: Record<MigrationKind, string[]> = {
  */
 export async function verifyMigration(rpc: ChainRpc, m: MigrationRecord, ctx: VerifyContext): Promise<VerifiedMigration> {
   const checks: Record<string, boolean> = {};
-  const out: VerifiedMigration = { ...m, supported: m.kind === "dbc_damm_v2" || m.kind === "launchlab_cpmm", checks, requiredChecks: REQUIRED[m.kind], failed: [], positionStates: [], cpmmPoolCreator: null, cpmmLpMint: null, cpmmVaults: null, cpmmEnableCreatorFee: null, cpmmCreatorFeeOnRaw: null, cpmmCreatorFeeOn: null, cpmmConfig: null, cpmmFeeShare: null, locks: [], tokenAMint: null, tokenBMint: null, notes: [] };
+  const out: VerifiedMigration = { ...m, supported: m.kind === "dbc_damm_v2" || m.kind === "launchlab_cpmm" || m.kind === "pumpfun_pumpswap", checks, requiredChecks: REQUIRED[m.kind], failed: [], positionStates: [], cpmmPoolCreator: null, cpmmLpMint: null, cpmmVaults: null, cpmmEnableCreatorFee: null, cpmmCreatorFeeOnRaw: null, cpmmCreatorFeeOn: null, cpmmConfig: null, cpmmFeeShare: null, locks: [], tokenAMint: null, tokenBMint: null, notes: [] };
   const finish = () => {
     out.failed = out.requiredChecks.filter((c) => checks[c] !== true);
     return out;
@@ -548,6 +569,24 @@ export async function verifyMigration(rpc: ChainRpc, m: MigrationRecord, ctx: Ve
       }
     }
     checks.locksValid = locksOk;
+  } else if (m.kind === "pumpfun_pumpswap") {
+    checks.destinationProgramIsPumpSwap = m.destinationProgram === PUMP_AMM_PROGRAM_ID;
+    checks.ownedByExpectedProgram = acc.owner === PUMP_AMM_PROGRAM_ID;
+    checks.layoutMatches = acc.data.length >= 211 && acc.data.subarray(0, 8).equals(PUMP_SWAP_POOL_DISC);
+    if (!checks.layoutMatches) return finish();
+    const p = decodePumpSwapPool(acc.data);
+    out.tokenAMint = p.baseMint;
+    out.tokenBMint = p.quoteMint;
+    // The launch token is the pool's BASE and the quote is the launch's quote asset (SOL).
+    checks.mintsMatch = p.baseMint === ctx.base && p.quoteMint === ctx.quote && m.baseMint === ctx.base && m.quoteMint === ctx.quote;
+    // A pump.fun coin graduates into exactly one pool: index 0, created by the coin's own pool authority.
+    checks.canonicalPoolOfMint = p.index === 0 && canonicalPumpSwapPool(ctx.base, ctx.quote) === m.destinationPool;
+    checks.createdByPumpPoolAuthority = p.creator === pumpPoolAuthority(ctx.base);
+    const vault = (await rpc.getAccountInfo(p.poolQuoteTokenAccount)).value;
+    const tokenPrograms = ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"];
+    checks.quoteVaultOwnedByTokenProgram = !!vault && tokenPrograms.includes(vault.owner);
+    out.pumpSwap = { coinCreator: p.coinCreator, poolCreator: p.creator, poolBaseTokenAccount: p.poolBaseTokenAccount, poolQuoteTokenAccount: p.poolQuoteTokenAccount, quoteTokenProgram: checks.quoteVaultOwnedByTokenProgram ? vault!.owner : null, holderReward: p.isHolderReward, cashback: p.isCashbackCoin };
+    if (ctx.bondingCreator && p.coinCreator !== ctx.bondingCreator) out.notes.push(`PumpSwap coin_creator ${p.coinCreator} is not the bonding curve's creator ${ctx.bondingCreator}: post-graduation creator fees are paid to another wallet`);
   }
   return finish();
 }

@@ -12,6 +12,7 @@ import { loadKeypair } from "../chain/keys";
 import { homedir } from "node:os";
 import { join as joinPath } from "node:path";
 import { deriveLaunchLabPool } from "../providers/raydium/pda";
+import { derivePumpBondingCurve } from "../providers/pumpfun/pda";
 
 /** Forgepad's PlatformConfig `platform_nft_wallet` (owner of Forge's platform LP Fee Key) on mainnet-beta. */
 export const FORGEPAD_PLATFORM_NFT_WALLET = "8KXqQwtrgtKxNfTWYsN34XNKXVQQR78JZfgbLorNL2n1";
@@ -141,7 +142,7 @@ const RawEnv = z.object({
   SOLANA_RPC_MAX_RPS: int(20, 1, 1000),
   HELIUS_API_KEY: z.string().optional(),
 
-  LAUNCH_PROVIDER: z.enum(["meteora_dbc", "raydium_launchlab", "mock"]).default("meteora_dbc"),
+  LAUNCH_PROVIDER: z.enum(["meteora_dbc", "raydium_launchlab", "pump_fun", "mock"]).default("meteora_dbc"),
   TOKEN_MINT: optionalPubkey,
   POOL_ADDRESS: optionalPubkey,
   FEE_BENEFICIARY_ROLE: z.enum(["creator", "partner", "platform"]).default("creator"),
@@ -155,6 +156,8 @@ const RawEnv = z.object({
   EXPECTED_LAUNCHLAB_PLATFORM_CONFIG: z.string().optional(),
   /** CPMM AmmConfig.creator_fee_rate the migrated pool must use (millionths of swap value; Forgepad 500 = 0.05 %). */
   EXPECTED_CPMM_CREATOR_FEE_RATE: z.string().optional(),
+  /** pump.fun: the wallet that must be the coin's creator (default: the configured creator wallet). */
+  EXPECTED_PUMPFUN_CREATOR: z.string().optional(),
 
   // Phase-aware reward funding (docs/REWARD_FUNDING.md). Default: forge_phase_aware_v2, the approved model.
   // legacy_creator_fee_v1 stays selectable; forge_phase_aware_v1 (PR #6) is retired and rejected.
@@ -309,6 +312,12 @@ export interface ExpectedAllocation {
   launchlabPlatformConfig?: string | null;
   /** CPMM AmmConfig.creator_fee_rate (millionths of swap value). */
   cpmmCreatorFeeRate?: number | null;
+  /**
+   * pump.fun: the wallet declared to be the coin's creator (EXPECTED_PUMPFUN_CREATOR, default the
+   * configured creator wallet). pump.fun sets the creator fee RATE itself (pump-fees schedule), so the
+   * declaration is the identity that earns it, on the bonding curve and on PumpSwap.
+   */
+  pumpfunCreator?: string | null;
 }
 
 export interface CustodyConfig {
@@ -381,7 +390,7 @@ export interface AppConfig {
     maxRps: number;
   };
   provider: {
-    id: "meteora_dbc" | "raydium_launchlab" | "mock";
+    id: "meteora_dbc" | "raydium_launchlab" | "pump_fun" | "mock";
     tokenMint: string | null;
     poolAddress: string | null;
     /** `derived`: POOL_ADDRESS was unset and the LaunchLab pool was derived from TOKEN_MINT. */
@@ -626,6 +635,11 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
   // launch exists (providers/meteora/pda.ts `discoverDbcPool`); until then the workers wait.
   let derivedPool: string | null = null;
   if (raw.LAUNCH_PROVIDER === "raydium_launchlab" && raw.TOKEN_MINT && !raw.POOL_ADDRESS) derivedPool = deriveLaunchLabPool(raw.TOKEN_MINT);
+  // pump.fun: the "pool" is the coin's bonding curve, the PDA ["bonding-curve", mint].
+  if (raw.LAUNCH_PROVIDER === "pump_fun" && raw.TOKEN_MINT && !raw.POOL_ADDRESS) derivedPool = derivePumpBondingCurve(raw.TOKEN_MINT);
+  if (raw.LAUNCH_PROVIDER === "pump_fun" && raw.FEE_BENEFICIARY_ROLE !== "creator") {
+    problems.push('FEE_BENEFICIARY_ROLE: pump.fun pays trading fees to the coin creator only; use "creator"');
+  }
   if (raw.LAUNCH_PROVIDER === "mock" && raw.NODE_ENV === "production") {
     problems.push("LAUNCH_PROVIDER: mock is synthetic test data and is refused in production");
   }
@@ -730,6 +744,9 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
     if (raw.FEE_BENEFICIARY_ROLE !== "creator") problems.push('LAST60_CREATOR_AUTOMATION_ENABLED: requires FEE_BENEFICIARY_ROLE=creator');
   }
   const creatorAddress = raw.LAST60_CREATOR_WALLET_ADDRESS ?? (creatorFromVault ? vaultCreator : null);
+  // pump.fun: the coin must have been created by the declared wallet — by default the creator wallet
+  // this deployment manages (the wallet the token is launched from).
+  expected.pumpfunCreator = expectedPubkey("EXPECTED_PUMPFUN_CREATOR", raw.EXPECTED_PUMPFUN_CREATOR) ?? creatorAddress ?? null;
   for (const [name, a] of [["LAST60_PAYOUT_WALLET_ADDRESS", payoutWalletAddress], ["FORGE_PLATFORM_LP_BENEFICIARY", forgeBeneficiary]] as const) {
     if (creatorAddress && a && creatorAddress === a) problems.push(`LAST60_CREATOR_WALLET_ADDRESS: must not be ${name} (the creator wallet sends TO the payout wallet)`);
   }

@@ -10,14 +10,17 @@ import type { PoolInfo } from "../LaunchProvider";
 import { migrationVerified, type VerifiedMigration } from "../migration";
 import { CpmmDestination, type CpmmPoolFacts } from "./cpmm";
 import { DammV2Destination, type DammV2Position } from "./dammV2";
+import { PumpSwapDestination, type PumpSwapPoolFacts } from "./pumpSwap";
+import { pumpSwapCreatorVaultAta } from "../pumpfun/pda";
 import type { DestinationAdapter, DestinationContext } from "./types";
 
 export type { DestinationAdapter } from "./types";
 export { DammV2Destination } from "./dammV2";
 export { CpmmDestination } from "./cpmm";
+export { PumpSwapDestination, decodePumpSwapPool, type PumpSwapPoolFacts } from "./pumpSwap";
 
 export interface DestinationSpec {
-  kind: "dbc_damm_v2" | "launchlab_cpmm";
+  kind: "dbc_damm_v2" | "launchlab_cpmm" | "pumpfun_pumpswap";
   pool: string;
   program: string;
   ctx: DestinationContext;
@@ -25,6 +28,7 @@ export interface DestinationSpec {
   lpAllocation?: AllocationBasis;
   dammV2?: { tokenAMint: string; tokenBMint: string; positions: DammV2Position[] };
   cpmm?: CpmmPoolFacts;
+  pumpSwap?: PumpSwapPoolFacts;
 }
 
 /**
@@ -136,10 +140,31 @@ export function destinationSpec(info: PoolInfo, v: VerifiedMigration, lpCheck: {
     const cpmm: CpmmPoolFacts = { token0Mint: v.tokenAMint!, token1Mint: v.tokenBMint!, token0Vault: v.cpmmVaults!.token0, token1Vault: v.cpmmVaults!.token1, poolCreator: v.cpmmPoolCreator!, enableCreatorFee: v.cpmmEnableCreatorFee === true, creatorFeeOn: v.cpmmCreatorFeeOn, ammConfig: v.destinationConfig ?? null, feeShare: v.cpmmFeeShare ? { ammConfigDefaultRate: v.cpmmFeeShare.ammConfigDefaultRate, override: v.cpmmFeeShare.override, overrideRate: v.cpmmFeeShare.overrideRate, effectiveRate: v.cpmmFeeShare.effectiveRate, overridePda: v.cpmmFeeShare.overridePda, verifiedAtSlot: v.cpmmFeeShare.verifiedAtSlot } : null, platformNftWallet: sourceFacts.platformNftWallet ?? null, allPlatformLocks: cls.platformLocks, beneficiaryLocks, ...(creatorRole ? { platformLocks: cls.platformLocks } : {}) };
     return { kind: v.kind, pool: v.destinationPool, program: v.destinationProgram, ctx, allocation, lpAllocation, cpmm };
   }
+  if (v.kind === "pumpfun_pumpswap" && v.pumpSwap) {
+    const ps = v.pumpSwap;
+    // The PumpSwap creator fee continues the bonding-curve creator allocation: it is verified only when
+    // the pool pays the SAME wallet (coin_creator == beneficiary), not to holders or as cashback, and
+    // the bonding-curve allocation itself was verified. pump.fun gives the creator no LP at graduation.
+    const problems: string[] = [];
+    if (ps.coinCreator !== info.beneficiary) problems.push(`PumpSwap coin_creator ${ps.coinCreator} is not the beneficiary ${info.beneficiary}`);
+    if (ps.holderReward) problems.push("the pool pays its creator fee to the coin's holders (holder-reward coin)");
+    if (ps.cashback) problems.push("the pool returns its creator fee to traders (cashback coin)");
+    const allocation = makeBasis({
+      ...common,
+      phase: "post_migration_trading",
+      params: { coinCreator: ps.coinCreator, creatorVault: pumpSwapCreatorVaultAta(info.beneficiary, v.tokenBMint!, ps.quoteTokenProgram!), holderReward: ps.holderReward, cashback: ps.cashback },
+      source: `PumpSwap pool ${v.destinationPool} (coin_creator); per-trade BuyEvent / SellEvent.coin_creator / coin_creator_fee; migration tx ${v.signature}`,
+      verification: problems.length ? "unverifiable" : (info.allocation?.verification ?? "not_declared"),
+      problems: problems.length ? problems : [...(info.allocation?.problems ?? [])],
+    });
+    const pumpSwap: PumpSwapPoolFacts = { baseMint: v.tokenAMint!, quoteMint: v.tokenBMint!, poolBaseTokenAccount: ps.poolBaseTokenAccount, poolQuoteTokenAccount: ps.poolQuoteTokenAccount, coinCreator: ps.coinCreator, quoteTokenProgram: ps.quoteTokenProgram! };
+    return { kind: v.kind, pool: v.destinationPool, program: v.destinationProgram, ctx, allocation, pumpSwap };
+  }
   return null;
 }
 
 export function buildDestination(spec: DestinationSpec, rpc: ChainRpc | null): DestinationAdapter {
   if (spec.kind === "dbc_damm_v2") return new DammV2Destination(rpc, spec.pool, spec.dammV2!.tokenAMint, spec.dammV2!.tokenBMint, spec.dammV2!.positions, spec.ctx, spec.allocation);
+  if (spec.kind === "pumpfun_pumpswap") return new PumpSwapDestination(rpc, spec.pool, spec.pumpSwap!, spec.ctx, spec.allocation);
   return new CpmmDestination(spec.pool, spec.cpmm!, spec.ctx, spec.allocation, spec.lpAllocation!);
 }

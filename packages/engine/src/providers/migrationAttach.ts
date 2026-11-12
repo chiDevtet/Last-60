@@ -13,6 +13,7 @@ import type { LaunchProvider, PoolInfo } from "./LaunchProvider";
 import { MigrationAwareProvider } from "./MigrationAwareProvider";
 import { MeteoraDBCProvider } from "./meteora/MeteoraDBCProvider";
 import { RaydiumLaunchLabProvider } from "./raydium/RaydiumLaunchLabProvider";
+import { PumpFunProvider } from "./pumpfun/PumpFunProvider";
 import { findMigration, migrationVerified, verifyMigration, type VerifiedMigration, type VerifyContext } from "./migration";
 import { destinationSpec, type DestinationSpec } from "./destination";
 
@@ -32,7 +33,7 @@ export function verifyContextOf(provider: LaunchProvider, info: PoolInfo): Verif
 
 function lpCheckOf(provider: LaunchProvider) {
   const inner = provider instanceof MigrationAwareProvider ? provider.inner : provider;
-  if (inner instanceof MeteoraDBCProvider || inner instanceof RaydiumLaunchLabProvider) return inner.lpCheck;
+  if (inner instanceof MeteoraDBCProvider || inner instanceof RaydiumLaunchLabProvider || inner instanceof PumpFunProvider) return inner.lpCheck;
   return { verification: "not_declared" as const, problems: [] };
 }
 
@@ -46,7 +47,7 @@ export function specFor(provider: LaunchProvider, info: PoolInfo, v: VerifiedMig
 export type MigrationOutcome = MigrationStatus | "conflict";
 
 /** Supported source → destination kinds. Everything else is unsupported and never attached. */
-const SUPPORTED_KIND: Record<string, DestinationSpec["kind"]> = { meteora_dbc: "dbc_damm_v2", raydium_launchlab: "launchlab_cpmm" };
+const SUPPORTED_KIND: Record<string, DestinationSpec["kind"]> = { meteora_dbc: "dbc_damm_v2", raydium_launchlab: "launchlab_cpmm", pump_fun: "pumpfun_pumpswap" };
 
 /** The facts that identify ONE graduation. A verified spec is only ever reused for the same facts. */
 function identityOf(x: { kind: string; pool?: string; destinationPool?: string; program?: string; destinationProgram?: string; ctx?: { sourcePool: string; migrationSignature: string; migrationSlot: number }; bondingPool?: string; signature?: string; slot?: number }) {

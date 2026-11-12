@@ -27,6 +27,7 @@ import {
   submitCustodySignature,
   createExportRequest,
   deriveLaunchLabPool,
+  derivePumpBondingCurve,
   discoverDbcPool,
   type DbcDiscovery,
   requestWalletGeneration,
@@ -503,7 +504,8 @@ export function createApp(d: ApiDeps) {
     }
     let poolAddress: string;
     try {
-      poolAddress = deriveLaunchLabPool(mint);
+      // Raydium LaunchLab pool, or pump.fun bonding curve: both are PDAs of the token mint.
+      poolAddress = s.launchProvider === "pump_fun" ? derivePumpBondingCurve(mint) : deriveLaunchLabPool(mint);
     } catch {
       return c.json({ error: "not a valid token mint address" }, 400);
     }

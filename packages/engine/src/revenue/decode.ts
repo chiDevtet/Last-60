@@ -4,10 +4,13 @@
  * Collections (instruction-scoped transfers, never whole-transaction balance deltas):
  *   bonding_curve_creator_fee        creator-fee claim of the bonding pool (LaunchLab claim_creator_fee
  *                                    out of the creator fee vault; DBC claim_creator_trading_fee out of
- *                                    the pool's quote/base vaults), as parsed by the provider;
+ *                                    the pool's quote/base vaults; pump.fun collect_creator_fee out of
+ *                                    the creator vault, in native SOL), as parsed by the provider;
  *   cpmm_creator_trading_fee         CPMM collect_creator_fee(_permissionless) transfers to pool_creator;
  *   damm_v2_creator_lp_fee           DAMM v2 claim_position_fee on a migration position of the verified
  *                                    Meteora DBC graduation, transfers out of the pool's token vaults;
+ *   pumpswap_creator_fee             pump_amm collect_coin_creator_fee out of the creator's coin creator
+ *                                    vault, after a verified pump.fun → PumpSwap graduation;
  *   forge_platform_lp_fee_collection LP-lock collect_cp_fees on a lock whose Fee Key was minted to the
  *                                    PlatformConfig platform_nft_wallet by the verified migration.
  * Funding inflows (last60_funding_inflow): System Program transfers (native SOL) and SPL Token /
@@ -16,7 +19,7 @@
  * platform NFT wallet). Anything else reaching the destination is not revenue of this launch.
  */
 import type { FlatInstruction, NormalizedTx } from "../chain/tx";
-import { decodeTokenTransfer, SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID, subtreeTransfers, tokenAccountInfo } from "../chain/tx";
+import { childInstructions, decodeTokenTransfer, SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID, subtreeTransfers, tokenAccountInfo } from "../chain/tx";
 import { ASSOCIATED_TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { PublicKey } from "@solana/web3.js";
 import { COLLECT_CP_FEES_DISC, RAYDIUM_CP_LOCK_PROGRAM_ID } from "../providers/migration";
@@ -44,7 +47,7 @@ export interface RevenueLaunchFacts {
   creator: string | null;
   /** Configured beneficiary role: bonding-curve creator-fee claims are parsed only for role "creator". */
   role: string;
-  /** Vaults that bonding-curve creator-fee claims are paid out of (LaunchLab creator fee vault / DBC pool vaults). */
+  /** Vaults that bonding-curve creator-fee claims are paid out of (LaunchLab creator fee vault / DBC pool vaults / pump.fun creator vault). */
   creatorClaimVaults: string[];
   /** Verified graduation destination (CPMM), when attached. */
   destination: null | {
@@ -165,6 +168,33 @@ export function extractRevenue(tx: NormalizedTx, parsed: ParsedTransaction, f: R
       const ixOrdinal = typeof c.evidence?.instruction === "number" ? (c.evidence.instruction as number) : null;
       const ix = ixOrdinal !== null ? byOrdinal.get(ixOrdinal) : null;
       if (!ix) continue; // no instruction-scoped evidence → not a collection we can attribute
+      if (c.evidence?.native === true) {
+        // pump.fun collect_creator_fee: native SOL, moved by the System Program transfers the claim
+        // instruction itself invoked (vault → creator). The program's event must state the same total.
+        const paid = childInstructions(tx, ix).map((x) => ({ ix: x, t: decodeSystemTransfer(x) })).filter((x): x is { ix: FlatInstruction; t: NonNullable<ReturnType<typeof decodeSystemTransfer>> } => !!x.t && vaults.has(x.t.from) && x.t.lamports > 0n);
+        if (paid.reduce((a, x) => a + x.t.lamports, 0n) !== c.quoteAmount) continue; // event and transfers disagree → not attributable
+        for (const p of paid) {
+          out.push({
+            kind: "collection",
+            stream: "bonding_curve_creator_fee",
+            launchPhase: "bonding_curve",
+            ...common(f.sourcePool),
+            ...pos(p.ix.ordinal),
+            feeMint: NATIVE_SOL,
+            asset: assetOf(NATIVE_SOL),
+            decimals: 9,
+            grossAmount: p.t.lamports,
+            netAmount: p.t.lamports,
+            sourceAccount: p.t.from,
+            destinationAccount: p.t.to,
+            sourceOwner: null,
+            destinationOwner: p.t.to,
+            beneficiary: p.t.to,
+            evidence: { claimInstruction: ix.ordinal, claimer: c.claimer, vault: p.t.from, transfer: p.ix.ordinal, event: String(c.evidence?.event ?? ""), native: true },
+          });
+        }
+        continue;
+      }
       for (const t of subtreeTransfers(tx, ix)) {
         if (!vaults.has(t.source) || t.amount === 0n) continue;
         const info = tokenAccountInfo(tx, t.destination);
@@ -297,6 +327,44 @@ export function extractRevenue(tx: NormalizedTx, parsed: ParsedTransaction, f: R
           destinationOwner: recipient,
           beneficiary: recipient,
           evidence: { claimInstruction: ix.ordinal, position: String(c.evidence?.position ?? ix.accounts[2] ?? ""), positionOwner: owner, vault: t.source, transfer: t.ordinal },
+        });
+      }
+    }
+  }
+
+  // 3c. pump.fun → PumpSwap: coin creator fees collected from the creator's vault (collect_coin_creator_fee,
+  //     already restricted to the launch creator's own vault by the PumpSwap adapter).
+  if (d && d.kind === "pumpfun_pumpswap" && f.role === "creator") {
+    for (const c of parsed.claims) {
+      if (c.pool !== d.pool || c.evidence?.event !== "CollectCoinCreatorFeeEvent") continue;
+      const ixOrdinal = typeof c.evidence?.instruction === "number" ? (c.evidence.instruction as number) : null;
+      const ix = ixOrdinal !== null ? byOrdinal.get(ixOrdinal) : null;
+      const vault = String(c.evidence?.vault ?? "");
+      if (!ix || !vault) continue;
+      const paid = subtreeTransfers(tx, ix).filter((t) => t.source === vault && t.amount > 0n);
+      if (paid.reduce((a, t) => a + t.amount, 0n) !== c.quoteAmount) continue; // event and transfers disagree → not attributable
+      for (const t of paid) {
+        const info = tokenAccountInfo(tx, t.destination);
+        const mint = t.mint ?? info?.mint ?? f.quoteMint;
+        // Collected into a WSOL account the same transaction creates and closes: owner proven from the ATA address.
+        const recipient = info?.owner ?? ataOwnerOf(t.destination, mint, t.program, [f.creator, c.claimer]);
+        out.push({
+          kind: "collection",
+          stream: "pumpswap_creator_fee",
+          launchPhase: "post_migration",
+          ...common(d.pool),
+          ...pos(t.ordinal),
+          feeMint: mint,
+          asset: assetOf(mint),
+          decimals: decimalsOf(tx, t.destination) ?? t.decimals ?? null,
+          grossAmount: t.amount,
+          netAmount: t.amount,
+          sourceAccount: t.source,
+          destinationAccount: t.destination,
+          sourceOwner: null,
+          destinationOwner: recipient,
+          beneficiary: recipient,
+          evidence: { claimInstruction: ix.ordinal, claimer: c.claimer, vault, transfer: t.ordinal, event: "CollectCoinCreatorFeeEvent" },
         });
       }
     }

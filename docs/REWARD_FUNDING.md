@@ -88,6 +88,18 @@ Every event carries an explicit stream; streams are never summed into one "creat
 | `damm_v2_creator_lp_fee` | post_migration | collection (gross) — Meteora DBC → DAMM v2 only | — | creator | creator | no |
 | `damm_v2_creator_lp_retained` | post_migration | derived (gross − contribution) | creator (25 %) | creator | creator | no |
 | `damm_v2_creator_lp_last60_contribution` | post_migration | observed transfer | creator (75 %) | creator | Asteroid Protocol | **yes** (§17) |
+| `pumpswap_creator_fee` | post_migration | collection (gross) — pump.fun → PumpSwap only | — | creator | creator | no |
+| `pumpswap_creator_retained` | post_migration | derived (gross − contribution) | creator (25 %) | creator | creator | no |
+| `pumpswap_creator_last60_contribution` | post_migration | observed transfer | creator (75 %) | creator | Asteroid Protocol | **yes** |
+
+**pump.fun.** A pump.fun launch has one creator entitlement in both phases — the coin creator fee — so
+both collections fund rewards at the bonding-curve share (75 %): `collect_creator_fee` is a
+`bonding_curve_creator_fee` collection (native SOL, vault → creator System transfers of the claim
+instruction, equal to `CollectCreatorFeeEvent`), and after a verified graduation
+`collect_coin_creator_fee` is a `pumpswap_creator_fee` collection. Both require the verified creator
+basis (`EXPECTED_PUMPFUN_CREATOR` / the configured creator wallet) and a vault not mixed with another
+coin's fees since the previous claim; the creator wallet automation settles the 75 % with the usual
+`last60:v1:<claim>` memo.
 
 Storage (all with unique keys, `$setOnInsert` writes and model-level immutability guards):
 
