@@ -28,7 +28,7 @@ the same amount. A round with no qualifying buyer pays nobody and its reward rol
 |---|---|
 | **Rewards engine** (`apps/worker` → `rewards`) | Clock-anchored 5-minute rounds; CSPRNG execution time sealed with AES-GCM and reused across restarts; snapshot at the cluster slot; deterministic unique-buyer selection; integer reward/retained allocation with dust and rollover; one MongoDB transaction per allocation; individual payouts with persisted-before-broadcast signatures and expiry-proven retries; reconciliation that halts on over-attribution. |
 | **Indexer** (`apps/worker` → `indexer`) | WebSocket fast path + gap-free cursor polling + backfill; idempotent ingestion; finality tracking and fork exclusion; v1-transaction aware. |
-| **Launch providers** | Meteora DBC and Raydium LaunchLab adapters from the official IDLs, validated on real mainnet data; switch with `LAUNCH_PROVIDER` (or live, from the admin console). Strictly verified graduation to Meteora DAMM v2 and Raydium CPMM with post-migration buyer tracking and creator-entitlement accounting. |
+| **Launch providers** | Meteora DBC, Raydium LaunchLab and pump.fun adapters from the official IDLs, validated on real mainnet data; switch with `LAUNCH_PROVIDER` (or live, from the admin console). Strictly verified graduation to Meteora DAMM v2, Raydium CPMM and PumpSwap with post-migration buyer tracking and creator-entitlement accounting. |
 | **Creator-fee accounting** | Only fees allocated to the creator by on-chain configuration and position ownership are counted; every record carries gross / allocated / excluded amounts, its allocation basis, evidence and payout eligibility ([Fee accounting](docs/FEE_ACCOUNTING.md)). |
 | **Phase-aware reward funding** | Forge's two-phase model kept as seven separate streams: bonding-curve creator fees (25 % creator / 75 % Asteroid Protocol of what is **collected**), CPMM creator fees (direct creator revenue, never funding) and Forge platform LP claims (50 % the creator's allocation, dedicated to Asteroid Protocol / 50 % Forge). Only **observed, finalized, correlated** transfers fund rounds, capped at the expected allocation, once, under the versioned `forge_phase_aware_v2` policy: into an Asteroid Protocol funding destination (same transaction or memo), or — for the creator's 50 % LP allocation — **Forge's existing post-migration payout to the creator's wallet**, attributed to exactly one verified harvest by launch-scoped, complete-index evidence, never by amount; anything ambiguous is recorded and never payable ([Reward funding](docs/REWARD_FUNDING.md)). |
 | **API** (`apps/api`) | Public REST + Server-Sent Events from whitelisted DTOs; wallet-signature admin API with audited, version-checked configuration. |
@@ -51,7 +51,7 @@ Minimum `.env` for a **read-only run against a real pool** (payouts are dry-run 
 ```bash
 SOLANA_CLUSTER=mainnet-beta
 SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=…
-LAUNCH_PROVIDER=raydium_launchlab            # or meteora_dbc
+LAUNCH_PROVIDER=raydium_launchlab            # or meteora_dbc | pump_fun
 TOKEN_MINT=…  POOL_ADDRESS=…  FEE_BENEFICIARY_ROLE=creator
 MONGODB_URI='mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true'
 SCHEDULE_ENCRYPTION_KEY=$(bun run cli gen-schedule-key)

@@ -138,6 +138,16 @@ export function buildAllocationReport(info: PoolInfo, expected: ExpectedAllocati
       pendingRow("migrated_lp", "creator-owned locked-LP Fee Key", "LP fees of a Fee Key the migration transaction actually minted to the creator", "the migration transaction's lock records (a creator Fee Key exists only for pre-upgrade migrations)", info.destination?.lpAllocation, ["platform-owned locked LP (platform_scale + creator_scale) is never attributed to the creator"]);
       pendingRow("post_migration_trading", "CPMM creator fee (post-graduation)", "CPMM creator fee collected to the CPMM pool_creator, net of the protocol share", "the migration transaction (CPMM pool_creator, enable_creator_fee, creator_fee_on), the CreatorFeeShare PDA and later collection instructions", info.destination?.allocation, ["independent of the bonding-curve creator fee and of locked-LP fees", "direct creator revenue: never Asteroid Protocol funding, never part of the Forge LP split", "params show creator_fee_on, the AmmConfig default share rate, the per-creator CreatorFeeShare override and the effective rate; an unverified mode or rate is never distributable"]);
     }
+  } else if (info.provider === "pump_fun") {
+    feeMints.push({ phase: "bonding_curve", mint: info.quoteMint, note: "pump.fun fees are native SOL (accounted as the SOL asset)" });
+    if (creatorRole) {
+      add("bonding_curve", "coin creator (BondingCurve.creator)", "pumpfunCreator", info.creator, [
+        "pump.fun pays the creator fee to the coin's creator; its RATE comes from the pump-fees schedule (it changes with the market cap) and is read per trade from TradeEvent.creator_fee",
+        "declared with EXPECTED_PUMPFUN_CREATOR, default the configured creator wallet (the wallet the coin is launched from)",
+        "holder-reward and cashback coins pay the creator fee to holders / traders and are never distributable",
+      ], info.allocation?.verification);
+      pendingRow("post_migration_trading", "PumpSwap coin creator fee (post-graduation)", "coin creator fee of each PumpSwap trade, exact in the trade's own event", "the migration transaction and the PumpSwap pool (coin_creator must be the same creator wallet)", info.destination?.allocation, ["pump.fun gives the creator no LP at graduation: there is no migrated-LP stream"]);
+    }
   }
   if (!creatorRole) {
     rows.push({ phase: "bonding_curve", parameter: `${info.feeBeneficiaryRole} share`, env: "(none)", meaning: `no declaration exists for the "${info.feeBeneficiaryRole}" role`, declared: null, onChain: JSON.stringify(info.allocation?.params ?? {}), forgepadIntended: null, matchesIntended: null, verification: "not_declared", distributable: false, notes: ["only the creator role has declarable expectations; other roles are recorded but not distributable"] });

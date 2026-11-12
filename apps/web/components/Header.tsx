@@ -1,6 +1,6 @@
 import type { ConnState } from "@/lib/useLive";
 
-const PROVIDER_LABEL: Record<string, string> = { meteora_dbc: "Meteora DBC", raydium_launchlab: "Raydium LaunchLab", mock: "Mock provider" };
+const PROVIDER_LABEL: Record<string, string> = { meteora_dbc: "Meteora DBC", raydium_launchlab: "Raydium LaunchLab", pump_fun: "pump.fun", mock: "Mock provider" };
 
 export function Header({ conn, cluster, provider, tradeUrl }: { conn: ConnState; cluster: string; provider: string; tradeUrl?: string | null }) {
   const live = conn === "live";

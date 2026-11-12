@@ -10,6 +10,7 @@ import type { NormalizedTx } from "../chain/tx";
 import type { ChainRpc } from "../chain/rpc";
 import type { NormalizedAttribution } from "../accounting/attribution";
 import { DammV2Destination } from "./destination/dammV2";
+import { PumpSwapDestination } from "./destination/pumpSwap";
 import type { CheckpointState, ClaimPlan, FeeSourceState, LaunchProvider, ParsedTransaction, PoolInfo } from "./LaunchProvider";
 import { buildDestination, type DestinationAdapter, type DestinationSpec } from "./destination";
 
@@ -75,9 +76,23 @@ export class MigrationAwareProvider implements LaunchProvider {
     return this.dest instanceof DammV2Destination && this.inner.info().feeBeneficiaryRole === "creator" ? this.dest : null;
   }
 
+  /** The PumpSwap pool a pump.fun coin graduated into, when attached. */
+  private pumpSwap(): PumpSwapDestination | null {
+    return this.dest instanceof PumpSwapDestination ? this.dest : null;
+  }
+
   /** Bonding-curve unclaimed fees, plus — after a DBC → DAMM v2 graduation — the creator's unclaimed position LP fees. */
   async getFeeSourceState(): Promise<FeeSourceState> {
     const a = await this.inner.getFeeSourceState();
+    const ps = this.pumpSwap();
+    if (ps) {
+      // The bonding-curve vault keeps reconciling on its own (`unclaimedQuote`); what PumpSwap holds for
+      // the creator only adds to what a claim would pay now.
+      const st = await ps.claimState(this.inner.info().beneficiary).catch(() => null);
+      const extra = st ? st.vaultBalance + st.poolBucket : 0n;
+      if (extra === 0n) return a;
+      return { ...a, claimableQuote: (a.claimableQuote ?? a.unclaimedQuote) + extra, source: `${a.source}; claimable also includes the PumpSwap coin creator vault` };
+    }
     const d = this.dammV2();
     const b = d ? await d.claimState(this.inner.info().beneficiary).catch(() => null) : null;
     if (!b || (b.unclaimedQuote === 0n && b.unclaimedBase === 0n)) return a;
@@ -85,6 +100,16 @@ export class MigrationAwareProvider implements LaunchProvider {
   }
 
   async buildClaimInstructions(claimer: PublicKey, destination: PublicKey): Promise<ClaimPlan> {
+    const ps = this.pumpSwap();
+    if (ps) {
+      // One transaction, as pump.fun's own "claim" does: the bonding-curve vault (residual fees) and
+      // the PumpSwap coin creator vault. Each leg is included only when it has something to pay.
+      const amm = await ps.buildClaimInstructions(claimer, destination);
+      if (!amm.instructions.length) return this.inner.buildClaimInstructions(claimer, destination);
+      const inner = await this.inner.getFeeSourceState().catch(() => null);
+      const bonding = inner && (inner.claimableQuote ?? inner.unclaimedQuote) > 0n ? await this.inner.buildClaimInstructions(claimer, destination) : null;
+      return { instructions: [...(bonding?.instructions ?? []), ...amm.instructions], signer: claimer, description: `${bonding ? `${bonding.description} + ` : ""}PumpSwap collect_coin_creator_fee (${ps.pool}) → ${destination.toBase58()}` };
+    }
     const d = this.dammV2();
     if (!d) return this.inner.buildClaimInstructions(claimer, destination);
     const info = this.inner.info();

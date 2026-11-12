@@ -4,7 +4,7 @@
  * Amounts are base-unit decimal strings.
  */
 
-export type LaunchProviderId = "meteora_dbc" | "raydium_launchlab" | "mock";
+export type LaunchProviderId = "meteora_dbc" | "raydium_launchlab" | "pump_fun" | "mock";
 
 /** Publicly visible phase of a round. Derived from time + settled state only. */
 export type RoundPhase =

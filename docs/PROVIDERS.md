@@ -7,6 +7,7 @@ validated against real mainnet transactions and account data (`test/fixtures/mai
 ```
 LAUNCH_PROVIDER=meteora_dbc        FEE_BENEFICIARY_ROLE=creator|partner
 LAUNCH_PROVIDER=raydium_launchlab  FEE_BENEFICIARY_ROLE=creator|platform
+LAUNCH_PROVIDER=pump_fun           FEE_BENEFICIARY_ROLE=creator
 ```
 
 Switching was exercised live: the running system was moved from a Meteora DBC pool to a Raydium
@@ -66,6 +67,52 @@ within seconds without a restart.
   pools of a platform. Per-event attribution is authoritative; deposits of other pools are recorded as
   excluded `shared_vault_inflow` records so reconciliation can compare exactly.
 
+## pump.fun — `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` (bonding curve) → PumpSwap `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`
+
+Built from the official IDLs (`@pump-fun/pump-sdk` 4.3.1 / `@pump-fun/pump-swap-sdk` 2.2.0, vendored in
+`providers/pumpfun/idl/` and `providers/destination/idl/`) and verified on real mainnet transactions
+(`test/fixtures/mainnet/pumpfun-*.json`, `test/pumpfun.test.ts`). Only SOL-quoted coins, role `creator`.
+
+* **Pool from the mint.** The "pool" is the coin's bonding curve, the PDA `["bonding-curve", mint]`
+  (derived, even before launch). Leave `POOL_ADDRESS` empty.
+* **Events.** Every trade instruction (`buy`, `buy_exact_sol_in`, `sell`, their `_v2` / `_v3` forms,
+  `multi_hop_curve_swap` hops) emits one `TradeEvent` (self-CPI) with the mint, the trader (`user`),
+  the protocol `fee`, the coin's `creator` and its `creator_fee`.
+* **Amounts.** `sol_amount` excludes fees: a buyer pays `sol_amount + fee + creator_fee`, a seller
+  receives `sol_amount − fee − creator_fee` (lamport deltas of real trades match). The buyback fee is a
+  slice of `fee`.
+* **Where the creator fee goes.** Legacy and `_v2` trades pay it into the creator vault
+  `["creator-vault", creator]` (native lamports) in the trade. `_v3` trades — most of today's volume —
+  leave it on the curve (`BondingCurve.creator_fee`) until the permissionless `sweep_creator_fee`
+  (pump.fun runs a crank; the claim also sweeps). Attribution is always per trade, from the event.
+* **Shared vault.** The vault is keyed by the creator: all their coins pay into it. Other coins'
+  deposits are recorded as excluded `shared_vault_inflow` records (computed from the vault's lamport
+  change minus this coin's own deposits, so reconciliation is exact); a plain top-up (e.g. a rent floor)
+  is recorded as `creator_vault_top_up`. Use a dedicated creator wallet per launch.
+* **Claims.** `collect_creator_fee` pays the vault above its rent floor (read from the RPC; 650 240
+  lamports today) to the creator and emits `CollectCreatorFeeEvent`. It is permissionless and always
+  pays the creator wallet. The claim plan is `sweep_creator_fee` (if the curve holds fees) +
+  `collect_creator_fee`; when the destination is another wallet (legacy policy) the amount claimable at
+  build time is forwarded in the same transaction — fees of trades landing in between stay in the
+  creator wallet.
+* **Allocation.** pump.fun sets the creator fee rate itself (pump-fees schedule, per trade in the
+  event), so the declaration is the identity: the curve's `creator` must equal
+  `EXPECTED_PUMPFUN_CREATOR` (default: the configured creator wallet). Holder-reward and cashback coins
+  pay the creator fee to holders / traders and are never distributable; a trade whose event names
+  another creator (e.g. after fee sharing or a CTO) is recorded and excluded.
+* **Graduation.** `migrate` / `migrate_v2` name the PumpSwap pool. It is verified strictly: PumpSwap
+  owner and `Pool` discriminator, mints, the canonical PDA `["pool", 0, pool_authority(mint), mint, quote]`,
+  created by the coin's pool authority, quote vault owned by a token program. The creator receives no LP.
+* **PumpSwap.** `BuyEvent` / `SellEvent` carry `coin_creator` and the exact `coin_creator_fee` (final
+  at the trade — nothing is withheld at collection). Legacy trades pay the coin creator vault (the
+  WSOL account of `["creator_vault", coin_creator]`), `_v2` trades leave it in the pool
+  (`Pool.creator_fees`) until `sweep_creator_fee`. `collect_coin_creator_fee` pays the vault to the
+  creator (`CollectCoinCreatorFeeEvent`). After graduation one claim transaction collects both vaults,
+  as pump.fun's own claim does, and unwraps the WSOL.
+* **Not observed live end-to-end**: no reward round on a real pump.fun launch has been run yet.
+  `migrate` (v1) and `multi_hop_*` are implemented from the IDL; the fixtures cover `migrate_v2` and
+  the single-hop trades.
+
 ## Transaction versions
 
 Mainnet now carries **version 1** transactions. The indexer requests
@@ -82,6 +129,7 @@ bun scripts/verify-fee-attribution.ts find-dbc                       # pick one 
 POOL_ADDRESS=… TOKEN_MINT=… LAUNCH_PROVIDER=… FEE_BENEFICIARY_ROLE=… bun scripts/verify-round.ts <n> --fees
 # Refresh real-transaction fixtures
 bun scripts/fetch-fixtures.ts
+bun scripts/fetch-pumpfun-fixtures.ts
 ```
 
 ## Post-migration (graduation)
@@ -122,6 +170,8 @@ different fee mechanism. Asteroid Protocol handles it as follows (code: `provide
 | Raydium LaunchLab (bonding) | pool owner, base mint, platform config, payout asset | ✔ `TradeEvent` | ✔ per trade `creator_fee` (cross-checked with the vault transfer); claims per instruction; shared vault exact | **Implemented**, mainnet-verified |
 | DBC → **DAMM v2** | strict (above) | ✔ `EvtSwap2` | ✔ fee growth of creator-held migration positions (checkpointed per snapshot); claims via `EvtClaimPositionFee` | **Implemented**; verified offline on real mainnet transactions/accounts; **not yet observed live end-to-end** |
 | LaunchLab → **CPMM** | strict (above) | ✔ instruction transfers (+ log `SwapEvent` for fee detail) | ✔ CPMM creator fee as collected to the creator; ✔ locked-LP fees collected from the creator's migration lock | **Implemented**; swap and creator-fee collection verified on real mainnet transactions; LP-lock collection verified on synthetic transactions only (no creator-lock collection observed on mainnet yet) |
+| pump.fun (bonding) | curve PDA of the mint, owner, SOL quote, creator = declared wallet | ✔ `TradeEvent` | ✔ per trade `creator_fee`; shared vault exact | **Implemented**; verified offline on real mainnet transactions; **not yet observed live end-to-end** |
+| pump.fun → **PumpSwap** | strict (canonical pool PDA, pool authority, mints, layout) | ✔ `BuyEvent` / `SellEvent` | ✔ per trade `coin_creator_fee`; claims via `CollectCoinCreatorFeeEvent` | **Implemented**; verified offline on real mainnet transactions; **not yet observed live end-to-end** |
 | DBC → DAMM v1 | — | ✗ | ✗ | **Unsupported**: layouts and the lock-escrow fee model are not verified here; marked unverified, never accounted |
 | LaunchLab → AMM v4 | — | ✗ | ✗ (AMM v4 has no creator fee) | **Unsupported**: marked unverified, never accounted |
 

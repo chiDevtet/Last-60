@@ -97,9 +97,10 @@ export class Reconciler {
     const claims: any[] = await this.d.db.FeeClaim.aggregate([{ $match: { pool: info.poolAddress, status: "confirmed", slot: { $gt: baseline.slot, $lte: state.slot } } }, { $group: { _id: null, t: { $sum: "$quoteAmount" } } }]);
     // Shared vaults (LaunchLab): deposits of the creator's OTHER pools into the same vault are indexed
     // (the vault is watched) and recorded as excluded inflows. Counting them makes the comparison
-    // exact, so other pools' fees can no longer mask an over-attribution on this pool.
+    // exact, so other pools' fees can no longer mask an over-attribution on this pool. (Inflows of a
+    // DESTINATION vault — pump.fun's PumpSwap creator vault — are not part of the bonding-curve vault.)
     const foreign: any[] = state.mayIncludeOtherPools
-      ? await this.d.db.FeeAttribution.aggregate([{ $match: { sourcePool: info.poolAddress, kind: "shared_vault_inflow", feeMint: info.quoteMint, slot: { $gt: baseline.slot, $lte: state.slot } } }, { $group: { _id: null, t: { $sum: "$excludedAmount" } } }])
+      ? await this.d.db.FeeAttribution.aggregate([{ $match: { sourcePool: info.poolAddress, destinationPool: null, kind: "shared_vault_inflow", feeMint: info.quoteMint, slot: { $gt: baseline.slot, $lte: state.slot } } }, { $group: { _id: null, t: { $sum: "$excludedAmount" } } }])
       : [];
     const expected = big(fees[0]?.t ?? 0) + big(foreign[0]?.t ?? 0) - big(claims[0]?.t ?? 0) + big(baseline.quote ?? "0");
     const actual = state.unclaimedQuote;

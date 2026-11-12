@@ -31,14 +31,14 @@ const SOL = 1_000_000_000n;
 const USD1 = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
 
 describe("revenue streams", () => {
-  test("ten distinct streams; only the three Last-60 contributions are reward-eligible; all are CREATOR allocations", () => {
+  test("thirteen distinct streams; only the four Last-60 contributions are reward-eligible; all are CREATOR allocations", () => {
     expect(STREAM_INFO.forge_platform_lp_last60_contribution).toMatchObject({ beneficiary: "last60", allocationOwner: "creator", custodian: "forge", rewardEligible: true });
     expect(STREAM_INFO.bonding_curve_last60_reward_contribution).toMatchObject({ beneficiary: "last60", allocationOwner: "creator", custodian: "creator", rewardEligible: true });
     expect(STREAM_INFO.forge_platform_lp_retained).toMatchObject({ beneficiary: "forge", allocationOwner: "forge", rewardEligible: false });
     expect(STREAM_INFO.cpmm_creator_trading_fee).toMatchObject({ beneficiary: "creator", allocationOwner: "creator", rewardEligible: false });
-    expect(REVENUE_STREAMS).toHaveLength(10);
+    expect(REVENUE_STREAMS).toHaveLength(13);
     const eligible = REVENUE_STREAMS.filter((s) => STREAM_INFO[s].rewardEligible);
-    expect(eligible.sort()).toEqual(["bonding_curve_last60_reward_contribution", "damm_v2_creator_lp_last60_contribution", "forge_platform_lp_last60_contribution"]);
+    expect(eligible.sort()).toEqual(["bonding_curve_last60_reward_contribution", "damm_v2_creator_lp_last60_contribution", "forge_platform_lp_last60_contribution", "pumpswap_creator_last60_contribution"]);
     expect(eligible.every((s) => STREAM_INFO[s].allocationOwner === "creator")).toBe(true);
     // Creator retained 25 %, CPMM creator fees and Forge retained 50 % are never buyer-reward funding.
     for (const s of ["bonding_curve_creator_retained", "cpmm_creator_trading_fee", "forge_platform_lp_retained", "bonding_curve_creator_fee", "forge_platform_lp_fee_collection"] as const) expect(STREAM_INFO[s].rewardEligible).toBe(false);

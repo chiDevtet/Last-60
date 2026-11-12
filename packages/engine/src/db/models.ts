@@ -247,7 +247,7 @@ guardImmutable(feeAttributionSchema, ["basis", "basisId", "creatorAmount", "excl
  * Last-60 funding destination). One row per (signature, instruction ordinal, stream, mint): retries,
  * re-indexing and restarts can never create a second row.
  */
-export const REVENUE_EVENT_STREAMS = ["bonding_curve_creator_fee", "cpmm_creator_trading_fee", "forge_platform_lp_fee_collection", "damm_v2_creator_lp_fee", "last60_funding_inflow"] as const;
+export const REVENUE_EVENT_STREAMS = ["bonding_curve_creator_fee", "cpmm_creator_trading_fee", "forge_platform_lp_fee_collection", "damm_v2_creator_lp_fee", "pumpswap_creator_fee", "last60_funding_inflow"] as const;
 const revenueEventSchema = new Schema(
   {
     key: { type: String, required: true, unique: true },
@@ -315,7 +315,7 @@ guardImmutable(revenueEventSchema, ["key", "kind", "stream", "provider", "launch
 const rewardFundingSchema = new Schema(
   {
     key: { type: String, required: true, unique: true },
-    stream: { type: String, enum: ["bonding_curve_last60_reward_contribution", "forge_platform_lp_last60_contribution", "damm_v2_creator_lp_last60_contribution"], required: true },
+    stream: { type: String, enum: ["bonding_curve_last60_reward_contribution", "forge_platform_lp_last60_contribution", "damm_v2_creator_lp_last60_contribution", "pumpswap_creator_last60_contribution"], required: true },
     collectionKey: { type: String, required: true },
     correlationMethod: { type: String, enum: ["same_transaction", "memo", "exclusive_window", "forge_distribution_sequence"], required: true },
     /** How the funds reached Last-60 (null on credits written before this field = last60_destination). */

@@ -5,7 +5,8 @@
  *   - creator-fee attribution for the destination's actual creator entitlement:
  *       DAMM v2  — fee growth of LP positions whose NFT the beneficiary holds (checkpointed);
  *       CPMM     — creator fees as COLLECTED to the pool creator, and LP fees COLLECTED from the
- *                  locked-LP fee key minted to the beneficiary at migration.
+ *                  locked-LP fee key minted to the beneficiary at migration;
+ *       PumpSwap — the coin creator fee of each trade, exact in the trade's own event.
  * Gross pool fees, protocol / partner / platform shares and other LPs' fees are recorded as
  * excluded, never attributed.
  */
@@ -14,7 +15,7 @@ import type { AllocationBasis, NormalizedAttribution } from "../../accounting/at
 import type { CheckpointState, ParsedTransaction } from "../LaunchProvider";
 
 export interface DestinationAdapter {
-  readonly kind: "dbc_damm_v2" | "launchlab_cpmm";
+  readonly kind: "dbc_damm_v2" | "launchlab_cpmm" | "pumpfun_pumpswap";
   readonly program: string;
   readonly pool: string;
   readonly migrationSlot: number;
@@ -30,7 +31,7 @@ export interface DestinationAdapter {
 }
 
 export interface DestinationContext {
-  sourceProvider: "meteora_dbc" | "raydium_launchlab";
+  sourceProvider: "meteora_dbc" | "raydium_launchlab" | "pump_fun";
   sourcePool: string;
   baseMint: string;
   quoteMint: string;

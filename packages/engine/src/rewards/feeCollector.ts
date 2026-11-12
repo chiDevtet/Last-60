@@ -61,7 +61,7 @@ export class FeeCollector {
     if (recent) return null; // a claim is already in flight
     const provider = this.d.provider();
     const state = await provider.getFeeSourceState();
-    if (state.unclaimedQuote < this.d.cfg.feeCollection.minClaimLamports) return null;
+    if ((state.claimableQuote ?? state.unclaimedQuote) < this.d.cfg.feeCollection.minClaimLamports) return null;
 
     const destination = phaseAware ? this.d.claimer.publicKey : this.d.payoutWallet!;
     const plan = await provider.buildClaimInstructions(this.d.claimer.publicKey, destination);

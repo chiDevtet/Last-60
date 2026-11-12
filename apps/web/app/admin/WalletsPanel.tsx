@@ -348,7 +348,7 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
         </div>
         {derived && (
           <p className="mt-2 flex items-center gap-2 text-xs">
-            <span className="text-mist">{derived.provider === "meteora_dbc" ? "Meteora DBC pool (SOL quote):" : "Raydium LaunchLab pool (SOL quote):"}</span>{" "}
+            <span className="text-mist">{derived.provider === "meteora_dbc" ? "Meteora DBC pool (SOL quote):" : derived.provider === "pump_fun" ? "pump.fun bonding curve (SOL quote):" : "Raydium LaunchLab pool (SOL quote):"}</span>{" "}
             {derived.poolAddress ? (
               <>
                 <code className="font-mono">{derived.poolAddress}</code> <Copy text={derived.poolAddress} />
@@ -357,7 +357,7 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
             <span className={derived.poolExists ? "text-good" : "text-mist"}>{derived.poolExists ? "exists" : derived.lookup === "ambiguous" ? "several pools use this mint — enter the pool address" : derived.poolExists === false ? "not created yet" : "lookup unavailable"}</span>
           </p>
         )}
-        <p className="mt-2 text-[11px] text-dim">Set the token mint in Configuration and leave the pool address empty: a Raydium LaunchLab pool is derived from the mint, a Meteora DBC pool is found on chain from the mint once the token is launched. A pool quoted in another token (e.g. USD1) must be entered explicitly.</p>
+        <p className="mt-2 text-[11px] text-dim">Set the token mint in Configuration and leave the pool address empty: a Raydium LaunchLab pool and a pump.fun bonding curve are derived from the mint, a Meteora DBC pool is found on chain from the mint once the token is launched. A pump.fun coin must be created by the creator wallet above (or the wallet declared in EXPECTED_PUMPFUN_CREATOR) for its fees to be distributed. A pool quoted in another token (e.g. USD1) must be entered explicitly.</p>
       </div>
     </section>
   );

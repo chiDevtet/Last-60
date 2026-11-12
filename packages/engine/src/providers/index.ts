@@ -3,6 +3,7 @@ import type { ChainRpc } from "../chain/rpc";
 import { AwaitingLaunchError, type LaunchProvider } from "./LaunchProvider";
 import { MeteoraDBCProvider } from "./meteora/MeteoraDBCProvider";
 import { RaydiumLaunchLabProvider } from "./raydium/RaydiumLaunchLabProvider";
+import { PumpFunProvider } from "./pumpfun/PumpFunProvider";
 import { MockProvider } from "./mock/MockProvider";
 import { MigrationAwareProvider } from "./MigrationAwareProvider";
 
@@ -11,10 +12,12 @@ export { MeteoraDBCProvider, DBC_PROGRAM_ID } from "./meteora/MeteoraDBCProvider
 export { RaydiumLaunchLabProvider, LAUNCHLAB_PROGRAM_ID } from "./raydium/RaydiumLaunchLabProvider";
 export { deriveLaunchLabPool } from "./raydium/pda";
 export { deriveDbcPool, discoverDbcPool, type DbcDiscovery } from "./meteora/pda";
+export { PumpFunProvider, PUMP_PROGRAM_ID, PUMP_AMM_PROGRAM_ID, decodePumpBondingCurve, verifyPumpCreator } from "./pumpfun/PumpFunProvider";
+export { derivePumpBondingCurve, canonicalPumpSwapPool, pumpCreatorVault, pumpSwapCreatorVaultAta, pumpSwapCreatorVaultAuthority } from "./pumpfun/pda";
 export { MockProvider } from "./mock/MockProvider";
 export * from "./migration";
 export { MigrationAwareProvider } from "./MigrationAwareProvider";
-export { destinationSpec, buildDestination, type DestinationSpec, DammV2Destination, CpmmDestination } from "./destination";
+export { destinationSpec, buildDestination, type DestinationSpec, DammV2Destination, CpmmDestination, PumpSwapDestination } from "./destination";
 export { resolveAndAttachMigration, attachStoredMigration } from "./migrationAttach";
 
 export interface ProviderTarget {
@@ -46,6 +49,8 @@ export function createProvider(target: ProviderTarget, rpc: ChainRpc | null): La
       return new MigrationAwareProvider(new MeteoraDBCProvider(rpc, { tokenMint: req(target.tokenMint, "TOKEN_MINT"), poolAddress: req(target.poolAddress, "POOL_ADDRESS"), role: target.role, payoutMint: target.payoutMint, expected: target.expected }), rpc);
     case "raydium_launchlab":
       return new MigrationAwareProvider(new RaydiumLaunchLabProvider(rpc, { tokenMint: req(target.tokenMint, "TOKEN_MINT"), poolAddress: req(target.poolAddress, "POOL_ADDRESS"), role: target.role, payoutMint: target.payoutMint, expected: target.expected }), rpc);
+    case "pump_fun":
+      return new MigrationAwareProvider(new PumpFunProvider(rpc, { tokenMint: req(target.tokenMint, "TOKEN_MINT"), poolAddress: req(target.poolAddress, "POOL_ADDRESS"), role: target.role, payoutMint: target.payoutMint, expected: target.expected }), rpc);
     case "mock":
       return new MockProvider({ poolAddress: target.poolAddress ?? undefined, tokenMint: target.tokenMint ?? undefined });
   }

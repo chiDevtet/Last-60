@@ -164,8 +164,9 @@ export class CreatorWalletAutomation {
     const recs: any[] = await db.RevenueReconciliation.find({
       sourcePool,
       // Bonding-curve claims and, after a Meteora DBC graduation, DAMM v2 migration-position LP claims:
-      // both are the creator's fees and fund rewards at the same 75 % share.
-      stream: { $in: ["bonding_curve_creator_fee", "damm_v2_creator_lp_fee"] },
+      // both are the creator's fees and fund rewards at the same 75 % share. So are pump.fun's creator
+      // fees collected from PumpSwap after graduation.
+      stream: { $in: ["bonding_curve_creator_fee", "damm_v2_creator_lp_fee", "pumpswap_creator_fee"] },
       recipient: me,
       verified: true,
       asset: WSOL_MINT,
@@ -188,7 +189,7 @@ export class CreatorWalletAutomation {
       if (outstanding < cfg.creatorWallet.minTransferLamports) continue;
       const amount = this.fit(outstanding, budget);
       if (amount < cfg.creatorWallet.minTransferLamports) {
-        await this.d.terminal.warn(`Creator wallet balance too low to send the Asteroid Protocol share (${sol(outstanding)} SOL) of ${rec.stream === "damm_v2_creator_lp_fee" ? "LP fee" : "bonding"} claim ${rec.collectionSignature.slice(0, 8)}…; retrying automatically.`, `creator-low:${rec.key}:${Math.floor(this.now() / 3_600_000)}`);
+        await this.d.terminal.warn(`Creator wallet balance too low to send the Asteroid Protocol share (${sol(outstanding)} SOL) of ${rec.stream === "damm_v2_creator_lp_fee" ? "LP fee" : rec.stream === "pumpswap_creator_fee" ? "PumpSwap creator fee" : "bonding"} claim ${rec.collectionSignature.slice(0, 8)}…; retrying automatically.`, `creator-low:${rec.key}:${Math.floor(this.now() / 3_600_000)}`);
         continue;
       }
       const sig = await this.send({ kind: "bonding_settlement", ref: rec.key, sourcePool, collectionKey: rec.key, collectionSignature: rec.collectionSignature, lamports: amount, memo: `${FUNDING_MEMO_PREFIX}${rec.collectionSignature}` });
@@ -389,7 +390,7 @@ export class CreatorWalletAutomation {
       const credit: any = await db.RewardFunding.findOne({ signature: row.signature }).lean();
       if (!credit) return attempt(null, { waiting: "credit_not_written_yet" });
       await db.CreatorWalletTransfer.updateOne({ signature: row.signature }, { $set: { effectRecorded: true, effect: { creditKey: credit.key, payoutEligible: credit.payoutEligible, creditable: big(credit.creditableAmount).toString(), reason: credit.ineligibleReason ?? null }, updatedAt: new Date(this.now()) } });
-      if (credit.payoutEligible) await this.d.terminal.system(`Creator wallet sent ${sol(big(row.lamports))} SOL — the Asteroid Protocol share of a ${credit.stream === "damm_v2_creator_lp_last60_contribution" ? "post-migration LP" : "bonding-curve"} fee claim — to the payout wallet.`, `creator-settled:${row.signature}`);
+      if (credit.payoutEligible) await this.d.terminal.system(`Creator wallet sent ${sol(big(row.lamports))} SOL — the Asteroid Protocol share of a ${credit.stream === "damm_v2_creator_lp_last60_contribution" ? "post-migration LP" : credit.stream === "pumpswap_creator_last60_contribution" ? "PumpSwap creator" : "bonding-curve"} fee claim — to the payout wallet.`, `creator-settled:${row.signature}`);
       else await this.d.terminal.warn(`Creator wallet transfer ${row.signature.slice(0, 8)}… was recorded but is not payable: ${credit.ineligibleReason ?? "unknown"}.`, `creator-settled:${row.signature}`);
       return true;
     }

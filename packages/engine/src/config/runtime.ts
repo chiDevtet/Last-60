@@ -10,6 +10,7 @@ import { isValidPubkey } from "./env";
 import type { Models } from "../db/models";
 import { roleChangeBlockReason } from "../accounting/attribution";
 import { deriveLaunchLabPool } from "../providers/raydium/pda";
+import { derivePumpBondingCurve } from "../providers/pumpfun/pda";
 
 const pubkey = z.string().trim().refine(isValidPubkey, "must be a Solana public key");
 const httpUrl = z.string().trim().refine((v) => /^https?:\/\//.test(v), "must be an http(s) URL");
@@ -18,7 +19,7 @@ const intStr = z.string().regex(/^\d+$/, "must be an integer amount of base unit
 
 export const RuntimeOverridesSchema = z
   .object({
-    launchProvider: z.enum(["meteora_dbc", "raydium_launchlab", "mock"]),
+    launchProvider: z.enum(["meteora_dbc", "raydium_launchlab", "pump_fun", "mock"]),
     tokenMint: pubkey,
     poolAddress: pubkey,
     feeBeneficiaryRole: z.enum(["creator", "partner", "platform"]),
@@ -99,8 +100,9 @@ function resolvePool(cfg: AppConfig, o: RuntimeOverrides, launchProvider: Effect
     const found = tokenMint ? discovered[`meteora_dbc:${tokenMint}`] : undefined;
     return found ? { poolAddress: found, poolAddressSource: "discovered" } : { poolAddress: null, poolAddressSource: null };
   }
-  const launchLab = launchProvider === "raydium_launchlab";
-  const derive = (mint: string) => ({ poolAddress: deriveLaunchLabPool(mint), poolAddressSource: "derived" as const });
+  // Raydium LaunchLab pools and pump.fun bonding curves are PDAs of the token mint.
+  const launchLab = launchProvider === "raydium_launchlab" || launchProvider === "pump_fun";
+  const derive = (mint: string) => ({ poolAddress: launchProvider === "pump_fun" ? derivePumpBondingCurve(mint) : deriveLaunchLabPool(mint), poolAddressSource: "derived" as const });
   if (launchLab && o.tokenMint) return derive(o.tokenMint);
   if (cfg.provider.poolAddress && launchProvider === cfg.provider.id) return { poolAddress: cfg.provider.poolAddress, poolAddressSource: cfg.provider.poolAddressSource ?? "configured" };
   if (launchLab && tokenMint) return derive(tokenMint);
@@ -161,7 +163,9 @@ export function validateEffective(cfg: AppConfig, s: EffectiveSettings): string[
   const p: string[] = [];
   if (s.launchProvider !== "mock" && !s.tokenMint) p.push("tokenMint is required for this provider");
   // Meteora DBC without a pool: the indexer finds it from the mint once the launch exists (waiting state).
-  else if (s.launchProvider === "raydium_launchlab" && !s.poolAddress) p.push("poolAddress is required for this provider");
+  else if ((s.launchProvider === "raydium_launchlab" || s.launchProvider === "pump_fun") && !s.poolAddress) p.push("poolAddress is required for this provider");
+  if (s.launchProvider === "pump_fun" && s.feeBeneficiaryRole !== "creator") p.push('pump.fun supports the role "creator" only');
+  if (s.launchProvider === "pump_fun" && s.tokenMint && s.poolAddress && s.poolAddress !== derivePumpBondingCurve(s.tokenMint)) p.push("poolAddress is not the pump.fun bonding curve of the token mint (leave it empty: it is derived)");
   if (s.launchProvider === "mock" && cfg.solana.cluster === "mainnet-beta") p.push("the mock provider (synthetic data) is refused on mainnet-beta");
   if (s.launchProvider === "meteora_dbc" && s.feeBeneficiaryRole === "platform") p.push('Meteora DBC supports roles "creator" or "partner"');
   if (s.launchProvider === "raydium_launchlab" && s.feeBeneficiaryRole === "partner") p.push('Raydium LaunchLab supports roles "creator" or "platform"');

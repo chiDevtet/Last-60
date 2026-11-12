@@ -146,3 +146,35 @@ describe("keys, crypto and exact amounts", () => {
     expect(formatSol(63_000_000n, 3)).toBe("0.063");
   });
 });
+
+describe("pump.fun provider configuration", () => {
+  const MINT = "pgEM9acRas6uSCiiq3zwKZXCPRgTo3XT1u5jRdCpump";
+  const CURVE = "CvriGNbGgpJErHW9Hg19JmWGp8HWy9TkfCFogcnYGoFm";
+  const { POOL_ADDRESS: _pool, ...noPool } = base;
+  const env = { ...noPool, LAUNCH_PROVIDER: "pump_fun", TOKEN_MINT: MINT };
+
+  test("the bonding curve is derived from the token mint; only the creator role is accepted", () => {
+    const c = loadConfig("indexer", env);
+    expect(c.provider).toMatchObject({ id: "pump_fun", poolAddress: CURVE, poolAddressSource: "derived", feeBeneficiaryRole: "creator" });
+    expect(() => loadConfig("indexer", { ...env, FEE_BENEFICIARY_ROLE: "partner" })).toThrow(/pump\.fun pays trading fees to the coin creator only/);
+  });
+
+  test("the declared creator is EXPECTED_PUMPFUN_CREATOR, defaulting to the configured creator wallet", () => {
+    const creator = Keypair.generate().publicKey.toBase58();
+    const declared = Keypair.generate().publicKey.toBase58();
+    expect(loadConfig("indexer", env).provider.expected.pumpfunCreator).toBeNull();
+    expect(loadConfig("indexer", { ...env, LAST60_CREATOR_WALLET_ADDRESS: creator }).provider.expected.pumpfunCreator).toBe(creator);
+    expect(loadConfig("indexer", { ...env, LAST60_CREATOR_WALLET_ADDRESS: creator, EXPECTED_PUMPFUN_CREATOR: declared }).provider.expected.pumpfunCreator).toBe(declared);
+    expect(() => loadConfig("indexer", { ...env, EXPECTED_PUMPFUN_CREATOR: "nope" })).toThrow(/EXPECTED_PUMPFUN_CREATOR/);
+  });
+
+  test("switching to pump.fun in the admin console derives the curve and validates role and pool", () => {
+    const cfg = loadConfig("api", { ...noPool, TOKEN_MINT: MINT });
+    expect(RuntimeOverridesSchema.safeParse({ launchProvider: "pump_fun" }).success).toBe(true);
+    const s = resolveSettings(cfg, { launchProvider: "pump_fun" }, 1);
+    expect(s).toMatchObject({ launchProvider: "pump_fun", poolAddress: CURVE, poolAddressSource: "derived" });
+    expect(validateEffective(cfg, s)).toEqual([]);
+    expect(validateEffective(cfg, { ...s, feeBeneficiaryRole: "platform" }).join(" ")).toContain('pump.fun supports the role "creator" only');
+    expect(validateEffective(cfg, { ...s, poolAddress: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin" }).join(" ")).toContain("not the pump.fun bonding curve");
+  });
+});

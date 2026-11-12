@@ -11,7 +11,7 @@ import type { PublicKey, TransactionInstruction } from "@solana/web3.js";
 import type { NormalizedTx } from "../chain/tx";
 import type { AllocationBasis, FeeEvidenceStatus, FeePhase, NormalizedAttribution } from "../accounting/attribution";
 
-export type ProviderId = "meteora_dbc" | "raydium_launchlab" | "mock";
+export type ProviderId = "meteora_dbc" | "raydium_launchlab" | "pump_fun" | "mock";
 export type FeeBeneficiaryRole = "creator" | "partner" | "platform";
 export type PoolStatus = "bonding" | "migrating" | "migrated";
 
@@ -120,8 +120,13 @@ export interface FeeSourceState {
   slot: number;
   /** Unclaimed eligible fees held on-chain for the beneficiary. */
   unclaimedQuote: bigint;
+  /**
+   * What a claim would actually pay now, when that is less than the balance held on-chain (pump.fun:
+   * the creator vault keeps its rent floor). Defaults to `unclaimedQuote`.
+   */
+  claimableQuote?: bigint;
   unclaimedBase: bigint;
-  /** True if the on-chain balance may include fees from other pools (LaunchLab creator vault). */
+  /** True if the on-chain balance may include fees from other pools (LaunchLab / pump.fun creator vault). */
   mayIncludeOtherPools: boolean;
   source: string;
 }
@@ -182,8 +187,8 @@ export class ProviderValidationError extends Error {
 }
 
 /**
- * Resolve who actually traded. Neither program puts the trader in its event, so we use the
- * emitting instruction's `payer` if it signed the transaction; otherwise (program-owned routing
+ * Resolve who actually traded. Meteora and Raydium do not put the trader in their events (pump.fun
+ * does: its `user` is passed here), so we use the emitting instruction's `payer` if it signed the transaction; otherwise (program-owned routing
  * accounts) the signer whose balance of `mint` moved in the trade's direction; else the fee payer.
  */
 export function resolveTrader(
