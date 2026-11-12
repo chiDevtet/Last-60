@@ -33,7 +33,7 @@ export const VAULT_ALG = "aes-256-gcm/v1";
 
 export class VaultError extends Error {
   constructor(
-    readonly code: "vault_key_missing" | "vault_key_insecure" | "vault_key_invalid" | "vault_key_mismatch" | "vault_entry_corrupt" | "vault_address_mismatch" | "wallet_configured_in_environment" | "wallet_exists" | "unknown_role",
+    readonly code: "vault_key_missing" | "vault_key_insecure" | "vault_key_invalid" | "vault_key_mismatch" | "vault_entry_corrupt" | "vault_address_mismatch" | "wallet_configured_in_environment" | "wallet_exists" | "unknown_role" | "wallet_not_found" | "role_not_retirable" | "address_confirmation_mismatch" | "transfers_in_flight",
     message: string,
   ) {
     super(message);
@@ -326,10 +326,55 @@ async function fulfilImport(db: Models, cfg: Pick<AppConfig, "api" | "instanceId
   return true;
 }
 
+// ── retire (clear a wallet so a fresh one can be generated or imported) ──────────────────────
+
+/** Only the creator wallet can be cleared from the admin console (one launch's creator, replaced per launch). */
+export const RETIRABLE_ROLES: readonly WalletRole[] = ["creator"];
+
+/**
+ * API: clear the active `role` wallet so a fresh one can be generated or imported. The vault entry is moved
+ * unchanged to `wallet_vault_retired` (still encrypted; the key stays recoverable on the rewards host), then
+ * every process notices the change and restarts without it (watchVaultWallets). Refuses an environment
+ * wallet, a wrong typed address, and — for the creator — while a creator-wallet transfer is in flight (its
+ * effect would otherwise never be recorded).
+ */
+export async function retireWallet(db: Models, cfg: Pick<AppConfig, "wallets">, input: { role: string; actor: string; confirmAddress: string; reason?: string | null; now?: number }) {
+  if (!(WALLET_ROLES as readonly string[]).includes(input.role)) throw new VaultError("unknown_role", `unknown wallet role ${input.role}`);
+  const role = input.role as WalletRole;
+  if (!RETIRABLE_ROLES.includes(role)) throw new VaultError("role_not_retirable", `the ${role} wallet cannot be cleared from the admin console`);
+  if (cfg.wallets[role].source === "env") throw new VaultError("wallet_configured_in_environment", `the ${role} wallet is configured in the environment (${cfg.wallets[role].address ?? "key only"}); remove it there instead`);
+  const row: any = await db.WalletVault.findById(role).lean();
+  if (!row || row.status !== "active") throw new VaultError("wallet_not_found", `there is no active ${role} wallet to clear`);
+  if (input.confirmAddress.trim() !== row.address) throw new VaultError("address_confirmation_mismatch", `type the ${role} wallet's full address (${row.address}) to confirm`);
+  if (role === "creator") {
+    const open = await db.CreatorWalletTransfer.countDocuments({ from: row.address, $or: [{ status: "submitted" }, { status: "confirmed", effectRecorded: false }] });
+    if (open) throw new VaultError("transfers_in_flight", `${open} creator wallet transfer(s) are still in flight; try again in a minute once they are confirmed`);
+  }
+  const at = new Date(input.now ?? Date.now());
+  const id = `${role}:${row.address}:${at.getTime()}`;
+  await db.RetiredWallet.create({ _id: id, role, address: row.address, entry: row, retiredAt: at, retiredBy: input.actor, reason: input.reason ?? null });
+  const r = await db.WalletVault.deleteOne({ _id: role, status: "active", address: row.address });
+  if (!r.deletedCount) {
+    await db.RetiredWallet.deleteOne({ _id: id });
+    throw new VaultError("wallet_not_found", `the ${role} wallet changed while clearing it; reload and try again`);
+  }
+  return { role, retired: row.address as string, archiveId: id };
+}
+
+/** Rewards host: decrypt a retired wallet's key (recovery of funds left in an old creator wallet). */
+export async function loadRetiredKeypair(db: Models, cfg: Pick<AppConfig, "wallets" | "secrets">, archiveId: string): Promise<Keypair | null> {
+  const a: any = await db.RetiredWallet.findById(archiveId).lean();
+  if (!a) return null;
+  const key = loadVaultKey(cfg);
+  if (!key) throw new VaultError("vault_key_missing", `the vault key is missing (${cfg.wallets.vaultKeyPath} or LAST60_WALLET_VAULT_KEY); restore it`);
+  return decryptSecretKey(key, a.entry);
+}
+
 // ── status (admin) ───────────────────────────────────────────────────────────────────────────
 
 export async function walletsStatus(db: Models, cfg: Pick<AppConfig, "wallets">, balanceOf?: (address: string) => Promise<bigint | null>) {
   const rows: any[] = await db.WalletVault.find({}).lean();
+  const retired: any[] = await db.RetiredWallet.find({}, { role: 1, address: 1, retiredAt: 1, retiredBy: 1 }).sort({ retiredAt: -1 }).limit(20).lean();
   const out: Record<string, unknown> = {};
   for (const role of WALLET_ROLES) {
     const row = rows.find((r) => r._id === role);
@@ -341,6 +386,8 @@ export async function walletsStatus(db: Models, cfg: Pick<AppConfig, "wallets">,
       source: configured.source ?? (row?.status === "active" ? "vault" : null),
       vault: row ? { status: row.status, origin: row.origin ?? "generated", requestedAt: row.requestedAt, requestedBy: row.requestedBy, generatedAt: row.generatedAt, lastExportedAt: row.lastExportedAt, exports: row.exports ?? 0, refusedReason: row.refusedReason ?? null, refusedAt: row.refusedAt ?? null } : null,
       pendingRestart: row?.status === "active" && configured.source !== "env" && configured.address !== row.address,
+      retirable: RETIRABLE_ROLES.includes(role) && row?.status === "active" && configured.source !== "env",
+      retired: retired.filter((x) => x.role === role).map((x) => ({ id: x._id, address: x.address, retiredAt: x.retiredAt, retiredBy: x.retiredBy })),
       balanceLamports: address && balanceOf ? ((await balanceOf(address).catch(() => null))?.toString() ?? null) : null,
     };
   }

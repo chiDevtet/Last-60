@@ -16,7 +16,7 @@ No environment variable has to be edited for any of it.
    creator wallet automation (docs/CREATOR_WALLET.md) and claims fees.
 4. **Export a backup right away** (§2). The page shows "⚠ not backed up yet" until you do.
 
-A generated wallet is never replaced from the admin console. A wallet configured in the environment
+A generated wallet is never replaced from the admin console (the creator wallet can be **cleared** first, §2b). A wallet configured in the environment
 (`LAST60_PAYOUT_WALLET_*`, `LAST60_CREATOR_WALLET_*`) takes precedence and cannot be generated over; an
 environment address that differs from a generated one is a configuration error (the processes refuse to
 start rather than guess).
@@ -95,7 +95,7 @@ Refusals are shown on the page and the terminal (`key_does_not_control_the_signe
 encrypted to a key that is not the worker's, which can mean the API server was tampered with — check it
 before retrying.
 
-The same rules as generation apply: an imported wallet is never replaced from the admin page, an
+The same rules as generation apply: an imported wallet is never replaced from the admin page (clear the creator wallet first, §2b), an
 environment wallet always wins, and one key cannot be both the payout and the creator wallet.
 
 **What import protects and what it does not.** Nobody who can write to the database can store a key of
@@ -104,6 +104,24 @@ and the API never sees the key. The one thing the browser must trust is the work
 receives through the API: a compromised API could serve its own key on a **first** import from a fresh
 browser. The pin (and the fingerprint you can compare on the server) is the defence; the worker also
 refuses — loudly — anything encrypted to a key that is not its own.
+
+## 2b. Clear the creator wallet (for a new launch)
+
+Each launch has its own creator wallet. To launch a new token from a fresh one, press **Clear wallet** on
+the creator wallet in the admin page, confirm, and type its full address. Then generate or import the new
+one as usual.
+
+* Only the creator wallet can be cleared. The payout wallet and environment wallets (`LAST60_CREATOR_WALLET_*`)
+  cannot; remove an environment wallet from the environment instead.
+* Clearing is refused while a creator-wallet transfer (a 75 % settlement or a sweep) is still in flight;
+  try again a minute later.
+* Nothing is deleted. The encrypted entry moves unchanged to `wallet_vault_retired` (still bound to its
+  role and address, still under the vault key), so the old key, and any SOL left in it, can be recovered
+  on the rewards host with `loadRetiredKeypair(db, cfg, "<archive id>")`. The admin page cannot export a
+  cleared wallet, so **export a backup before clearing** if you may need it.
+* From then on Asteroid Protocol no longer claims fees or settles for the previous token's creator. All
+  processes restart (about 15 s) without a creator wallet. The page lists previously cleared addresses,
+  and the action is recorded in the configuration audit (`wallet_retire`).
 
 ## 3. Fund the wallets
 

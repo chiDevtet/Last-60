@@ -222,6 +222,28 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
     }
   }
 
+  async function retire(role: ExportWalletRole, title: string, w: any) {
+    const name = title.toLowerCase();
+    const bal = w.balanceLamports !== null ? `${sol(w.balanceLamports, 6)} SOL` : "an unknown balance";
+    const backup = w.vault?.lastExportedAt ? `last backed up ${dateTime(w.vault.lastExportedAt)}` : w.vault?.origin === "imported" ? "imported — you already hold this key" : "NOT BACKED UP — export it first";
+    if (!confirm(`Clear the ${name} ${w.address}?\n\nIt still holds ${bal} (${backup}).\n\nAfter clearing:\n• Asteroid Protocol stops claiming fees and settling for the current token's creator.\n• All processes restart (about 15 s); then you can generate or import a fresh ${name}.\n• The old key is archived encrypted on the server (not deleted), but this page can no longer export it — export a backup first if you might need it.`)) return;
+    const typed = prompt(`To confirm, type the full address of the ${name} you are clearing:\n\n${w.address}`);
+    if (typed === null) return;
+    setErr(null);
+    setMsg(null);
+    setBusy(`ret:${role}`);
+    try {
+      await call(`/wallets/${role}/retire`, { method: "POST", body: JSON.stringify({ confirmAddress: typed.trim(), reason: "cleared from the admin console" }) });
+      setRevealed(null);
+      setMsg(`Cleared the ${name} ${shortAddress(w.address, 6, 6)}. Processes restart in about 15 seconds; then generate or import a fresh ${name} here.`);
+      await load();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function derive() {
     setErr(null);
     try {
@@ -268,12 +290,23 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
                       <button disabled={!!busy} onClick={() => exportKey(role, w.address)} className="focus-ring rounded-lg border border-line px-3 py-1.5 text-xs text-mist hover:text-frost disabled:opacity-40">
                         {busy === `exp:${role}` ? "Exporting…" : "Export private key"}
                       </button>
+                      {w.retirable && (
+                        <button disabled={!!busy} onClick={() => retire(role, title, w)} className="focus-ring rounded-lg border border-bad/40 px-3 py-1.5 text-xs text-bad hover:bg-bad/10 disabled:opacity-40">
+                          {busy === `ret:${role}` ? "Clearing…" : "Clear wallet"}
+                        </button>
+                      )}
                       <span className={`text-[11px] ${w.vault?.lastExportedAt || w.vault?.origin === "imported" ? "text-mist" : "text-warn"}`}>{w.vault?.lastExportedAt ? `last backed up ${dateTime(w.vault.lastExportedAt)}` : w.vault?.origin === "imported" ? "imported — you already hold this key" : "⚠ not backed up yet"}</span>
                     </div>
                   )}
                   {revealed?.role === role && <Revealed role={role} address={revealed.address} secret={revealed.secret} onHide={() => setRevealed(null)} />}
                 </>
-              ) : pending ? (
+              ) : null}
+              {!w.address && w.retired?.length > 0 && (
+                <p className="mt-3 text-[11px] text-dim">
+                  Previously cleared: {w.retired.slice(0, 3).map((x: any) => `${shortAddress(x.address, 4, 4)} (${dateTime(x.retiredAt)})`).join(", ")} — archived encrypted on the server.
+                </p>
+              )}
+              {w.address ? null : pending ? (
                 <p className="mt-3 text-xs text-warn">◷ {w.vault.origin === "imported" ? "Import" : "Generation"} requested {dateTime(w.vault.requestedAt)} — waiting for the rewards worker.</p>
               ) : (
                 <>
