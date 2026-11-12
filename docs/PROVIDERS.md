@@ -75,6 +75,19 @@ Built from the official IDLs (`@pump-fun/pump-sdk` 4.3.1 / `@pump-fun/pump-swap-
 
 * **Pool from the mint.** The "pool" is the coin's bonding curve, the PDA `["bonding-curve", mint]`
   (derived, even before launch). Leave `POOL_ADDRESS` empty.
+* **Mint from the creator wallet.** A pump.fun mint is only known once the coin exists, so with pump.fun
+  selected and no token mint set, the indexer watches the creator wallet (`LAST60_CREATOR_WALLET_*` or the
+  admin-console vault wallet) and sets the mint itself (`providers/pumpfun/launchDetect.ts`). Every ~5 s it
+  reads the wallet's NEW signatures and looks for a pump.fun `create` / `create_v2` that **the wallet
+  signed**, whose `CreateEvent` names the wallet as `user` and `creator`, and whose bonding curve is the
+  canonical PDA of the mint. (`create` takes the creator as an argument, so anyone can name any wallet as a
+  creator; only the wallet's own signature proves the launch is ours.) The mint is remembered per creator
+  wallet (system_state `pool_discovery`, key `pump_fun_launch:<creator>`) and shown as "detected from the
+  creator wallet". Use a **fresh, dedicated** creator wallet: a wallet with more than 2 000 signatures, or
+  one that launched two coins, is refused with a waiting message (set the mint by hand then). This also
+  keeps the shared creator vaults (keyed by creator, not by coin) to one coin. A mint set in the admin
+  console wins; an environment `TOKEN_MINT` applies to pump.fun only when the environment selects
+  `LAUNCH_PROVIDER=pump_fun` (another provider's token never carries over).
 * **Events.** Every trade instruction (`buy`, `buy_exact_sol_in`, `sell`, their `_v2` / `_v3` forms,
   `multi_hop_curve_swap` hops) emits one `TradeEvent` (self-CPI) with the mint, the trader (`user`),
   the protocol `fee`, the coin's `creator` and its `creator_fee`.

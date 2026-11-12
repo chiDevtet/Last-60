@@ -155,3 +155,15 @@ A Raydium LaunchLab (Forgepad) pool address is a program-derived address of the 
    environment).
 
 From then on: claims, the 75 % settlement, post-migration sweeps and rewards are automatic.
+
+### pump.fun: no token mint to enter
+
+The mint of a pump.fun coin is unknown until it is created, so Asteroid Protocol finds it from the creator
+wallet (docs/PROVIDERS.md, "Mint from the creator wallet"):
+
+1. Clear the previous creator wallet if any (§2b), then generate (or import) a **fresh** creator wallet,
+   export it into Phantom and fund it.
+2. In Configuration set **Launch provider** to `pump_fun` and leave **Token mint** and **Pool address**
+   empty (clear them if set). The page shows "watching the creator wallet …".
+3. Launch the coin on pump.fun **from that wallet**. Within seconds the indexer detects it, the token mint
+   is set ("detected from the creator wallet"), the bonding curve is derived, and the workers attach.

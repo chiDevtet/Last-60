@@ -16,6 +16,7 @@ import { LogsSubscriber } from "../chain/ws";
 import type { Models } from "../db/models";
 import { big } from "../db/decimal";
 import { discoverDbcPool } from "../providers/meteora/pda";
+import { PumpLaunchDetector } from "../providers/pumpfun/launchDetect";
 import { AwaitingLaunchError, attachStoredMigration, createProvider, providerTargetFor, resolveAndAttachMigration, type LaunchProvider, type PoolInfo } from "../providers";
 import { basesOf, roleChangeBlockReason } from "../accounting/attribution";
 import { TerminalWriter } from "../terminal/terminal";
@@ -125,7 +126,38 @@ export class Indexer {
     return next;
   }
 
+  private pumpDetector: PumpLaunchDetector | null = null;
+
+  /**
+   * pump.fun with no token mint: find the coin the dedicated creator wallet launches (it signed the
+   * create; docs/PROVIDERS.md). Scanned incrementally on every wait cycle (~5 s), then remembered for
+   * that creator wallet, so the workers attach within seconds of the launch with no admin action.
+   */
+  private async detectPumpLaunch(s: EffectiveSettings): Promise<EffectiveSettings> {
+    const creator = this.deps.cfg.creatorWallet?.address;
+    if (!creator) throw new AwaitingLaunchError("no token mint is configured yet (set it in the admin console, or set up a creator wallet so its pump.fun launch is detected)");
+    if (this.pumpDetector?.creator !== creator) this.pumpDetector = new PumpLaunchDetector((this.rpc ?? this.deps.rpc)!, creator);
+    const d = await this.pumpDetector.scan();
+    const who = `${creator.slice(0, 4)}…${creator.slice(-4)}`;
+    if (d.status === "too_much_history") throw new AwaitingLaunchError(`the creator wallet ${who} has too much history to detect its pump.fun launch (use a fresh, dedicated creator wallet, or set the token mint in the admin console)`);
+    if (d.status === "ambiguous") throw new AwaitingLaunchError(`the creator wallet ${who} launched ${d.launches.length} pump.fun coins (${d.launches.map((l) => l.mint).join(", ")}); set the token mint in the admin console`);
+    if (d.status === "not_found") throw new AwaitingLaunchError(`watching the creator wallet ${who} for its pump.fun launch (the token is set automatically once it is created)`);
+    const { mint, signature } = d.launch;
+    await recordDiscoveredPool(this.deps.db, "pump_fun_launch", creator, mint);
+    this.log.info({ creator, mint, bondingCurve: d.launch.bondingCurve, signature, name: d.launch.name, symbol: d.launch.symbol }, "pump.fun launch detected from the creator wallet");
+    const sym = d.launch.symbol ? `$${d.launch.symbol} ` : "";
+    await this.terminal.system(`Detected the pump.fun launch of ${sym}${mint.slice(0, 4)}…${mint.slice(-4)} from the creator wallet ${who}.`, `pump-launch:${creator}:${mint}`).catch(() => undefined);
+    const next = await this.deps.settings.get(true);
+    if (next.tokenMint !== mint) throw new Error(`detected pump.fun mint ${mint} was not applied (effective mint ${next.tokenMint ?? "none"}; a mint set in the admin console or TOKEN_MINT takes precedence)`);
+    this.pumpDetector = null;
+    return next;
+  }
+
   private async configure(s: EffectiveSettings) {
+    if (s.launchProvider === "pump_fun" && !s.tokenMint) {
+      this.rpc ??= this.deps.rpc ?? new RpcClient({ urls: s.rpcUrls, timeoutMs: this.deps.cfg.solana.timeoutMs, maxRps: this.deps.cfg.solana.maxRps, maxTxVersion: this.deps.cfg.solana.maxTxVersion, logger: this.log });
+      s = await this.detectPumpLaunch(s);
+    }
     if (s.launchProvider === "meteora_dbc" && s.tokenMint && !s.poolAddress) {
       this.rpc ??= this.deps.rpc ?? new RpcClient({ urls: s.rpcUrls, timeoutMs: this.deps.cfg.solana.timeoutMs, maxRps: this.deps.cfg.solana.maxRps, maxTxVersion: this.deps.cfg.solana.maxTxVersion, logger: this.log });
       s = await this.discoverDbcPool(s);

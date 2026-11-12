@@ -59,6 +59,8 @@ export interface EffectiveSettings {
   version: number;
   launchProvider: AppConfig["provider"]["id"];
   tokenMint: string | null;
+  /** `configured` (override / environment) or `detected` (pump.fun: launched by the dedicated creator wallet). */
+  tokenMintSource: "configured" | "detected" | null;
   poolAddress: string | null;
   /** `configured` (override / environment) or `derived` (Raydium LaunchLab PDA of the token mint, SOL quote). */
   poolAddressSource: "configured" | "derived" | "discovered" | null;
@@ -126,14 +128,33 @@ export async function recordDiscoveredPool(db: Models, provider: string, tokenMi
   });
 }
 
+/** Key of the pump.fun coin launched by `creator` in the discovery map (system_state `pool_discovery`). */
+export const pumpLaunchKey = (creator: string) => `pump_fun_launch:${creator}`;
+
+/**
+ * The token mint. An admin-console override wins, then the environment's TOKEN_MINT — but for pump.fun only
+ * when the environment itself selects pump.fun (a mint of another provider's launch never carries over).
+ * Without either, a pump.fun mint is the coin the dedicated creator wallet launched (detected by the
+ * indexer, `PumpLaunchDetector`, and remembered per creator wallet).
+ */
+function resolveTokenMint(cfg: AppConfig, o: RuntimeOverrides, launchProvider: EffectiveSettings["launchProvider"], discovered: DiscoveredPools): Pick<EffectiveSettings, "tokenMint" | "tokenMintSource"> {
+  if (o.tokenMint) return { tokenMint: o.tokenMint, tokenMintSource: "configured" };
+  const envMint = launchProvider === "pump_fun" && cfg.provider.id !== "pump_fun" ? null : cfg.provider.tokenMint;
+  if (envMint) return { tokenMint: envMint, tokenMintSource: "configured" };
+  const creator = cfg.creatorWallet?.address;
+  const detected = launchProvider === "pump_fun" && creator ? discovered[pumpLaunchKey(creator)] : undefined;
+  return detected ? { tokenMint: detected, tokenMintSource: "detected" } : { tokenMint: null, tokenMintSource: null };
+}
+
 export function resolveSettings(cfg: AppConfig, overrides: RuntimeOverrides, version: number, discovered: DiscoveredPools = {}): EffectiveSettings {
   const o = overrides;
   const launchProvider = o.launchProvider ?? cfg.provider.id;
-  const tokenMint = o.tokenMint ?? cfg.provider.tokenMint;
+  const { tokenMint, tokenMintSource } = resolveTokenMint(cfg, o, launchProvider, discovered);
   return {
     version,
     launchProvider,
     tokenMint,
+    tokenMintSource,
     ...resolvePool(cfg, o, launchProvider, tokenMint, discovered),
     feeBeneficiaryRole: o.feeBeneficiaryRole ?? cfg.provider.feeBeneficiaryRole,
     buyerCount: o.buyerCount ?? cfg.rewards.buyerCount,
@@ -161,9 +182,11 @@ export function resolveSettings(cfg: AppConfig, overrides: RuntimeOverrides, ver
 /** Cross-field rules that a patch must satisfy in combination with the environment. */
 export function validateEffective(cfg: AppConfig, s: EffectiveSettings): string[] {
   const p: string[] = [];
-  if (s.launchProvider !== "mock" && !s.tokenMint) p.push("tokenMint is required for this provider");
+  // pump.fun with a creator wallet and no mint: the indexer detects the coin that wallet launches (waiting state).
+  if (s.launchProvider === "pump_fun" && !s.tokenMint && !cfg.creatorWallet?.address) p.push("tokenMint is required for pump.fun unless a creator wallet is set up (its launch is then detected automatically)");
+  else if (s.launchProvider !== "mock" && s.launchProvider !== "pump_fun" && !s.tokenMint) p.push("tokenMint is required for this provider");
   // Meteora DBC without a pool: the indexer finds it from the mint once the launch exists (waiting state).
-  else if ((s.launchProvider === "raydium_launchlab" || s.launchProvider === "pump_fun") && !s.poolAddress) p.push("poolAddress is required for this provider");
+  else if ((s.launchProvider === "raydium_launchlab" || s.launchProvider === "pump_fun") && s.tokenMint && !s.poolAddress) p.push("poolAddress is required for this provider");
   if (s.launchProvider === "pump_fun" && s.feeBeneficiaryRole !== "creator") p.push('pump.fun supports the role "creator" only');
   if (s.launchProvider === "pump_fun" && s.tokenMint && s.poolAddress && s.poolAddress !== derivePumpBondingCurve(s.tokenMint)) p.push("poolAddress is not the pump.fun bonding curve of the token mint (leave it empty: it is derived)");
   if (s.launchProvider === "mock" && cfg.solana.cluster === "mainnet-beta") p.push("the mock provider (synthetic data) is refused on mainnet-beta");

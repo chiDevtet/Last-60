@@ -171,8 +171,13 @@ describe("pump.fun provider configuration", () => {
   test("switching to pump.fun in the admin console derives the curve and validates role and pool", () => {
     const cfg = loadConfig("api", { ...noPool, TOKEN_MINT: MINT });
     expect(RuntimeOverridesSchema.safeParse({ launchProvider: "pump_fun" }).success).toBe(true);
-    const s = resolveSettings(cfg, { launchProvider: "pump_fun" }, 1);
+    // The environment's TOKEN_MINT belongs to the environment's provider (Meteora DBC here): it never
+    // carries over to pump.fun (its "bonding curve" would not exist). The pump.fun mint is set in the
+    // console, or detected from the creator wallet (test/pumpfun-launch-detect.test.ts).
+    expect(resolveSettings(cfg, { launchProvider: "pump_fun" }, 1)).toMatchObject({ launchProvider: "pump_fun", tokenMint: null, poolAddress: null });
+    const s = resolveSettings(cfg, { launchProvider: "pump_fun", tokenMint: MINT }, 1);
     expect(s).toMatchObject({ launchProvider: "pump_fun", poolAddress: CURVE, poolAddressSource: "derived" });
+    expect(resolveSettings(loadConfig("api", { ...noPool, TOKEN_MINT: MINT, LAUNCH_PROVIDER: "pump_fun" }), {}, 1)).toMatchObject({ tokenMint: MINT, poolAddress: CURVE });
     expect(validateEffective(cfg, s)).toEqual([]);
     expect(validateEffective(cfg, { ...s, feeBeneficiaryRole: "platform" }).join(" ")).toContain('pump.fun supports the role "creator" only');
     expect(validateEffective(cfg, { ...s, poolAddress: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin" }).join(" ")).toContain("not the pump.fun bonding curve");
