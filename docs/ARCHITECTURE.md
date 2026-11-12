@@ -223,9 +223,12 @@ See `docs/FEE_ACCOUNTING.md` for the full ledger specification. Summary:
 
 * **Accrual (attribution):** each decoded swap stores `eligibleFee` computed with the exact
   integer formula the program uses for the configured beneficiary role.
-* **Collection:** optional `FEE_COLLECTION_MODE=auto_claim` claims the beneficiary's fees after
-  each snapshot and unwraps WSOL into the payout wallet in the same transaction; `manual`
-  leaves claiming to operators.
+* **Collection:** optional `FEE_COLLECTION_MODE=auto_claim` claims the beneficiary's fees
+  `FEE_CLAIM_LEAD_SECONDS` (default 90) before each round's execution window opens, so the claim
+  (and, under forge_phase_aware_v2, its 75 % settlement, polled every 5 s until the window opens) is
+  final in time to fund that same round; `0` claims right after each snapshot instead (the fees then
+  fund the next round). Legacy: WSOL is unwrapped into the payout wallet in the same transaction;
+  `manual` leaves claiming to operators.
 * **Reconciliation:** periodically compares `Σ attributed − Σ claimed (+ baseline)` with the
   on-chain unclaimed counter (DBC) or vault balance (LaunchLab) at a common slot, checks
   per-round ledger invariants, and checks the payout wallet covers pending payouts.

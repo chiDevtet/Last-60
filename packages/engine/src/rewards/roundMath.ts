@@ -46,3 +46,14 @@ export function drawExecuteAt(b: RoundBounds, now: number, randomInt: (min: numb
   const offset = randomInt(0, b.windowEndsAt - from); // [0, remaining)
   return { executeAt: from + offset, late: from > b.windowStartsAt };
 }
+
+/**
+ * The pre-round fee claim: due once per round, from `leadMs` before the execution window opens until it
+ * opens, so what was claimed (and its 75 % settlement) is final before the round can execute.
+ */
+export function preRoundClaimDue(now: number, p: ScheduleParams, leadMs: number, lastClaimedIndex: number | null): RoundBounds | null {
+  if (leadMs <= 0) return null;
+  const b = boundsOf(roundIndexAt(now, p), p);
+  if (b.index === lastClaimedIndex || now < b.windowStartsAt - leadMs || now >= b.windowStartsAt) return null;
+  return b;
+}

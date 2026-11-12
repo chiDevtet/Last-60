@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { allocate, type AllocationInput } from "../src/rewards/allocation";
-import { boundsOf, drawExecuteAt, roundIndexAt } from "../src/rewards/roundMath";
+import { boundsOf, drawExecuteAt, preRoundClaimDue, roundIndexAt } from "../src/rewards/roundMath";
+import { loadConfig } from "../src/config/env";
 import { secureRandomInt } from "../src/util/crypto";
 
 const SOL = 1_000_000_000n;
@@ -141,5 +142,27 @@ describe("clock-anchored rounds", () => {
     const expected = N / 12;
     const chi2 = buckets.reduce((s, o) => s + (o - expected) ** 2 / expected, 0);
     expect(chi2).toBeLessThan(40); // df=11, p≈1e-4 threshold ≈ 37.4–40
+  });
+});
+
+describe("pre-round fee claim (FEE_CLAIM_LEAD_SECONDS)", () => {
+  const p = { roundDurationMs: 300_000, windowStartMs: 240_000, windowDurationMs: 60_000, anchorEpochMs: 0 };
+  const b = boundsOf(5_981_740, p);
+  test("due once per round, from the lead before the execution window until it opens", () => {
+    const lead = 90_000;
+    expect(preRoundClaimDue(b.windowStartsAt - lead - 1, p, lead, null)).toBeNull(); // too early: fees still accruing
+    expect(preRoundClaimDue(b.windowStartsAt - lead, p, lead, null)?.index).toBe(b.index);
+    expect(preRoundClaimDue(b.windowStartsAt - 1, p, lead, null)?.index).toBe(b.index);
+    expect(preRoundClaimDue(b.windowStartsAt - 30_000, p, lead, b.index)).toBeNull(); // already claimed for this round
+    expect(preRoundClaimDue(b.windowStartsAt, p, lead, null)).toBeNull(); // window open: the round may execute any moment
+    expect(preRoundClaimDue(b.windowStartsAt - 30_000, p, 0, null)).toBeNull(); // 0 = claim after the round instead
+    const next = boundsOf(b.index + 1, p);
+    expect(preRoundClaimDue(next.windowStartsAt - 10_000, p, lead, b.index)?.index).toBe(next.index);
+  });
+  test("defaults to 90 s and never exceeds the window start", () => {
+    const env = { SOLANA_CLUSTER: "devnet", SOLANA_RPC_URL: "https://api.devnet.solana.com", MONGODB_URI: "mongodb://x", REWARD_FUNDING_POLICY: "legacy_creator_fee_v1" };
+    expect(loadConfig("api", env).feeCollection.leadMs).toBe(90_000);
+    expect(loadConfig("api", { ...env, FEE_CLAIM_LEAD_SECONDS: "0" }).feeCollection.leadMs).toBe(0);
+    expect(loadConfig("api", { ...env, FEE_CLAIM_LEAD_SECONDS: "3600" }).feeCollection.leadMs).toBe(loadConfig("api", env).schedule.windowStartMs);
   });
 });
