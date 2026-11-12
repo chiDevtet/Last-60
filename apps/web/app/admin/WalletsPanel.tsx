@@ -332,7 +332,17 @@ export function WalletsPanel({ call, signMessage }: { call: Call; signMessage: S
       <div className="mt-4 rounded-xl border border-line p-4">
         <h3 className="text-sm font-semibold">Launch</h3>
         <div className="mt-2 space-y-1 text-xs">
-          <p><span className="text-mist">Token mint:</span> <span className="font-mono">{launch.tokenMint ?? "not set — set it in Configuration below"}</span></p>
+          <p>
+            <span className="text-mist">Token mint:</span>{" "}
+            <span className="font-mono">{launch.tokenMint ?? (launch.provider === "pump_fun" && launch.creatorWallet ? "not launched yet" : "not set — set it in Configuration below")}</span>{" "}
+            {launch.tokenMintSource === "detected" && <span className="rounded border border-line px-1 text-[10px] text-mist">detected from the creator wallet</span>}
+          </p>
+          {launch.provider === "pump_fun" && !launch.tokenMint && launch.creatorWallet && (
+            <p className="text-warn">◷ watching the creator wallet <span className="font-mono">{shortAddress(launch.creatorWallet, 4, 4)}</span> — launch the coin on pump.fun from this wallet and the token is set automatically within seconds</p>
+          )}
+          {launch.provider === "pump_fun" && !launch.tokenMint && !launch.creatorWallet && (
+            <p className="text-warn">Generate or import a fresh creator wallet above: its pump.fun launch is then detected automatically.</p>
+          )}
           <p>
             <span className="text-mist">Pool:</span> <span className="font-mono">{launch.poolAddress ? shortAddress(launch.poolAddress, 6, 6) : "—"}</span>{" "}
             {launch.poolAddressSource === "derived" && <span className="rounded border border-line px-1 text-[10px] text-mist">derived from the mint</span>}

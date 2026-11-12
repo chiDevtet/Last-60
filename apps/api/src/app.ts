@@ -485,7 +485,7 @@ export function createApp(d: ApiDeps) {
   admin.get("/launch", async (c) => {
     const s = await d.settings.get(true);
     const info = s.poolAddress && d.rpc ? await d.rpc.getAccountInfo(s.poolAddress).catch(() => null) : null;
-    return c.json(jsonSafe({ provider: s.launchProvider, tokenMint: s.tokenMint, poolAddress: s.poolAddress, poolAddressSource: s.poolAddressSource, poolExists: info ? !!info.value : null, poolOwner: info?.value?.owner ?? null }));
+    return c.json(jsonSafe({ provider: s.launchProvider, tokenMint: s.tokenMint, tokenMintSource: s.tokenMintSource, creatorWallet: d.cfg.creatorWallet?.address ?? null, poolAddress: s.poolAddress, poolAddressSource: s.poolAddressSource, poolExists: info ? !!info.value : null, poolOwner: info?.value?.owner ?? null }));
   });
   admin.get("/launch/derive", async (c) => {
     const mint = z.string().trim().min(32).max(44).parse(c.req.query("mint"));
