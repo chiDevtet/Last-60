@@ -587,6 +587,25 @@ const walletVaultSchema = new Schema(
   { collection: "wallet_vault", versionKey: false },
 );
 
+/**
+ * Retired vault wallets: an active wallet the admin cleared so a fresh one can be generated or imported.
+ * The entry is moved here unchanged (still encrypted under the vault key, role and address bound as AAD),
+ * so the old key stays recoverable on the rewards host; nothing is ever deleted.
+ */
+const retiredWalletSchema = new Schema(
+  {
+    _id: { type: String, required: true }, // `${role}:${address}:${retiredAt ms}`
+    role: { type: String, enum: WALLET_ROLES, required: true },
+    address: { type: String, required: true },
+    entry: { type: Schema.Types.Mixed, required: true }, // the wallet_vault row as it was
+    retiredAt: { type: Date, required: true },
+    retiredBy: { type: String, required: true },
+    reason: { type: String, default: null },
+  },
+  { collection: "wallet_vault_retired", versionKey: false },
+);
+retiredWalletSchema.index({ role: 1, retiredAt: -1 });
+
 /** One-time key export requests. The API relays them; only the rewards worker can fulfil one (ciphertext only). */
 const walletExportSchema = new Schema(
   {
@@ -994,6 +1013,7 @@ export const schemas = {
   CustodyTransfer: custodyTransferSchema,
   CreatorWalletTransfer: creatorWalletTransferSchema,
   WalletVault: walletVaultSchema,
+  RetiredWallet: retiredWalletSchema,
   WalletExport: walletExportSchema,
   TransferUse: transferUseSchema,
   AttributionRecovery: attributionRecoverySchema,

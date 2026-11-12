@@ -35,6 +35,7 @@ import {
   takeExport,
   VaultError,
   walletsStatus,
+  retireWallet,
   type AppConfig,
   type Models,
   type ChainRpc,
@@ -445,6 +446,14 @@ export function createApp(d: ApiDeps) {
     const r = await createExportRequest(d.db, d.cfg, c.req.param("role"), { ...body, adminWallet: c.get("admin"), site, now: now() });
     await audit(c, "wallet_export_request", c.req.param("role"), r, body.requestId);
     return c.json(jsonSafe(r), r.accepted ? 200 : 422);
+  });
+  // Clear the creator wallet so a fresh one can be generated or imported. No key material is involved: the
+  // encrypted entry is archived (wallet_vault_retired), never deleted; every process restarts without it.
+  admin.post("/wallets/:role/retire", async (c) => {
+    const body = z.object({ confirmAddress: z.string().min(32).max(44), reason: z.string().max(300).optional() }).strict().parse(await c.req.json());
+    const r = await retireWallet(d.db, d.cfg, { role: c.req.param("role"), actor: c.get("admin"), confirmAddress: body.confirmAddress, reason: body.reason ?? null, now: now() });
+    await audit(c, "wallet_retire", c.req.param("role"), r, body.reason ?? null);
+    return c.json(jsonSafe(r));
   });
   // Import an existing key: the browser seals it to the rewards worker's published import key; the admin
   // wallet signs the intent (address, worker key). The API stores ciphertext only, never the key.
