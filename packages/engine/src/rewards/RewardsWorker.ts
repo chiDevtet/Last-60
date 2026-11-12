@@ -16,6 +16,7 @@ import { rootLogger, type Logger } from "../util/logger";
 import { systemClock, type Clock } from "../util/time";
 import { backoffDelay } from "../util/backoff";
 import { RoundScheduler } from "./scheduler";
+import { preRoundClaimDue } from "./roundMath";
 import { PayoutExecutor } from "./payouts";
 import { FeeCollector } from "./feeCollector";
 import { Reconciler } from "./reconciliation";
@@ -57,6 +58,9 @@ export class RewardsWorker {
   readonly signer: PayoutSigner | null;
   private plannedSinceClaim = false;
   private claimedSinceCreatorPass = false;
+  /** The round whose pre-round claim was started, and until when its settlement is polled quickly. */
+  private preClaimedIndex: number | null = null;
+  private settleUntil = 0;
   private stopped = false;
   /**
    * Fee claims (which wait for confirmation) and reconciliation (which can ingest thousands of
@@ -172,7 +176,16 @@ export class RewardsWorker {
           await this.payouts.processDue();
           t.payouts = now;
         }
-        if (!this.background.claim && (this.plannedSinceClaim || now - t.claim > 300_000)) {
+        // Fees are claimed shortly BEFORE each round's execution window (FEE_CLAIM_LEAD_SECONDS), so the
+        // claim and its 75 % settlement are final in time to fund that round. With a lead of 0 they are
+        // claimed right after each round instead (and fund the next one). A 5-minute fallback remains.
+        const lead = this.d.cfg.feeCollection.leadMs ?? 0;
+        const pre = preRoundClaimDue(now, this.scheduler.schedule, lead, this.preClaimedIndex);
+        if (!this.background.claim && (pre || (lead <= 0 && this.plannedSinceClaim) || now - t.claim > 300_000)) {
+          if (pre) {
+            this.preClaimedIndex = pre.index;
+            this.settleUntil = pre.windowStartsAt;
+          }
           this.plannedSinceClaim = false;
           t.claim = now;
           this.background.claim = Promise.resolve()
@@ -183,7 +196,7 @@ export class RewardsWorker {
             .catch((err) => this.log.warn({ err: String(err) }, "fee claim failed"))
             .finally(() => (this.background.claim = null));
         }
-        if (this.d.cfg.creatorWallet?.automationEnabled && !this.background.creator && (this.claimedSinceCreatorPass || now - t.creator >= this.d.cfg.creatorWallet.intervalMs)) {
+        if (this.d.cfg.creatorWallet?.automationEnabled && !this.background.creator && (this.claimedSinceCreatorPass || now - t.creator >= (now < this.settleUntil ? 5_000 : this.d.cfg.creatorWallet.intervalMs))) {
           this.claimedSinceCreatorPass = false;
           t.creator = now;
           this.background.creator = Promise.resolve()

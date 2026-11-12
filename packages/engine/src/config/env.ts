@@ -234,6 +234,12 @@ const RawEnv = z.object({
   FEE_CLAIM_AUTHORITY_PRIVATE_KEY: z.string().optional(),
   FEE_CLAIM_AUTHORITY_KEYPAIR_PATH: z.string().optional(),
   FEE_CLAIM_MIN_LAMPORTS: bigintStr(10_000_000n),
+  /**
+   * Seconds before each round's execution window opens at which fees are claimed (auto_claim), so the
+   * claim and its 75 % settlement are final in time to fund THAT round. 0 = claim right after each round
+   * (the fees then fund the next round).
+   */
+  FEE_CLAIM_LEAD_SECONDS: int(90, 0, 3_600),
 
   /**
    * Launch creator wallet automation (docs/CREATOR_WALLET.md). With the creator's key loaded in the
@@ -436,7 +442,7 @@ export interface AppConfig {
     concurrency: number;
     memo: boolean;
   };
-  feeCollection: { mode: "manual" | "auto_claim"; minClaimLamports: bigint };
+  feeCollection: { mode: "manual" | "auto_claim"; minClaimLamports: bigint; leadMs: number };
   creatorWallet: CreatorWalletConfig;
   wallets: WalletsConfig;
   mongo: { uri: string; dbName: string };
@@ -854,7 +860,7 @@ export function loadConfig(role: ProcessRole, env: Record<string, string | undef
       concurrency: raw.PAYOUT_CONCURRENCY,
       memo: raw.PAYOUT_MEMO,
     },
-    feeCollection: { mode: raw.FEE_COLLECTION_MODE ?? (creatorAutomation || (creatorAddress && phaseAware) ? "auto_claim" : "manual"), minClaimLamports: raw.FEE_CLAIM_MIN_LAMPORTS },
+    feeCollection: { mode: raw.FEE_COLLECTION_MODE ?? (creatorAutomation || (creatorAddress && phaseAware) ? "auto_claim" : "manual"), minClaimLamports: raw.FEE_CLAIM_MIN_LAMPORTS, leadMs: Math.min(raw.FEE_CLAIM_LEAD_SECONDS * 1000, raw.RANDOM_WINDOW_START_SECONDS * 1000) },
     creatorWallet: {
       address: creatorAddress,
       keyConfigured: creatorKeySet,

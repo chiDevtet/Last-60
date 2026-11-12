@@ -6,7 +6,7 @@ by hand: no claim, no transfer, no custody request, no signature submission.
 
 | Phase | What happens automatically | How it becomes round funding |
 |---|---|---|
-| Bonding curve | 1. **Claim** — the accrued creator fee is claimed (`claim_creator_fee`) into the creator wallet (`FEE_COLLECTION_MODE=auto_claim`, the default with a creator key). 2. **75 % settlement** — once the claim is finalized, exactly the claim's outstanding Asteroid Protocol share (75 % of what was collected) is sent from the creator wallet to the payout wallet with the memo `last60:v1:<claim signature>`. The creator keeps 25 %. | The normal pipeline links the transfer to its claim (memo correlation) and writes a payable credit. It landed in the payout wallet, so custody is `direct`: it funds the next round. |
+| Bonding curve | 1. **Claim** — the accrued creator fee is claimed (`claim_creator_fee`) into the creator wallet (`FEE_COLLECTION_MODE=auto_claim`, the default with a creator key). 2. **75 % settlement** — once the claim is finalized, exactly the claim's outstanding Asteroid Protocol share (75 % of what was collected) is sent from the creator wallet to the payout wallet with the memo `last60:v1:<claim signature>`. The creator keeps 25 %. | The normal pipeline links the transfer to its claim (memo correlation) and writes a payable credit. It landed in the payout wallet, so custody is `direct`: it funds the next round to execute. The claim runs `FEE_CLAIM_LEAD_SECONDS` (default 90) before each round's execution window, so a round is funded by the fees of its own first ~2.5 minutes. |
 | After migration (Meteora DBC → DAMM v2) | **Claim** — the LP fees of the creator's migration positions are claimed (`claim_position_fee`) into the creator wallet together with any residual bonding fees. **75 % settlement** — exactly as on the bonding curve (memo `last60:v1:<claim signature>`). Requires `EXPECTED_DBC_CREATOR_LP_PERCENTAGE` (REWARD_FUNDING.md §17). | Same as the bonding curve: memo correlation → payable credit, direct custody. |
 | After migration (Forgepad LaunchLab → CPMM) | **Sweep** — when Forge's collector pays the creator's 50 % LP allocation to the creator wallet (REWARD_FUNDING.md §4a) and Asteroid Protocol has attributed it to its harvest (payable credit), a custody request is opened and exactly the credited SOL is sent from the creator wallet to the payout wallet with the memo `last60:custody:v1:<custodyId>`. | The normal custody verification binds it (method `creator_wallet_sweep`); once finalized the credit funds the next round. The sweep is a custody transfer, never a second contribution. |
 
@@ -55,6 +55,7 @@ Defaults that make it hands-off (all overridable, see `.env.example`):
 | `LAST60_CUSTODY_ENABLED` | on (v2 + payout wallet) | sweeps use the custody workflow |
 | `LAST60_CREATOR_AUTOMATION_ENABLED` | on when a creator key is set | |
 | `FEE_COLLECTION_MODE` | `auto_claim` when a creator key / address is set | the creator claims its own fees |
+| `FEE_CLAIM_LEAD_SECONDS` | 90 | claim this long before each round's execution window (0 = right after each round) |
 
 Then check, read-only:
 
